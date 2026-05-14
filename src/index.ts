@@ -3,7 +3,7 @@ import { ModelMessage } from 'ai'
 import { createOpenAI } from '@ai-sdk/openai'
 import { createInterface } from 'node:readline'
 import { calculatorTool, weatherTool } from './tools'
-import { agentLoop } from './agent-loop'
+import { agentLoop, BudgetState } from './agent-loop'
 
 const SYSTEM = `你是 Super Agent，一个有工具调用能力的 AI 助手。
 需要查询信息时，主动使用工具，不要编造数据。
