@@ -11,7 +11,7 @@ const SYSTEM = `你是 Super Agent，一个有工具调用能力的 AI 助手。
 
 const tools = { get_weather: weatherTool, calculator: calculatorTool }
 
-const glmClient = createOpenAI({
+const client = createOpenAI({
   baseURL: 'https://open.bigmodel.cn/api/coding/paas/v4',
   apiKey: process.env.GLM_API_KEY,
 })
@@ -37,7 +37,7 @@ function ask() {
 
     messages.push({ role: 'user', content: trimmed })
 
-    await agentLoop(glmClient.chat('glm-5.1'), tools, messages, SYSTEM, budget)
+    await agentLoop(client.chat('glm-5.1'), tools, messages, SYSTEM, budget)
 
     ask()
   })

@@ -2,6 +2,7 @@ export function isRetryable(error: unknown): boolean {
   if (!(error instanceof Error)) return false
   const message = error.message || ''
   const statusMatch = message.match(/(\d{3})/)
+
   if (statusMatch) {
     const status = parseInt(statusMatch[1])
     if ([429, 529, 408].includes(status)) return true
