@@ -1,6 +1,7 @@
 import { streamText, type ModelMessage } from 'ai'
 import { detect, recordCall, recordResult, resetHistory } from './loop-detection.js'
 import { isRetryable, calculateDelay, sleep } from './retry.js'
+import { ToolRegistry } from './tool-registry.js'
 
 const MAX_STEPS = 15
 const MAX_RETRIES = 3
@@ -10,7 +11,7 @@ export interface BudgetState {
   limit: number
 }
 
-export async function agentLoop(model: any, tools: any, messages: ModelMessage[], system: string, budget: BudgetState) {
+export async function agentLoop(model: any, registry: ToolRegistry, messages: ModelMessage[], system: string, budget: BudgetState) {
   let step = 0
   resetHistory()
 
@@ -30,7 +31,7 @@ export async function agentLoop(model: any, tools: any, messages: ModelMessage[]
         const result = streamText({
           model,
           system,
-          tools,
+          tools: registry.toAISDKFormat(),
           messages,
           maxRetries: 0,
           providerOptions: { openai: { parallelToolCalls: true } },
