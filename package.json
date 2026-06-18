@@ -14,6 +14,7 @@
   "packageManager": "pnpm@10.33.2",
   "dependencies": {
     "@ai-sdk/openai": "^3.0.53",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "ai": "^6.0.168",
     "dotenv": "^17.4.2",
     "fast-glob": "^3.3.3",

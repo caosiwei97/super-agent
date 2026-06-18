@@ -5,51 +5,87 @@ import { createInterface } from 'node:readline'
 import { allTools } from './tools'
 import { agentLoop, BudgetState } from './agent-loop'
 import { ToolRegistry } from './tool-registry'
+import { MCPClient } from './mcp-client'
+
+const registry = new ToolRegistry()
+registry.register(...allTools)
+
+async function connectMCP() {
+  const githubToken = process.env.GITHUB_PERSONAL_ACCESS_TOKEN
+
+  let canSpawn = true
+  try {
+    const { execSync } = await import('node:child_process')
+    execSync('echo test', { stdio: 'ignore' })
+  } catch {
+    canSpawn = false
+  }
+
+  if (githubToken && canSpawn) {
+    console.log('\n连接 GitHub MCP Server...')
+    try {
+      const client = new MCPClient('npx', ['-y', '@modelcontextprotocol/server-github'], { GITHUB_PERSONAL_ACCESS_TOKEN: githubToken })
+      const tools = await registry.registerMCPServer('github', client)
+      console.log(`  已注册 ${tools.length} 个 MCP 工具`)
+      return
+    } catch (err) {
+      console.log(`  MCP 连接失败: ${err instanceof Error ? err.message : err}`)
+      console.log('  降级为 Mock MCP...')
+    }
+  }
+
+  if (!githubToken) {
+    console.log('\n未配置 GITHUB_PERSONAL_ACCESS_TOKEN，使用 Mock MCP')
+  }
+}
 
 const SYSTEM = `你是 Super Agent，一个有工具调用能力的 AI 助手。
 需要查询信息时，主动使用工具，不要编造数据。
 回答要简洁直接。`
 
-const registry = new ToolRegistry()
-registry.register(...allTools)
+async function main() {
+  await connectMCP()
 
-console.log(`已注册 ${registry.getAll().length} 个工具：`)
+  console.log(`已注册 ${registry.getAll().length} 个工具：`)
 
-for (const tool of registry.getAll()) {
-  const flags = [tool.isConcurrencySafe ? '可并发' : '串行', tool.isReadOnly ? '只读' : '读写'].join(', ')
-  console.log(`  - ${tool.name}（${flags}）`)
-}
+  for (const tool of registry.getAll()) {
+    const flags = [tool.isConcurrencySafe ? '可并发' : '串行', tool.isReadOnly ? '只读' : '读写'].join(', ')
+    console.log(`  - ${tool.name}（${flags}）`)
+  }
 
-const client = createOpenAI({
-  baseURL: 'https://open.bigmodel.cn/api/coding/paas/v4',
-  apiKey: process.env.GLM_API_KEY,
-})
-
-// 预算由调用方持有，跨轮持续累计——agentLoop 只负责消费它
-const budget: BudgetState = { used: 0, limit: 200000 }
-
-const rl = createInterface({
-  input: process.stdin,
-  output: process.stdout,
-})
-
-const messages: ModelMessage[] = []
-
-function ask() {
-  rl.question('\nYou: ', async (input) => {
-    const trimmed = input.trim()
-    if (!trimmed || trimmed === 'exit') {
-      console.log('Bye!')
-      rl.close()
-      return
-    }
-
-    messages.push({ role: 'user', content: trimmed })
-
-    await agentLoop(client.chat('glm-5.1'), registry, messages, SYSTEM, budget)
-
-    ask()
+  const client = createOpenAI({
+    baseURL: 'https://api.deepseek.com',
+    apiKey: process.env.OPENAI_API_KEY,
   })
+
+  // 预算由调用方持有，跨轮持续累计——agentLoop 只负责消费它
+  const budget: BudgetState = { used: 0, limit: 1000000 }
+
+  const rl = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  })
+
+  const messages: ModelMessage[] = []
+
+  function ask() {
+    rl.question('\nYou: ', async (input) => {
+      const trimmed = input.trim()
+      if (!trimmed || trimmed === 'exit') {
+        console.log('Bye!')
+        rl.close()
+        return
+      }
+
+      messages.push({ role: 'user', content: trimmed })
+
+      await agentLoop(client.chat('deepseek-v4-flash'), registry, messages, SYSTEM, budget)
+
+      ask()
+    })
+  }
+
+  ask()
 }
 
-ask()
+main().catch(console.error)
