@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, readdirSync, statSync, existsSync } from 'node:fs'
 import { extname, join, relative, resolve } from 'node:path'
-import type { ToolDefinition } from './tool-registry.js'
+import type { ToolDefinition } from '../core/tool-registry.js'
 import { execSync } from 'node:child_process'
 import fg from 'fast-glob'
 import { createServer, Server } from 'node:http'

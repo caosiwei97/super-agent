@@ -1,91 +1,44 @@
 import 'dotenv/config'
 import { ModelMessage } from 'ai'
 import { createOpenAI } from '@ai-sdk/openai'
-import { createInterface } from 'node:readline'
 import { allTools } from './tools'
-import { agentLoop, BudgetState } from './agent-loop'
-import { ToolRegistry } from './tool-registry'
-import { MCPClient } from './mcp-client'
+import { ToolRegistry } from './core/tool-registry'
+import { createToolSearch } from './tools/create-tool-search'
+import { simulatedTools } from './tools/simulated-tools'
+import { connectGitHubMCP } from './mcp/create-mcp'
+import { printStartupStats, startRepl } from './repl'
 
+// ---- 1. 装配 registry ----
 const registry = new ToolRegistry()
 registry.register(...allTools)
+registry.register(createToolSearch(registry))
 
-async function connectMCP() {
-  const githubToken = process.env.GITHUB_PERSONAL_ACCESS_TOKEN
+const messages: ModelMessage[] = []
 
-  let canSpawn = true
-  try {
-    const { execSync } = await import('node:child_process')
-    execSync('echo test', { stdio: 'ignore' })
-  } catch {
-    canSpawn = false
-  }
-
-  if (githubToken && canSpawn) {
-    console.log('\n连接 GitHub MCP Server...')
-    try {
-      const client = new MCPClient('npx', ['-y', '@modelcontextprotocol/server-github'], { GITHUB_PERSONAL_ACCESS_TOKEN: githubToken })
-      const tools = await registry.registerMCPServer('github', client)
-      console.log(`  已注册 ${tools.length} 个 MCP 工具`)
-      return
-    } catch (err) {
-      console.log(`  MCP 连接失败: ${err instanceof Error ? err.message : err}`)
-      console.log('  降级为 Mock MCP...')
-    }
-  }
-
-  if (!githubToken) {
-    console.log('\n未配置 GITHUB_PERSONAL_ACCESS_TOKEN，使用 Mock MCP')
-  }
-}
-
-const SYSTEM = `你是 Super Agent，一个有工具调用能力的 AI 助手。
-需要查询信息时，主动使用工具，不要编造数据。
-回答要简洁直接。`
-
+// ---- 2. 启动 ----
 async function main() {
-  await connectMCP()
+  // 2.1 先连真实 MCP（github），失败/无 token 则静默降级
+  await connectGitHubMCP(registry)
 
-  console.log(`已注册 ${registry.getAll().length} 个工具：`)
+  // 2.2 再注册演示用的模拟 MCP 工具
+  registry.register(...simulatedTools)
+  console.log(`  已注册 ${simulatedTools.length} 个模拟 MCP 工具（Notion/Browser/Supabase）`)
 
-  for (const tool of registry.getAll()) {
-    const flags = [tool.isConcurrencySafe ? '可并发' : '串行', tool.isReadOnly ? '只读' : '读写'].join(', ')
-    console.log(`  - ${tool.name}（${flags}）`)
-  }
+  // 2.3 打印统计
+  printStartupStats(registry)
 
+  // 2.4 创建模型客户端 + 预算（跨轮累计）
   const client = createOpenAI({
     baseURL: 'https://api.deepseek.com',
     apiKey: process.env.OPENAI_API_KEY,
   })
+  const budget = { used: 0, limit: 1_000_000 }
 
-  // 预算由调用方持有，跨轮持续累计——agentLoop 只负责消费它
-  const budget: BudgetState = { used: 0, limit: 1000000 }
-
-  const rl = createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  })
-
-  const messages: ModelMessage[] = []
-
-  function ask() {
-    rl.question('\nYou: ', async (input) => {
-      const trimmed = input.trim()
-      if (!trimmed || trimmed === 'exit') {
-        console.log('Bye!')
-        rl.close()
-        return
-      }
-
-      messages.push({ role: 'user', content: trimmed })
-
-      await agentLoop(client.chat('deepseek-v4-flash'), registry, messages, SYSTEM, budget)
-
-      ask()
-    })
-  }
-
-  ask()
+  // 2.5 进入 REPL —— SYSTEM 在 repl 里每轮按当前 registry 重建
+  startRepl({ model: client.chat('deepseek-v4-flash'), registry, messages, budget })
 }
 
-main().catch(console.error)
+main().catch((err) => {
+  console.error('启动失败:', err)
+  process.exit(1)
+})
