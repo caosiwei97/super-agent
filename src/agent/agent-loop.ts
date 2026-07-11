@@ -1,7 +1,7 @@
 import { streamText, type ModelMessage } from 'ai'
 import { detect, recordCall, recordResult, resetHistory } from './loop-detection.js'
 import { isRetryable, calculateDelay, sleep } from './retry.js'
-import { ToolRegistry } from './tool-registry.js'
+import { ToolRegistry } from '../core/tool-registry.js'
 
 const MAX_STEPS = 15
 const MAX_RETRIES = 3

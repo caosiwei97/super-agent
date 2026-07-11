@@ -1,12 +1,10 @@
 import 'dotenv/config'
 import { ModelMessage } from 'ai'
 import { createOpenAI } from '@ai-sdk/openai'
-import { allTools } from './tools'
+import { allTools, createToolSearch, simulatedTools } from './tools'
 import { ToolRegistry } from './core/tool-registry'
-import { createToolSearch } from './tools/create-tool-search'
-import { simulatedTools } from './tools/simulated-tools'
 import { connectGitHubMCP } from './mcp/create-mcp'
-import { printStartupStats, startRepl } from './repl'
+import { printStartupStats, startRepl } from './cli/repl'
 
 // ---- 1. 装配 registry ----
 const registry = new ToolRegistry()

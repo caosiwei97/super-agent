@@ -1,4 +1,4 @@
-import type { ToolDefinition, ToolRegistry } from '../core/tool-registry.js'
+import type { ToolDefinition, ToolRegistry } from '../../core/tool-registry.js'
 
 /**
  * 构造 tool_search 元工具。
