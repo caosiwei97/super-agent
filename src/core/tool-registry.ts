@@ -8,6 +8,7 @@ export interface ToolDefinition {
   isConcurrencySafe?: boolean
   isReadOnly?: boolean
   maxResultChars?: number
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   execute: (input: any) => Promise<unknown>
   shouldDefer?: boolean
   searchHint?: string
@@ -49,12 +50,14 @@ export class ToolRegistry {
         name: prefixedName,
         description: `[MCP:${serverName}] ${tool.description}`,
         parameters: tool.inputSchema as Record<string, unknown>,
-        isConcurrencySafe: true,
-        isReadOnly: true,
+        // 真实 MCP 工具的读写属性无法确定，保守起见走串行 + 读写标记，
+        // 避免把 create_issue 等写工具当只读并发执行。
+        isConcurrencySafe: false,
+        isReadOnly: false,
         maxResultChars: 3000,
         shouldDefer: true,
         searchHint: `${serverName} ${tool.name} ${tool.description}`,
-        execute: async (input: any) => {
+        execute: async (input) => {
           return toolClient.callTool(originalName, input)
         },
       })
@@ -80,19 +83,17 @@ export class ToolRegistry {
     return Array.from(this.tools.values())
   }
 
+  /** 工具是否被延迟加载且尚未被 tool_search 发现。 */
+  private isDeferred(tool: ToolDefinition): boolean {
+    return !!tool.shouldDefer && !this.discoveredTools.has(tool.name)
+  }
+
   getActiveTools(): ToolDefinition[] {
-    return this.getAll().filter((tool) => {
-      if (tool.shouldDefer && !this.discoveredTools.has(tool.name)) {
-        return false
-      }
-      return true
-    })
+    return this.getAll().filter((tool) => !this.isDeferred(tool))
   }
 
   getDeferredToolSummary(): string {
-    const deferred = this.getAll().filter((tool) => {
-      return tool.shouldDefer && !this.discoveredTools.has(tool.name)
-    })
+    const deferred = this.getAll().filter((tool) => this.isDeferred(tool))
 
     if (deferred.length === 0) return ''
 
@@ -139,7 +140,7 @@ export class ToolRegistry {
       }).length
       const tokens = Math.ceil(schemaSize / 4)
 
-      if (tool.shouldDefer && !this.discoveredTools.has(tool.name)) {
+      if (this.isDeferred(tool)) {
         deferred += tokens
       } else {
         active += tokens
@@ -149,6 +150,13 @@ export class ToolRegistry {
     return { active, deferred, total: active + deferred }
   }
 
+  /**
+   * 获取并发读锁：等待排他锁释放后，concurrentCount++。
+   *
+   * 被唤醒后必须重新检查 exclusiveLock——不能假设被唤醒就意味着条件满足，
+   * 因为 release 时一次性唤醒了所有等待者，可能多个 concurrent 和 exclusive
+   * 同时醒来，exclusive 醒来后拿到锁，concurrent 醒来后应继续等待。
+   */
   private async acquireConcurrent(): Promise<void> {
     while (this.exclusiveLock) {
       await new Promise<void>((r) => this.waitQueue.push(r))
@@ -161,6 +169,11 @@ export class ToolRegistry {
     if (this.concurrentCount === 0) this.drainQueue()
   }
 
+  /**
+   * 获取独占写锁：等待所有并发读完成 + 无其他排他锁。
+   *
+   * 同样在唤醒后重新检查条件，避免与 concurrent 竞争。
+   */
   private async acquireExclusive(): Promise<void> {
     while (this.exclusiveLock || this.concurrentCount > 0) {
       await new Promise<void>((r) => this.waitQueue.push(r))
@@ -173,13 +186,17 @@ export class ToolRegistry {
     this.drainQueue()
   }
 
+  /**
+   * 唤醒所有等待者。每个等待者在 resolve 后会回到 while 循环重新检查条件，
+   * 不满足的会重新入队等待下一次唤醒，从而避免锁竞态。
+   */
   private drainQueue(): void {
     const waiting = this.waitQueue.splice(0)
     for (const resolve of waiting) resolve()
   }
 
-  toAISDKFormat(): Record<string, any> {
-    const result: Record<string, any> = {}
+  toAISDKFormat(): Record<string, unknown> {
+    const result: Record<string, unknown> = {}
     const activeTools = this.getActiveTools()
 
     for (const tool of activeTools) {
@@ -190,8 +207,8 @@ export class ToolRegistry {
 
       result[tool.name] = {
         description: tool.description,
-        inputSchema: jsonSchema(tool.parameters as any),
-        execute: async (input: any) => {
+        inputSchema: jsonSchema(tool.parameters),
+        execute: async (input: Record<string, unknown>) => {
           if (isSafe) {
             await registry.acquireConcurrent()
           } else {
