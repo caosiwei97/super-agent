@@ -1,5 +1,6 @@
 import { MCPClient } from './mcp-client.js'
 import type { ToolRegistry } from '../core/tool-registry.js'
+import { canSpawnProcess } from '../core/env.js'
 
 /**
  * 连接 GitHub MCP Server 并把它的工具注册进 registry。
@@ -11,15 +12,7 @@ import type { ToolRegistry } from '../core/tool-registry.js'
 export async function connectGitHubMCP(registry: ToolRegistry): Promise<void> {
   const githubToken = process.env.GITHUB_PERSONAL_ACCESS_TOKEN
 
-  let canSpawn = true
-  try {
-    const { execSync } = await import('node:child_process')
-    execSync('echo test', { stdio: 'ignore' })
-  } catch {
-    canSpawn = false
-  }
-
-  if (githubToken && canSpawn) {
+  if (githubToken && canSpawnProcess()) {
     console.log('\n连接 GitHub MCP Server...')
     try {
       const client = new MCPClient('npx', ['-y', '@modelcontextprotocol/server-github'], {

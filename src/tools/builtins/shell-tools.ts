@@ -1,5 +1,6 @@
 import { execSync } from 'node:child_process'
 import type { ToolDefinition } from '../../core/tool-registry.js'
+import { canSpawnProcess } from '../../core/env.js'
 
 export const bashTool: ToolDefinition = {
   name: 'bash',
@@ -16,9 +17,7 @@ export const bashTool: ToolDefinition = {
   isReadOnly: false,
   maxResultChars: 3000,
   execute: async ({ command }: { command: string }) => {
-    try {
-      execSync('echo test', { stdio: 'ignore' })
-    } catch {
+    if (!canSpawnProcess()) {
       return `[bash 不可用] 当前环境（WebContainer）不支持 shell 命令。本地终端运行 pnpm start 可使用 bash 工具。`
     }
 
