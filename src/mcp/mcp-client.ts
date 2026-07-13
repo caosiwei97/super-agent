@@ -43,14 +43,16 @@ export class MCPClient {
       stderr: 'ignore',
     })
 
-    this.client = new Client(
+    // 先用临时变量持有 client，connect 成功后再赋给 this.client。
+    // 这样 connect 抛错时 this.client 保持 null，不会出现"已赋值但未连上"的中间状态。
+    const client = new Client(
       { name: 'super-agent', version: '0.5.0' },
-      // capabilities 留空；请求超时沿用之前的 15s。
       { capabilities: {} },
     )
 
     // SDK 内部会完成 initialize ↔ initialized 握手。
-    await this.client.connect(transport)
+    await client.connect(transport)
+    this.client = client
   }
 
   async listTools(): Promise<MCPTool[]> {
