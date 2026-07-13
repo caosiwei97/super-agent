@@ -1,32 +1,34 @@
 import { createInterface } from 'node:readline'
-import type { ModelMessage } from 'ai'
-import { agentLoop, BudgetState } from '../agent/agent-loop.js'
+import type { ModelMessage, LanguageModel } from 'ai'
+import { agentLoop, type BudgetState } from '../agent/agent-loop.js'
 import { ToolRegistry } from '../core/tool-registry.js'
 import { buildSystem } from '../context/prompt-builder.js'
+import { SessionStore } from '../session/store.js'
 
 export interface ReplDeps {
-  model: any
+  model: LanguageModel
   registry: ToolRegistry
   messages: ModelMessage[]
   budget: BudgetState
+  store: SessionStore
 }
 
 /** 启动时打印工具统计（从旧 main 里抽出来，保持输出一致）。 */
 export function printStartupStats(registry: ToolRegistry): void {
-  console.log(`已注册 ${registry.getAll().length} 个工具：`)
-  for (const tool of registry.getAll()) {
+  const allTools = registry.getAll()
+  const activeTools = registry.getActiveTools()
+  const estimate = registry.countTokenEstimate()
+
+  console.log(`已注册 ${allTools.length} 个工具：`)
+  for (const tool of allTools) {
     const flags = [tool.isConcurrencySafe ? '可并发' : '串行', tool.isReadOnly ? '只读' : '读写'].join(', ')
     console.log(`  - ${tool.name}（${flags}）`)
   }
 
-  const allCount = registry.getAll().length
-  const activeTools = registry.getActiveTools()
-  const estimate = registry.countTokenEstimate()
-
   console.log(`\n=== 工具统计 ===`)
-  console.log(`  全部工具: ${allCount} 个`)
+  console.log(`  全部工具: ${allTools.length} 个`)
   console.log(`  活跃工具: ${activeTools.length} 个`)
-  console.log(`  延迟工具: ${allCount - activeTools.length} 个`)
+  console.log(`  延迟工具: ${allTools.length - activeTools.length} 个`)
   console.log(`  Token 估算: ~${estimate.active} (活跃) + ~${estimate.deferred} (延迟，不占 prompt)`)
 }
 
@@ -40,7 +42,7 @@ export function printStartupStats(registry: ToolRegistry): void {
  * 三路统一收敛到 shutdown()：先 await closeAllMCP 清掉子进程句柄，再 process.exit(0)。
  * 否则 MCP 子进程 / 预览 server 等句柄会让进程在 rl.close() 之后仍挂住。
  */
-export function startRepl({ model, registry, messages, budget }: ReplDeps): void {
+export function startRepl({ model, registry, messages, budget, store }: ReplDeps): void {
   const rl = createInterface({ input: process.stdin, output: process.stdout })
 
   let shuttingDown = false
@@ -90,14 +92,20 @@ export function startRepl({ model, registry, messages, budget }: ReplDeps): void
         void shutdown()
         return
       }
+      const userMsg: ModelMessage = { role: 'user', content: trimmed }
 
-      messages.push({ role: 'user', content: trimmed })
+      messages.push(userMsg)
+      await store.append(userMsg)
+      const beforeLen = messages.length
 
       try {
-        await agentLoop(model, registry, messages, buildSystem(registry), budget)
+        await agentLoop(model, registry, messages, buildSystem(registry, messages, store), budget)
       } catch (err) {
-        console.log(`[Agent 出错] ${err instanceof Error ? err.message : err}`)
+        console.error(`[Agent 出错] ${err instanceof Error ? err.message : err}`)
       }
+      // 持久化本轮新增的消息（agent loop 会往 messages 里 push assistant/tool 消息）
+      const newMessages = messages.slice(beforeLen)
+      await store.appendAll(newMessages)
 
       ask()
     })

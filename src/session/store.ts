@@ -1,30 +1,101 @@
+import { existsSync, mkdirSync, readFileSync } from 'node:fs'
+import { appendFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import type { ModelMessage } from 'ai'
 
-/**
- * 会话消息存储。
- *
- * 当前是最小封装：只把 messages 数组及其增删查收口到一个对象，
- * 为将来加持久化（写文件 / DB）留出替换点。
- *
- * 现阶段 agent-loop 仍直接持有 messages 数组做 push，
- * 这里先不强制接线，避免引入引用同步问题；后续逐步收口。
- */
+const SESSION_DIR = '.sessions'
+const DEFAULT_SESSION = 'default'
+
+export interface SessionEntry {
+  type: 'message'
+  timestamp: string
+  message: ModelMessage
+}
+
 export class SessionStore {
-  private messages: ModelMessage[] = []
+  private dir: string
+  private sessionId: string
 
-  add(message: ModelMessage): void {
-    this.messages.push(message)
+  constructor(sessionId: string = DEFAULT_SESSION) {
+    this.sessionId = sessionId
+    this.dir = SESSION_DIR
+    if (!existsSync(this.dir)) {
+      mkdirSync(this.dir, { recursive: true })
+    }
   }
 
-  addMany(messages: ModelMessage[]): void {
-    this.messages.push(...messages)
+  private get filePath(): string {
+    return join(this.dir, `${this.sessionId}.jsonl`)
   }
 
-  getAll(): ModelMessage[] {
-    return this.messages
+  getSessionId() {
+    return this.sessionId
   }
 
-  clear(): void {
-    this.messages = []
+  async append(message: ModelMessage): Promise<void> {
+    const entry: SessionEntry = {
+      type: 'message',
+      timestamp: new Date().toISOString(),
+      message,
+    }
+    try {
+      await appendFile(this.filePath, JSON.stringify(entry) + '\n', 'utf-8')
+    } catch (err) {
+      console.error(`[Session] 写入失败: ${err instanceof Error ? err.message : err}`)
+    }
+  }
+
+  async appendAll(messages: ModelMessage[]): Promise<void> {
+    if (messages.length === 0) return
+    // 拼成一个大字符串一次写入，避免逐条 open/write/close 的系统调用开销
+    const batch = messages
+      .map((message) => {
+        const entry: SessionEntry = {
+          type: 'message',
+          timestamp: new Date().toISOString(),
+          message,
+        }
+        return JSON.stringify(entry)
+      })
+      .join('\n') + '\n'
+
+    try {
+      await appendFile(this.filePath, batch, 'utf-8')
+    } catch (err) {
+      console.error(`[Session] 批量写入失败: ${err instanceof Error ? err.message : err}`)
+    }
+  }
+
+  load(): ModelMessage[] {
+    if (!existsSync(this.filePath)) return []
+
+    const content = readFileSync(this.filePath, 'utf-8').trim()
+    if (!content) return []
+
+    const messages: ModelMessage[] = []
+    for (const line of content.split('\n')) {
+      if (!line.trim()) continue
+      try {
+        const entry: SessionEntry = JSON.parse(line)
+        if (entry.type === 'message') {
+          messages.push(entry.message)
+        }
+      } catch {
+        // skip malformed lines
+      }
+    }
+    return messages
+  }
+
+  exists(): boolean {
+    return existsSync(this.filePath)
+  }
+
+  getMessageCount(): number {
+    if (!existsSync(this.filePath)) return 0
+    // 只数行数，不解析 JSON，避免全量解析只为计数
+    const content = readFileSync(this.filePath, 'utf-8').trim()
+    if (!content) return 0
+    return content.split('\n').length
   }
 }
