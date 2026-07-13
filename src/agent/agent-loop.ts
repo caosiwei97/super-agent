@@ -1,17 +1,23 @@
-import { streamText, type ModelMessage } from 'ai'
+import { streamText, type ModelMessage, type LanguageModel, type LanguageModelUsage, type ToolSet } from 'ai'
 import { detect, recordCall, recordResult, resetHistory } from './loop-detection.js'
 import { isRetryable, calculateDelay, sleep } from './retry.js'
 import { ToolRegistry } from '../core/tool-registry.js'
 
 const MAX_STEPS = 15
-const MAX_RETRIES = 3
+const MAX_RETRIES = 10
 
 export interface BudgetState {
   used: number
   limit: number
 }
 
-export async function agentLoop(model: any, registry: ToolRegistry, messages: ModelMessage[], system: string, budget: BudgetState) {
+export async function agentLoop(
+  model: LanguageModel,
+  registry: ToolRegistry,
+  messages: ModelMessage[],
+  system: string,
+  budget: BudgetState,
+): Promise<void> {
   let step = 0
   resetHistory()
 
@@ -23,19 +29,23 @@ export async function agentLoop(model: any, registry: ToolRegistry, messages: Mo
     let fullText = ''
     let shouldBreak = false
     let lastToolCall: { name: string; input: unknown } | null = null
-    let stepResponse: any
-    let stepUsage: any
+    let stepResponse: { messages: ModelMessage[] } | undefined
+    let stepUsage: LanguageModelUsage | undefined
+    // 收集本轮需要追加到 messages 的额外消息（如循环检测警告），
+    // 不在 stream 消费过程中直接 push 到 messages，
+    // 避免抛错时半成品消息（tool-call 无配对 tool-result）被持久化。
+    const pendingMessages: ModelMessage[] = []
 
     for (let attempt = 1; ; attempt++) {
       try {
         const result = streamText({
           model,
           system,
-          tools: registry.toAISDKFormat(),
+          tools: registry.toAISDKFormat() as ToolSet,
           messages,
           maxRetries: 0,
           providerOptions: { openai: { parallelToolCalls: true } },
-          onError: () => {},
+          onError: (err) => console.error('[stream error]', err),
         })
 
         for await (const part of result.fullStream) {
@@ -57,7 +67,7 @@ export async function agentLoop(model: any, registry: ToolRegistry, messages: Mo
                 if (detection.level === 'critical') {
                   shouldBreak = true
                 } else {
-                  messages.push({
+                  pendingMessages.push({
                     role: 'user' as const,
                     content: `[系统提醒] ${detection.message}。请换一个思路解决问题，不要重复同样的操作。`,
                   })
@@ -82,6 +92,8 @@ export async function agentLoop(model: any, registry: ToolRegistry, messages: Mo
         stepUsage = await result.usage
         break
       } catch (error) {
+        console.error(error)
+
         if (attempt > MAX_RETRIES || !isRetryable(error as Error)) throw error
 
         const delay = calculateDelay(attempt)
@@ -94,6 +106,8 @@ export async function agentLoop(model: any, registry: ToolRegistry, messages: Mo
         fullText = ''
         shouldBreak = false
         lastToolCall = null
+        // 清空重试前的 pending 消息，避免重复
+        pendingMessages.length = 0
       }
     }
 
@@ -102,11 +116,17 @@ export async function agentLoop(model: any, registry: ToolRegistry, messages: Mo
       break
     }
 
-    messages.push(...stepResponse.messages)
+    // 统一追加本轮消息：先追加 pending（循环检测警告等），再追加 SDK 返回的 messages
+    if (pendingMessages.length > 0) {
+      messages.push(...pendingMessages)
+    }
+    if (stepResponse) {
+      messages.push(...stepResponse.messages)
+    }
 
     // Token 预算追踪：budget 由调用方持有，跨轮累计
-    const inp = typeof stepUsage?.inputTokens === 'number' ? stepUsage.inputTokens : (stepUsage?.inputTokens?.total ?? 0)
-    const out = typeof stepUsage?.outputTokens === 'number' ? stepUsage.outputTokens : (stepUsage?.outputTokens?.total ?? 0)
+    const inp = stepUsage?.inputTokens ?? 0
+    const out = stepUsage?.outputTokens ?? 0
 
     budget.used += inp + out
 
