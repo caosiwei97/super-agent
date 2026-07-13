@@ -101,7 +101,8 @@ export const editFileTool: ToolDefinition = {
       return `找到 ${count} 处匹配，请提供更多上下文让 old_string 唯一`
     }
 
-    const updated = content.replace(old_string, new_string)
+    // 用函数形式替换，避免 new_string 中的 $& $1 等特殊模式被解释为反向引用
+    const updated = content.replace(old_string, () => new_string)
     writeFileSync(resolved, updated, 'utf-8')
     return `已替换 ${path} 中的内容（${old_string.length} → ${new_string.length} 字符）`
   },
@@ -151,7 +152,12 @@ export const grepTool: ToolDefinition = {
   maxResultChars: 3000,
   execute: async ({ pattern, path = '.' }: { pattern: string; path?: string }) => {
     const baseDir = resolve(path)
-    const regex = new RegExp(pattern, 'i')
+    let regex: RegExp
+    try {
+      regex = new RegExp(pattern, 'i')
+    } catch {
+      return `无效的正则表达式: "${pattern}"。请检查语法是否正确`
+    }
     const matches: string[] = []
     const SKIP = new Set(['node_modules', '.git', 'dist'])
     const BIN_EXT = new Set(['.png', '.jpg', '.gif', '.woff', '.woff2', '.ico', '.lock'])

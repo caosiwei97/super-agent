@@ -1,5 +1,5 @@
 import { readFileSync, existsSync } from 'node:fs'
-import { extname, join, resolve } from 'node:path'
+import { extname, join, resolve, sep } from 'node:path'
 import { createServer, Server } from 'node:http'
 import type { ToolDefinition } from '../../core/tool-registry.js'
 
@@ -42,7 +42,10 @@ export const startPreviewTool: ToolDefinition = {
       const urlPath = (req.url?.split('?')[0] || '/').replace(/\/$/, '/index.html')
       const filePath = join(root, urlPath === '/' ? '/index.html' : urlPath)
       try {
-        if (!filePath.startsWith(root)) {
+        // 路径穿越校验：resolve 后必须仍在 root 目录内。
+        // 用 root + sep 避免 "app-evil/" 这种前缀匹配绕过。
+        const resolvedPath = resolve(filePath)
+        if (resolvedPath !== root && !resolvedPath.startsWith(root + sep)) {
           res.writeHead(403)
           res.end('Forbidden')
           return

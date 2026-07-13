@@ -40,6 +40,10 @@ export const calculatorTool: ToolDefinition = {
   isConcurrencySafe: true,
   isReadOnly: true,
   execute: async ({ expression }: { expression: string }) => {
+    // 白名单校验：只允许数字、基本运算符和括号，杜绝代码注入
+    if (!/^[\d+\-*/%().\s]+$/.test(expression)) {
+      return `不支持的表达式: ${expression}（仅允许数字和 + - * / % ( ) 运算符）`
+    }
     try {
       const result = new Function(`return ${expression}`)()
       return `${expression} = ${result}`
