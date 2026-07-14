@@ -6,10 +6,15 @@
  *
  * 不再用裸 /(\d{3})/ —— 那会误匹配 message 中的任意三位数（如 "retry in 5000ms" → 500）。
  */
-function extractStatusCode(error: Error): number | null {
+function extractStatusCode(error: Error) {
   // 1. 属性读取（最可靠）
+  const candidate = error as Error & {
+    status?: unknown
+    statusCode?: unknown
+    response?: { status?: unknown }
+  }
   const statusAttr =
-    (error as any).status ?? (error as any).statusCode ?? (error as any).response?.status
+    candidate.status ?? candidate.statusCode ?? candidate.response?.status
   if (typeof statusAttr === 'number') return statusAttr
 
   // 2. 文本 fallback：匹配 "status: 429" / "HTTP 500" / "status 503" 等模式
@@ -18,7 +23,7 @@ function extractStatusCode(error: Error): number | null {
   return match ? parseInt(match[1], 10) : null
 }
 
-export function isRetryable(error: unknown): boolean {
+export function isRetryable(error: unknown) {
   if (!(error instanceof Error)) return false
 
   // 网络中断 / 用户取消
@@ -43,17 +48,19 @@ export function isRetryable(error: unknown): boolean {
 /**
  * 指数退避 + 抖动。
  *
- * 抖动公式：capped - jitter/2 + random * jitter，
- * 确保结果始终在 [capped - jitter/2, capped + jitter/2] 范围内，
- * 不会因抖动叠加而超过 maxMs。
+ * 使用 [75%, 100%] 的有界抖动，既分散重试请求，也严格不超过 maxMs。
  */
-export function calculateDelay(attempt: number, baseMs = 500, maxMs = 30000): number {
+export function calculateDelay(attempt: number, baseMs = 500, maxMs = 30000) {
+  if (!Number.isSafeInteger(attempt) || attempt < 1) throw new Error('attempt 必须是正整数')
+  if (!Number.isFinite(baseMs) || baseMs <= 0) throw new Error('baseMs 必须是正数')
+  if (!Number.isFinite(maxMs) || maxMs <= 0) throw new Error('maxMs 必须是正数')
+
   const exponential = baseMs * Math.pow(2, attempt - 1)
   const capped = Math.min(exponential, maxMs)
-  const jitter = capped * 0.25
-  return Math.max(0, Math.round(capped - jitter / 2 + Math.random() * jitter))
+  const minimum = capped * 0.75
+  return Math.round(minimum + Math.random() * (capped - minimum))
 }
 
-export function sleep(ms: number): Promise<void> {
+export function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }

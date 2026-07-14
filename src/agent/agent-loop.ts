@@ -1,153 +1,317 @@
-import { streamText, type ModelMessage, type LanguageModel, type LanguageModelUsage, type ToolSet } from 'ai'
-import { detect, recordCall, recordResult, resetHistory } from './loop-detection.js'
-import { isRetryable, calculateDelay, sleep } from './retry.js'
-import { ToolRegistry } from '../core/tool-registry.js'
-
-const MAX_STEPS = 15
-const MAX_RETRIES = 10
+import {
+  streamText,
+  type LanguageModel,
+  type LanguageModelUsage,
+  type ModelMessage,
+  type ToolModelMessage,
+} from 'ai'
+import { LoopDetector, type DetectionResult, type ToolCallRecord } from './loop-detection.js'
+import { calculateDelay, isRetryable, sleep } from './retry.js'
+import {
+  ToolRegistry,
+  type ToolInvocation,
+  type ToolRuntimeHooks,
+} from '../core/tool-registry.js'
 
 export interface BudgetState {
   used: number
   limit: number
 }
 
-export async function agentLoop(
-  model: LanguageModel,
-  registry: ToolRegistry,
-  messages: ModelMessage[],
-  system: string,
-  budget: BudgetState,
-): Promise<void> {
-  let step = 0
-  resetHistory()
+export type AgentStopReason = 'completed' | 'budget' | 'loop_detected' | 'max_steps'
 
-  while (step < MAX_STEPS) {
-    step++
-    console.log(`\n--- Step ${step} ---`)
+export interface AgentLoopResult {
+  steps: number
+  stopReason: AgentStopReason
+}
 
+export interface AgentLoopObserver {
+  onStepStart?: (event: { step: number }) => void
+  onTextDelta?: (event: { text: string }) => void
+  onToolCall?: (event: { toolCallId: string; toolName: string; input: unknown }) => void
+  onToolResult?: (event: { toolCallId: string; toolName: string; output: unknown }) => void
+  onLoopDetection?: (event: { invocation: ToolInvocation; detection: DetectionResult }) => void
+  onStreamError?: (event: { error: unknown }) => void
+  onAttemptError?: (event: { attempt: number; error: unknown }) => void
+  onRetry?: (event: { attempt: number; maxRetries: number; delayMs: number }) => void
+  onBudget?: (event: { used: number; limit: number }) => void
+  onContinue?: (event: { nextStep: number }) => void
+  onStop?: (result: AgentLoopResult) => void
+}
+
+export type ToolApprovalHandler = (invocation: ToolInvocation) => Promise<boolean>
+
+export interface AgentLoopOptions {
+  model: LanguageModel
+  registry: ToolRegistry
+  messages: ModelMessage[]
+  buildSystem: () => string
+  budget: BudgetState
+  approveTool?: ToolApprovalHandler
+  observer?: AgentLoopObserver
+  beforeStep?: (step: number) => Promise<void>
+  onMessages?: (messages: ModelMessage[]) => Promise<void>
+  maxSteps?: number
+  maxRetries?: number
+}
+
+interface GuardedCall {
+  invocation: ToolInvocation
+  record: ToolCallRecord
+  detection: DetectionResult
+}
+
+interface ApprovalRequest {
+  approvalId: string
+  toolCallId: string
+}
+
+const DEFAULT_MAX_STEPS = 15
+const DEFAULT_MAX_RETRIES = 10
+
+function notify(callback: (() => void) | undefined) {
+  try {
+    callback?.()
+  } catch {
+    // Observability must not change agent execution semantics.
+  }
+}
+
+function usageTokens(usage: LanguageModelUsage | undefined) {
+  return (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0)
+}
+
+function deniedToolResult(call: GuardedCall, reason: string) {
+  return {
+    type: 'tool-result',
+    toolCallId: call.invocation.toolCallId,
+    toolName: call.invocation.tool.name,
+    output: { type: 'execution-denied', reason },
+  } satisfies ToolModelMessage['content'][number]
+}
+
+/**
+ * Runs one agent turn with retry, budget, approval and loop protection.
+ *
+ * Successful step messages are committed through `onMessages` immediately;
+ * callers can compact the working context between steps without losing the raw
+ * audit trail.
+ */
+export async function agentLoop(options: AgentLoopOptions) {
+  const {
+    model,
+    registry,
+    messages,
+    buildSystem,
+    budget,
+    approveTool = async () => false,
+    observer = {},
+    beforeStep,
+    onMessages,
+    maxSteps = DEFAULT_MAX_STEPS,
+    maxRetries = DEFAULT_MAX_RETRIES,
+  } = options
+
+  if (!Number.isSafeInteger(maxSteps) || maxSteps <= 0) {
+    throw new Error(`maxSteps 必须是正整数，当前值: ${maxSteps}`)
+  }
+  if (!Number.isSafeInteger(maxRetries) || maxRetries < 0) {
+    throw new Error(`maxRetries 必须是非负整数，当前值: ${maxRetries}`)
+  }
+  if (
+    !Number.isFinite(budget.used) ||
+    !Number.isFinite(budget.limit) ||
+    budget.used < 0 ||
+    budget.limit <= 0
+  ) {
+    throw new Error(`非法 Token 预算: ${budget.used}/${budget.limit}`)
+  }
+
+  const stop = (result: AgentLoopResult) => {
+    notify(() => observer.onStop?.(result))
+    return result
+  }
+
+  if (budget.used >= budget.limit) {
+    return stop({ steps: 0, stopReason: 'budget' })
+  }
+
+  const detector = new LoopDetector()
+  const guardedCalls = new Map<string, GuardedCall>()
+
+  const runtimeHooks: ToolRuntimeHooks = {
+    inspectToolCall: (invocation) => {
+      const existing = guardedCalls.get(invocation.toolCallId)
+      if (existing) return existing.detection.stuck
+
+      const detection = detector.detect(invocation.tool.name, invocation.input)
+      const record = detector.recordCall(invocation.tool.name, invocation.input)
+      guardedCalls.set(invocation.toolCallId, { invocation, record, detection })
+
+      if (detection.stuck) {
+        notify(() => observer.onLoopDetection?.({ invocation, detection }))
+      }
+      return detection.stuck
+    },
+    onToolResult: (invocation, result) => {
+      const call = guardedCalls.get(invocation.toolCallId)
+      if (call) detector.recordResult(call.record, result)
+    },
+  }
+
+  for (let step = 1; step <= maxSteps; step++) {
+    await beforeStep?.(step)
+    if (budget.used >= budget.limit) {
+      return stop({ steps: step - 1, stopReason: 'budget' })
+    }
+
+    notify(() => observer.onStepStart?.({ step }))
     let hasToolCall = false
-    let fullText = ''
-    let shouldBreak = false
-    let lastToolCall: { name: string; input: unknown } | null = null
-    let stepResponse: { messages: ModelMessage[] } | undefined
+    let responseMessages: ModelMessage[] = []
     let stepUsage: LanguageModelUsage | undefined
-    // 收集本轮需要追加到 messages 的额外消息（如循环检测警告），
-    // 不在 stream 消费过程中直接 push 到 messages，
-    // 避免抛错时半成品消息（tool-call 无配对 tool-result）被持久化。
-    const pendingMessages: ModelMessage[] = []
+    let approvalRequests: ApprovalRequest[] = []
 
     for (let attempt = 1; ; attempt++) {
       try {
+        const currentApprovals: ApprovalRequest[] = []
         const result = streamText({
           model,
-          system,
-          tools: registry.toAISDKFormat() as ToolSet,
+          system: buildSystem(),
+          tools: registry.toAISDKFormat(runtimeHooks),
           messages,
           maxRetries: 0,
           providerOptions: { openai: { parallelToolCalls: true } },
-          onError: (err) => console.error('[stream error]', err),
+          onError: (error) => notify(() => observer.onStreamError?.({ error })),
         })
 
         for await (const part of result.fullStream) {
           switch (part.type) {
             case 'text-delta':
-              process.stdout.write(part.text)
-              fullText += part.text
+              notify(() => observer.onTextDelta?.({ text: part.text }))
               break
 
-            case 'tool-call': {
+            case 'tool-call':
               hasToolCall = true
-              lastToolCall = { name: part.toolName, input: part.input }
-              console.log(`  [调用: ${part.toolName}(${JSON.stringify(part.input)})]`)
-
-              const detection = detect(part.toolName, part.input)
-
-              if (detection.stuck) {
-                console.log(`  ${detection.message}`)
-                if (detection.level === 'critical') {
-                  shouldBreak = true
-                } else {
-                  pendingMessages.push({
-                    role: 'user' as const,
-                    content: `[系统提醒] ${detection.message}。请换一个思路解决问题，不要重复同样的操作。`,
-                  })
-                }
-              }
-
-              recordCall(part.toolName, part.input)
-
+              notify(() => observer.onToolCall?.({
+                toolCallId: part.toolCallId,
+                toolName: part.toolName,
+                input: part.input,
+              }))
               break
-            }
 
             case 'tool-result':
-              console.log(`  [结果: ${JSON.stringify(part.output)}]`)
-              if (lastToolCall) {
-                recordResult(lastToolCall.name, lastToolCall.input, part.output)
-              }
+              notify(() => observer.onToolResult?.({
+                toolCallId: part.toolCallId,
+                toolName: part.toolName,
+                output: part.output,
+              }))
+              break
+
+            case 'tool-approval-request':
+              currentApprovals.push({
+                approvalId: part.approvalId,
+                toolCallId: part.toolCall.toolCallId,
+              })
               break
           }
         }
 
-        stepResponse = await result.response
+        responseMessages = (await result.response).messages
         stepUsage = await result.usage
+        approvalRequests = currentApprovals
         break
       } catch (error) {
-        console.error(error)
-
-        if (attempt > MAX_RETRIES || !isRetryable(error as Error)) throw error
+        notify(() => observer.onAttemptError?.({ attempt, error }))
+        if (attempt > maxRetries || !isRetryable(error)) throw error
 
         const delay = calculateDelay(attempt)
-
-        console.log(`  [重试] 第 ${attempt}/${MAX_RETRIES} 次失败，${delay}ms 后重试...`)
-
+        notify(() => observer.onRetry?.({ attempt, maxRetries, delayMs: delay }))
         await sleep(delay)
-
         hasToolCall = false
-        fullText = ''
-        shouldBreak = false
-        lastToolCall = null
-        // 清空重试前的 pending 消息，避免重复
-        pendingMessages.length = 0
       }
     }
 
-    if (shouldBreak) {
-      console.log('\n[循环检测触发，Agent 已停止]')
-      break
+    budget.used += usageTokens(stepUsage)
+    const committedMessages = [...responseMessages]
+    let criticalLoopDetected = false
+
+    if (approvalRequests.length > 0) {
+      const approvalContent: ToolModelMessage['content'] = []
+      const calls = approvalRequests.map((request) => {
+        const call = guardedCalls.get(request.toolCallId)
+        if (!call) throw new Error(`找不到待审批工具调用: ${request.toolCallId}`)
+        return { request, call }
+      })
+      criticalLoopDetected = calls.some(
+        ({ call }) => call.detection.stuck && call.detection.level === 'critical',
+      )
+
+      for (const { request, call } of calls) {
+        const loopBlocked = call.detection.stuck
+        const approved = !criticalLoopDetected && !loopBlocked && (await approveTool(call.invocation))
+        const reason = criticalLoopDetected
+          ? '同一步检测到严重循环，已阻止全部待执行工具'
+          : loopBlocked
+            ? call.detection.message
+            : approved
+              ? undefined
+              : '用户拒绝执行'
+
+        approvalContent.push({
+          type: 'tool-approval-response',
+          approvalId: request.approvalId,
+          approved,
+          reason,
+        })
+
+        if (!approved) {
+          const denied = deniedToolResult(call, reason || '工具执行被拒绝')
+          approvalContent.push(denied)
+          detector.recordResult(call.record, denied)
+          continue
+        }
+
+        const execution = await registry.executeTool(
+          call.invocation.tool.name,
+          call.invocation.input,
+          call.invocation.toolCallId,
+          runtimeHooks,
+        )
+        approvalContent.push({
+          type: 'tool-result',
+          toolCallId: call.invocation.toolCallId,
+          toolName: call.invocation.tool.name,
+          output: execution.ok
+            ? { type: 'text', value: execution.output }
+            : { type: 'error-text', value: execution.output },
+        })
+        notify(() => observer.onToolResult?.({
+          toolCallId: call.invocation.toolCallId,
+          toolName: call.invocation.tool.name,
+          output: execution.output,
+        }))
+      }
+
+      committedMessages.push({ role: 'tool', content: approvalContent })
     }
 
-    // 统一追加本轮消息：先追加 pending（循环检测警告等），再追加 SDK 返回的 messages
-    if (pendingMessages.length > 0) {
-      messages.push(...pendingMessages)
+    await onMessages?.(committedMessages)
+    messages.push(...committedMessages)
+
+    notify(() => observer.onBudget?.({ used: budget.used, limit: budget.limit }))
+
+    if (criticalLoopDetected) {
+      return stop({ steps: step, stopReason: 'loop_detected' })
     }
-    if (stepResponse) {
-      messages.push(...stepResponse.messages)
+    if (budget.used >= budget.limit) {
+      return stop({ steps: step, stopReason: 'budget' })
     }
-
-    // Token 预算追踪：budget 由调用方持有，跨轮累计
-    const inp = stepUsage?.inputTokens ?? 0
-    const out = stepUsage?.outputTokens ?? 0
-
-    budget.used += inp + out
-
-    const pct = Math.round((budget.used / budget.limit) * 100)
-
-    console.log(`  [Token] ${budget.used}/${budget.limit} (${pct}%)`)
-
-    if (budget.used > budget.limit) {
-      console.log('\n[Token 预算耗尽，强制停止]')
-      break
-    }
-
     if (!hasToolCall) {
-      if (fullText) console.log()
-      break
+      return stop({ steps: step, stopReason: 'completed' })
     }
 
-    console.log('  \u2192 继续下一步...')
+    notify(() => observer.onContinue?.({ nextStep: step + 1 }))
   }
 
-  if (step >= MAX_STEPS) {
-    console.log('\n[达到最大步数限制，强制停止]')
-  }
+  return stop({ steps: maxSteps, stopReason: 'max_steps' })
 }
