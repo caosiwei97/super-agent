@@ -1,33 +1,30 @@
 import { MCPClient } from './mcp-client.js'
 import type { ToolRegistry } from '../core/tool-registry.js'
-import { canSpawnProcess } from '../core/env.js'
 
-/**
- * 连接 GitHub MCP Server 并把它的工具注册进 registry。
- *
- * 需要环境变量 GITHUB_PERSONAL_ACCESS_TOKEN 且当前环境能 spawn 子进程；
- * 任意一项不满足都会静默降级（不连），不影响 agent 其余功能。
- * 连接失败也只降级、不抛错——MCP 是增强项而非必需项。
- */
-export async function connectGitHubMCP(registry: ToolRegistry): Promise<void> {
-  const githubToken = process.env.GITHUB_PERSONAL_ACCESS_TOKEN
+const GITHUB_MCP_URL = 'https://api.githubcopilot.com/mcp/'
 
-  if (githubToken && canSpawnProcess()) {
-    console.log('\n连接 GitHub MCP Server...')
-    try {
-      const client = new MCPClient('npx', ['-y', '@modelcontextprotocol/server-github'], {
-        GITHUB_PERSONAL_ACCESS_TOKEN: githubToken,
-      })
-      const tools = await registry.registerMCPServer('github', client)
-      console.log(`  已注册 ${tools.length} 个 MCP 工具`)
-      return
-    } catch (err) {
-      console.log(`  MCP 连接失败: ${err instanceof Error ? err.message : err}`)
-      console.log('  降级为 Mock MCP...')
-    }
+export interface GitHubMCPOptions {
+  token?: string
+}
+
+/** Connects to GitHub's hosted Streamable HTTP MCP server. */
+export async function connectGitHubMCP(
+  registry: ToolRegistry,
+  options: GitHubMCPOptions,
+) {
+  if (!options.token) {
+    console.log('\n未配置 GITHUB_PERSONAL_ACCESS_TOKEN，跳过 GitHub MCP')
+    return
   }
-
-  if (!githubToken) {
-    console.log('\n未配置 GITHUB_PERSONAL_ACCESS_TOKEN，使用 Mock MCP')
+  console.log('\n连接 GitHub MCP Server（GitHub 托管 HTTP）...')
+  try {
+    const client = new MCPClient({
+      url: GITHUB_MCP_URL,
+      headers: { Authorization: `Bearer ${options.token}` },
+    })
+    const tools = await registry.registerMCPServer('github', client)
+    console.log(`  已注册 ${tools.length} 个 GitHub MCP 工具`)
+  } catch (error) {
+    console.log(`  MCP 连接失败，继续使用本地工具: ${error instanceof Error ? error.message : error}`)
   }
 }

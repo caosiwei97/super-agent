@@ -1,10 +1,9 @@
 import { Client } from '@modelcontextprotocol/sdk/client'
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 
-interface MCPTool {
-  name: string
-  description: string
-  inputSchema: Record<string, unknown>
+export interface MCPClientOptions {
+  url: string
+  headers?: Record<string, string>
 }
 
 interface MCPCallResult {
@@ -12,50 +11,40 @@ interface MCPCallResult {
   isError?: boolean
 }
 
-/**
- * MCP 客户端：基于官方 @modelcontextprotocol/sdk 实现。
- *
- * 对外保持原有的最小接口契约（connect / listTools / callTool / close），
- * 让 tool-registry 与 index.ts 无需任何改动即可复用。
- */
+/** Hosted Streamable HTTP MCP client backed by the official SDK. */
 export class MCPClient {
   private client: Client | null = null
-  private serverName: string
 
-  constructor(
-    private command: string,
-    private args: string[],
-    private env?: Record<string, string>,
-  ) {
-    this.serverName = args[args.length - 1]?.replace(/^@.*\//, '') || 'mcp-server'
-  }
+  constructor(private readonly options: MCPClientOptions) {}
 
-  async connect(): Promise<void> {
-    // 用 stdio 传输拉起 MCP Server 子进程；协议握手由 SDK 自动完成。
-    // env 默认会继承父进程的安全环境变量，再覆盖以传入的 env（如 token）。
-    const transport = new StdioClientTransport({
-      command: this.command,
-      args: this.args,
-      // process.env 的值是 string | undefined，过滤掉 undefined 以满足 SDK 的 Record<string,string>。
-      env: Object.fromEntries(Object.entries({ ...process.env, ...this.env }).filter(([, v]) => v !== undefined)) as Record<string, string>,
-      // 默认 inherit 会让 server 的 stderr 直接打到主控制台，这里改为忽略，
-      // 避免下载进度 / npm 警告污染 agent 输出。
-      stderr: 'ignore',
+  async connect() {
+    const transport = new StreamableHTTPClientTransport(new URL(this.options.url), {
+      requestInit: { headers: this.options.headers },
     })
 
     // 先用临时变量持有 client，connect 成功后再赋给 this.client。
     // 这样 connect 抛错时 this.client 保持 null，不会出现"已赋值但未连上"的中间状态。
     const client = new Client(
-      { name: 'super-agent', version: '0.5.0' },
+      { name: 'super-agent', version: '1.0.0' },
       { capabilities: {} },
     )
 
-    // SDK 内部会完成 initialize ↔ initialized 握手。
-    await client.connect(transport)
-    this.client = client
+    // SDK 内部会完成 initialize ↔ initialized 握手。失败时主动关闭
+    // 临时 client，避免未进入 registry 生命周期的子进程残留。
+    try {
+      await client.connect(transport)
+      this.client = client
+    } catch (error) {
+      try {
+        await client.close()
+      } catch (closeError) {
+        throw new AggregateError([error, closeError], 'MCP 连接及回滚均失败')
+      }
+      throw error
+    }
   }
 
-  async listTools(): Promise<MCPTool[]> {
+  async listTools() {
     if (!this.client) throw new Error('MCP client 未连接')
     const { tools } = await this.client.listTools()
     // SDK 返回的 Tool 形状与本模块原先约定的 MCPTool 一致，做一次显式映射便于阅读。
@@ -66,7 +55,7 @@ export class MCPClient {
     }))
   }
 
-  async callTool(name: string, args: Record<string, unknown>): Promise<string> {
+  async callTool(name: string, args: Record<string, unknown>) {
     if (!this.client) throw new Error('MCP client 未连接')
     // SDK 返回类型里的 content 是更严格的联合类型，这里统一按文本块抽取，做一次结构断言即可。
     const result = (await this.client.callTool({ name, arguments: args })) as MCPCallResult
@@ -78,15 +67,11 @@ export class MCPClient {
     return texts.join('\n') || '(无返回内容)'
   }
 
-  async close(): Promise<void> {
+  async close() {
     if (this.client) {
       await this.client.close()
       this.client = null
     }
   }
 
-  /** 暴露 server 名，便于日志与调试（index.ts 目前未用，保留备用）。 */
-  get name(): string {
-    return this.serverName
-  }
 }

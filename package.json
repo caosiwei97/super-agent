@@ -1,25 +1,51 @@
 {
   "name": "super-agent",
   "version": "1.0.0",
-  "description": "",
+  "description": "A compact, durable TypeScript agent-loop demo",
+  "private": true,
   "type": "module",
-  "main": "index.js",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "super-agent": "dist/bin/super-agent.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    ".env-example"
+  ],
   "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "start": "tsx src/index.ts"
+    "dev": "tsx src/bin/super-agent.ts",
+    "cli": "tsx src/bin/super-agent.ts",
+    "debug": "node --inspect-brk --import tsx src/bin/super-agent.ts",
+    "start": "tsx src/bin/super-agent.ts",
+    "clean": "node scripts/clean.mjs",
+    "build": "pnpm clean && tsc --skipLibCheck",
+    "build:watch": "pnpm clean && tsc --watch --skipLibCheck --preserveWatchOutput",
+    "prepack": "pnpm build",
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit --skipLibCheck && tsc -p tsconfig.test.json --skipLibCheck",
+    "check": "pnpm typecheck && pnpm test"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
+  "engines": {
+    "node": ">=20"
+  },
   "packageManager": "pnpm@10.33.2",
   "dependencies": {
     "@ai-sdk/openai": "^3.0.53",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "ai": "^6.0.168",
     "dotenv": "^17.4.2",
-    "fast-glob": "^3.3.3",
-    "turndown": "^7.2.4",
-    "zod": "^4.3.6"
+    "fast-glob": "^3.3.3"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",

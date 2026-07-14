@@ -1,71 +1,201 @@
-import { createInterface } from 'node:readline'
-import type { ModelMessage, LanguageModel } from 'ai'
-import { agentLoop, type BudgetState } from '../agent/agent-loop.js'
-import { ToolRegistry } from '../core/tool-registry.js'
-import { buildSystem } from '../context/prompt-builder.js'
-import { SessionStore } from '../session/store.js'
+import { createInterface, type Interface } from 'node:readline'
+import type { LanguageModel } from 'ai'
+import {
+  ConversationRunner,
+  type CompactionPhase,
+  type ConversationState,
+} from '../agent/conversation-runner.js'
+import type { AgentLoopObserver, ToolApprovalHandler } from '../agent/agent-loop.js'
+import type { ToolInvocation, ToolRegistry } from '../core/tool-registry.js'
+import type { CompactionOptions, ContextCompactionResult } from '../context/compressor.js'
+import type { SessionWriter } from '../session/store.js'
 
-export interface ReplDeps {
+export interface CliRuntimeDeps {
   model: LanguageModel
   registry: ToolRegistry
-  messages: ModelMessage[]
-  budget: BudgetState
-  store: SessionStore
+  store: SessionWriter
+  state: ConversationState
+  compaction: CompactionOptions
+  maxSteps: number
+  maxRetries: number
+  autoApprove: boolean
 }
 
-/** 启动时打印工具统计（从旧 main 里抽出来，保持输出一致）。 */
-export function printStartupStats(registry: ToolRegistry): void {
+export function printStartupStats(registry: ToolRegistry) {
   const allTools = registry.getAll()
   const activeTools = registry.getActiveTools()
   const estimate = registry.countTokenEstimate()
 
   console.log(`已注册 ${allTools.length} 个工具：`)
   for (const tool of allTools) {
-    const flags = [tool.isConcurrencySafe ? '可并发' : '串行', tool.isReadOnly ? '只读' : '读写'].join(', ')
-    console.log(`  - ${tool.name}（${flags}）`)
+    const flags = [tool.isConcurrencySafe ? '可并发' : '串行', tool.isReadOnly ? '只读' : '读写']
+    if (tool.requiresApproval || !tool.isReadOnly) flags.push('需审批')
+    console.log(`  - ${tool.name}（${flags.join(', ')}）`)
   }
 
-  console.log(`\n=== 工具统计 ===`)
+  console.log('\n=== 工具统计 ===')
   console.log(`  全部工具: ${allTools.length} 个`)
   console.log(`  活跃工具: ${activeTools.length} 个`)
   console.log(`  延迟工具: ${allTools.length - activeTools.length} 个`)
-  console.log(`  Token 估算: ~${estimate.active} (活跃) + ~${estimate.deferred} (延迟，不占 prompt)`)
+  console.log(`  Token 估算: ~${estimate.active} (活跃) + ~${estimate.deferred} (延迟)`)
 }
 
-/**
- * 启动交互式 REPL。
- *
- * 退出（核心修复）：
- *   - 输入 exit / 空行 → 关闭
- *   - Ctrl+D（EOF）→ readline 触发 'close' 事件
- *   - Ctrl+C → 'SIGINT'，连按两次则强制退出
- * 三路统一收敛到 shutdown()：先 await closeAllMCP 清掉子进程句柄，再 process.exit(0)。
- * 否则 MCP 子进程 / 预览 server 等句柄会让进程在 rl.close() 之后仍挂住。
- */
-export function startRepl({ model, registry, messages, budget, store }: ReplDeps): void {
+function printCompaction(phase: CompactionPhase, result: ContextCompactionResult) {
+  if (result.error) console.warn(`[Compaction] LLM 摘要失败: ${result.error}`)
+  if (result.cleared === 0 && result.compressedCount === 0) return
+
+  const phaseLabel: Record<CompactionPhase, string> = {
+    'before-turn': '发送前',
+    'between-steps': 'Step 间',
+    'after-turn': 'Agent Loop 后',
+  }
+  const actions: string[] = []
+  if (result.cleared > 0) actions.push(`清理 ${result.cleared} 个旧工具结果`)
+  if (result.compressedCount > 0) actions.push(`摘要 ${result.compressedCount} 条消息`)
+  const saved = Math.max(0, result.beforeTokens - result.afterTokens)
+
+  console.log(
+    `[Context:${phaseLabel[phase]}] ${actions.join('，')}，` +
+      `~${result.beforeTokens} → ~${result.afterTokens} tokens` +
+      (saved > 0 ? `（节省 ~${saved}）` : ''),
+  )
+}
+
+function inputPreview(input: unknown) {
+  const serialized = JSON.stringify(input)
+  if (!serialized) return String(input)
+  return serialized.length > 500 ? `${serialized.slice(0, 500)}…` : serialized
+}
+
+function createInteractiveApprovalHandler(
+  rl: Interface,
+  autoApprove: boolean,
+) {
+  return async (invocation: ToolInvocation) => {
+    const description = `${invocation.tool.name}(${inputPreview(invocation.input)})`
+    if (autoApprove) {
+      console.log(`  [自动批准: ${description}]`)
+      return true
+    }
+    if (!process.stdin.isTTY) {
+      console.log(`  [拒绝: 非交互环境无法审批 ${invocation.tool.name}]`)
+      return false
+    }
+
+    return new Promise<boolean>((resolve) => {
+      rl.question(`\n批准执行 ${description}？[y/N] `, (answer) => {
+        resolve(['y', 'yes'].includes(answer.trim().toLowerCase()))
+      })
+    })
+  }
+}
+
+function createNonInteractiveApprovalHandler(autoApprove: boolean) {
+  return async (invocation: ToolInvocation) => {
+    const description = `${invocation.tool.name}(${inputPreview(invocation.input)})`
+    if (autoApprove) {
+      console.log(`  [自动批准: ${description}]`)
+      return true
+    }
+
+    console.log(`  [拒绝: one-shot 模式需使用 --yes 才能批准 ${invocation.tool.name}]`)
+    return false
+  }
+}
+
+function createConsoleObserver() {
+  return {
+    onStepStart: ({ step }) => console.log(`\n--- Step ${step} ---`),
+    onTextDelta: ({ text }) => process.stdout.write(text),
+    onToolCall: ({ toolName, input }) => {
+      console.log(`  [调用: ${toolName}(${JSON.stringify(input)})]`)
+    },
+    onToolResult: ({ output }) => console.log(`  [结果: ${JSON.stringify(output)}]`),
+    onLoopDetection: ({ detection }) => console.log(`  ${detection.stuck ? detection.message : ''}`),
+    onStreamError: ({ error }) => console.error('[stream error]', error),
+    onAttemptError: ({ error }) => console.error(error),
+    onRetry: ({ attempt, maxRetries, delayMs }) => {
+      console.log(`  [重试] 第 ${attempt}/${maxRetries} 次失败，${delayMs}ms 后重试...`)
+    },
+    onBudget: ({ used, limit }) => {
+      const percentage = Math.round((used / limit) * 100)
+      console.log(`  [Token] ${used}/${limit} (${percentage}%)`)
+    },
+    onContinue: () => console.log('  → 继续下一步...'),
+    onStop: ({ stopReason }) => {
+      const messages: Partial<Record<typeof stopReason, string>> = {
+        budget: '\n[Token 预算耗尽，Agent 已停止]',
+        loop_detected: '\n[循环检测触发，Agent 已停止]',
+        max_steps: '\n[达到最大步数限制，Agent 已停止]',
+      }
+      if (messages[stopReason]) console.log(messages[stopReason])
+      else console.log()
+    },
+  } satisfies AgentLoopObserver
+}
+
+function createRunner(deps: CliRuntimeDeps, approveTool: ToolApprovalHandler) {
+  return new ConversationRunner({
+    model: deps.model,
+    registry: deps.registry,
+    store: deps.store,
+    state: deps.state,
+    compaction: deps.compaction,
+    maxSteps: deps.maxSteps,
+    maxRetries: deps.maxRetries,
+    approveTool,
+    observer: createConsoleObserver(),
+    onCompaction: printCompaction,
+  })
+}
+
+/** Executes one automation-friendly turn and releases all tool resources. */
+export async function runOnce(deps: CliRuntimeDeps, prompt: string) {
+  const runner = createRunner(deps, createNonInteractiveApprovalHandler(deps.autoApprove))
+  let turnFailed = false
+  let turnError: unknown
+  try {
+    return await runner.runTurn(prompt)
+  } catch (error) {
+    turnFailed = true
+    turnError = error
+    throw error
+  } finally {
+    try {
+      await deps.registry.close()
+    } catch (closeError) {
+      if (turnFailed) {
+        throw new AggregateError([turnError, closeError], 'Agent 执行与工具资源关闭均失败')
+      }
+      throw closeError
+    }
+  }
+}
+
+/** Interactive shell only; turn orchestration lives in ConversationRunner. */
+export function startRepl(deps: CliRuntimeDeps) {
   const rl = createInterface({ input: process.stdin, output: process.stdout })
+  const runner = createRunner(deps, createInteractiveApprovalHandler(rl, deps.autoApprove))
 
   let shuttingDown = false
   let sigintCount = 0
-  let sigintTimer: NodeJS.Timeout | null = null
+  let sigintTimer: NodeJS.Timeout | undefined
 
-  async function shutdown(force = false): Promise<void> {
+  async function shutdown(force = false) {
     if (shuttingDown) return
     shuttingDown = true
-
     console.log('\nBye!')
 
     if (!force) {
       try {
-        await registry.closeAllMCP()
-      } catch {
-        // 清理失败也不阻塞退出
+        await deps.registry.close()
+      } catch (error) {
+        console.error(`[Shutdown] ${error instanceof Error ? error.message : error}`)
       }
     }
     process.exit(0)
   }
 
-  // Ctrl+C：第一次提醒「再按一次强制退出」，1.5s 内第二次直接 force 退出。
   rl.on('SIGINT', () => {
     sigintCount++
     if (sigintCount >= 2) {
@@ -77,36 +207,28 @@ export function startRepl({ model, registry, messages, budget, store }: ReplDeps
     if (sigintTimer) clearTimeout(sigintTimer)
     sigintTimer = setTimeout(() => {
       sigintCount = 0
-    }, 1500)
+    }, 1_500)
   })
 
-  // Ctrl+D / stdin 关闭：直接走清理。
-  rl.on('close', () => {
-    void shutdown()
-  })
+  rl.on('close', () => void shutdown())
 
-  function ask(): void {
+  function ask() {
     rl.question('\nYou: ', async (input) => {
       const trimmed = input.trim()
-      if (!trimmed || trimmed === 'exit') {
+      if (!trimmed) {
+        ask()
+        return
+      }
+      if (trimmed === 'exit') {
         void shutdown()
         return
       }
-      const userMsg: ModelMessage = { role: 'user', content: trimmed }
-
-      messages.push(userMsg)
-      await store.append(userMsg)
-      const beforeLen = messages.length
 
       try {
-        await agentLoop(model, registry, messages, buildSystem(registry, messages, store), budget)
-      } catch (err) {
-        console.error(`[Agent 出错] ${err instanceof Error ? err.message : err}`)
+        await runner.runTurn(trimmed)
+      } catch (error) {
+        console.error(`[Agent 出错] ${error instanceof Error ? error.message : error}`)
       }
-      // 持久化本轮新增的消息（agent loop 会往 messages 里 push assistant/tool 消息）
-      const newMessages = messages.slice(beforeLen)
-      await store.appendAll(newMessages)
-
       ask()
     })
   }
