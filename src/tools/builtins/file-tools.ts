@@ -1,229 +1,228 @@
-import { readFileSync, writeFileSync, readdirSync, statSync, existsSync } from 'node:fs'
-import { join, relative, resolve } from 'node:path'
+import { readFile, readdir, stat, writeFile } from 'node:fs/promises'
+import { isAbsolute, relative } from 'node:path'
 import fg from 'fast-glob'
 import type { ToolDefinition } from '../../core/tool-registry.js'
+import type { Workspace } from '../../core/workspace.js'
 
-export const readFileTool: ToolDefinition = {
-  name: 'read_file',
-  description: '读取指定路径的文件内容',
-  parameters: {
-    type: 'object',
-    properties: {
-      path: { type: 'string', description: '文件路径' },
-    },
-    required: ['path'],
-    additionalProperties: false,
-  },
-  isConcurrencySafe: true,
-  isReadOnly: true,
-  maxResultChars: 500,
-  execute: async ({ path }: { path: string }) => {
-    const resolved = resolve(path)
-    return readFileSync(resolved, 'utf-8')
-  },
-}
+const MAX_SEARCH_FILES = 2_000
+const MAX_SEARCH_FILE_BYTES = 1024 * 1024
+const MAX_EDIT_FILE_BYTES = 2 * 1024 * 1024
+const MAX_MATCHES = 50
+const MAX_GLOB_RESULTS = 500
+const MAX_DIRECTORY_ENTRIES = 500
+const MAX_MATCH_LINE_CHARS = 500
 
-export const writeFileTool: ToolDefinition = {
-  name: 'write_file',
-  description: '写入内容到指定文件。如果文件已存在则覆盖',
-  parameters: {
-    type: 'object',
-    properties: {
-      path: { type: 'string', description: '文件路径' },
-      content: { type: 'string', description: '要写入的内容' },
+export function createFileTools(workspace: Workspace) {
+  const readFileTool: ToolDefinition = {
+    name: 'read_file',
+    description: '读取工作区内指定路径的 UTF-8 文件内容',
+    parameters: {
+      type: 'object',
+      properties: { path: { type: 'string', description: '工作区内的文件路径' } },
+      required: ['path'],
+      additionalProperties: false,
     },
-    required: ['path', 'content'],
-    additionalProperties: false,
-  },
-  isConcurrencySafe: false,
-  isReadOnly: false,
-  execute: async ({ path, content }: { path: string; content: string }) => {
-    const resolved = resolve(path)
-    writeFileSync(resolved, content, 'utf-8')
-    return `已写入 ${content.length} 字符到 ${path}`
-  },
-}
+    isConcurrencySafe: true,
+    isReadOnly: true,
+    maxResultChars: 3_000,
+    execute: async ({ path }: { path: string }) => {
+      const resolved = workspace.resolveExisting(path)
+      if ((await stat(resolved)).size > MAX_EDIT_FILE_BYTES) {
+        return `文件超过 ${MAX_EDIT_FILE_BYTES} 字节读取限制`
+      }
+      return readFile(resolved, 'utf-8')
+    },
+  }
 
-export const listDirectoryTool: ToolDefinition = {
-  name: 'list_directory',
-  description: '列出指定目录下的文件和子目录',
-  parameters: {
-    type: 'object',
-    properties: {
-      path: { type: 'string', description: '目录路径，默认为当前目录' },
+  const writeFileTool: ToolDefinition = {
+    name: 'write_file',
+    description: '写入工作区内的文件；文件存在时会覆盖，需要用户审批',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '工作区内的文件路径' },
+        content: { type: 'string', description: '要写入的内容' },
+      },
+      required: ['path', 'content'],
+      additionalProperties: false,
     },
-    required: [],
-    additionalProperties: false,
-  },
-  isConcurrencySafe: true,
-  isReadOnly: true,
-  execute: async ({ path = '.' }: { path?: string }) => {
-    const resolved = resolve(path)
-    const entries = readdirSync(resolved)
-    return entries
-      .map((name) => {
-        try {
-          const stat = statSync(join(resolved, name))
-          return `${stat.isDirectory() ? '[DIR]' : '[FILE]'} ${name}`
-        } catch {
-          return `[?] ${name}`
-        }
+    isConcurrencySafe: false,
+    isReadOnly: false,
+    requiresApproval: true,
+    execute: async ({ path, content }: { path: string; content: string }) => {
+      if (Buffer.byteLength(content, 'utf-8') > MAX_EDIT_FILE_BYTES) {
+        return `写入内容超过 ${MAX_EDIT_FILE_BYTES} 字节限制`
+      }
+      await writeFile(workspace.resolveForWrite(path), content, 'utf-8')
+      return `已写入 ${content.length} 字符到 ${path}`
+    },
+  }
+
+  const listDirectoryTool: ToolDefinition = {
+    name: 'list_directory',
+    description: '列出工作区内指定目录的文件和子目录',
+    parameters: {
+      type: 'object',
+      properties: { path: { type: 'string', description: '工作区内目录，默认当前工作区' } },
+      required: [],
+      additionalProperties: false,
+    },
+    isConcurrencySafe: true,
+    isReadOnly: true,
+    execute: async ({ path = '.' }: { path?: string }) => {
+      const directory = workspace.resolveExisting(path)
+      const entries = await readdir(directory, { withFileTypes: true })
+      const rendered = entries
+        .sort((left, right) => left.name.localeCompare(right.name))
+        .slice(0, MAX_DIRECTORY_ENTRIES)
+        .map((entry) => `${entry.isDirectory() ? '[DIR]' : '[FILE]'} ${entry.name}`)
+        .join('\n')
+      return entries.length > MAX_DIRECTORY_ENTRIES ? `${rendered}\n... (结果已截断)` : rendered
+    },
+  }
+
+  const editFileTool: ToolDefinition = {
+    name: 'edit_file',
+    description: '精确替换工作区文件中的唯一文本片段，需要用户审批',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '工作区内的文件路径' },
+        old_string: { type: 'string', description: '必须唯一匹配的原始文本' },
+        new_string: { type: 'string', description: '替换后的文本' },
+      },
+      required: ['path', 'old_string', 'new_string'],
+      additionalProperties: false,
+    },
+    isConcurrencySafe: false,
+    isReadOnly: false,
+    requiresApproval: true,
+    execute: async ({ path, old_string, new_string }: {
+      path: string
+      old_string: string
+      new_string: string
+    }) => {
+      if (!old_string) return 'old_string 不能为空'
+      const resolved = workspace.resolveExisting(path)
+      if ((await stat(resolved)).size > MAX_EDIT_FILE_BYTES) {
+        return `文件超过 ${MAX_EDIT_FILE_BYTES} 字节编辑限制`
+      }
+      const content = await readFile(resolved, 'utf-8')
+      const count = content.split(old_string).length - 1
+      if (count === 0) return '未找到匹配内容，请检查空格和换行'
+      if (count > 1) return `找到 ${count} 处匹配，请提供更多上下文使 old_string 唯一`
+
+      const updated = content.replace(old_string, () => new_string)
+      if (Buffer.byteLength(updated, 'utf-8') > MAX_EDIT_FILE_BYTES) {
+        return `替换后的文件超过 ${MAX_EDIT_FILE_BYTES} 字节限制`
+      }
+      await writeFile(resolved, updated, 'utf-8')
+      return `已替换 ${path} 中的内容（${old_string.length} → ${new_string.length} 字符）`
+    },
+  }
+
+  const globTool: ToolDefinition = {
+    name: 'glob',
+    description: '在工作区内按 glob 模式搜索文件，如 src/**/*.ts',
+    parameters: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'glob 模式' },
+        path: { type: 'string', description: '工作区内搜索起点，默认当前工作区' },
+      },
+      required: ['pattern'],
+      additionalProperties: false,
+    },
+    isConcurrencySafe: true,
+    isReadOnly: true,
+    maxResultChars: 3_000,
+    execute: async ({ pattern, path = '.' }: { pattern: string; path?: string }) => {
+      if (isAbsolute(pattern) || pattern.split(/[\\/]/).includes('..')) {
+        return 'glob pattern 不允许使用绝对路径或 .. 跳出搜索目录'
+      }
+      const results = await fg(pattern, {
+        cwd: workspace.resolveExisting(path),
+        ignore: ['node_modules/**', '.git/**'],
+        dot: false,
+        onlyFiles: true,
+        followSymbolicLinks: false,
+        unique: true,
       })
-      .join('\n')
-  },
-}
-export const editFileTool: ToolDefinition = {
-  name: 'edit_file',
-  description: '精确替换文件中的指定内容。用 old_string 定位要替换的文本，用 new_string 替换它。不是全量覆写——只改你指定的部分',
-  parameters: {
-    type: 'object',
-    properties: {
-      path: { type: 'string', description: '文件路径' },
-      old_string: { type: 'string', description: '要被替换的原始文本（必须精确匹配）' },
-      new_string: { type: 'string', description: '替换后的新文本' },
+      if (results.length === 0) return `没有找到匹配 "${pattern}" 的文件`
+      const sorted = results.sort()
+      const suffix = sorted.length > MAX_GLOB_RESULTS ? '\n... (结果已截断)' : ''
+      return sorted.slice(0, MAX_GLOB_RESULTS).join('\n') + suffix
     },
-    required: ['path', 'old_string', 'new_string'],
-    additionalProperties: false,
-  },
-  isConcurrencySafe: false,
-  isReadOnly: false,
-  execute: async ({ path, old_string, new_string }: { path: string; old_string: string; new_string: string }) => {
-    const resolved = resolve(path)
-    if (!existsSync(resolved)) return `文件不存在: ${path}`
+  }
 
-    const content = readFileSync(resolved, 'utf-8')
-    const count = content.split(old_string).length - 1
-
-    if (count === 0) {
-      return `未找到匹配内容。请检查 old_string 是否与文件中的文本完全一致（包括空格和换行）`
-    }
-    if (count > 1) {
-      return `找到 ${count} 处匹配，请提供更多上下文让 old_string 唯一`
-    }
-
-    // 用函数形式替换，避免 new_string 中的 $& $1 等特殊模式被解释为反向引用
-    const updated = content.replace(old_string, () => new_string)
-    writeFileSync(resolved, updated, 'utf-8')
-    return `已替换 ${path} 中的内容（${old_string.length} → ${new_string.length} 字符）`
-  },
-}
-
-export const globTool: ToolDefinition = {
-  name: 'glob',
-  description: '按模式搜索文件。支持 * 和 ** 通配符，如 "src/**/*.ts" 匹配 src 下所有 TypeScript 文件',
-  parameters: {
-    type: 'object',
-    properties: {
-      pattern: { type: 'string', description: '搜索模式，如 "**/*.ts"、"src/*.json"' },
-      path: { type: 'string', description: '搜索起始目录，默认当前目录' },
+  const grepTool: ToolDefinition = {
+    name: 'grep',
+    description: '在工作区文件中按正则表达式搜索，返回最多 50 条匹配',
+    parameters: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: '长度不超过 200 的正则表达式' },
+        path: { type: 'string', description: '工作区内文件或目录，默认当前工作区' },
+      },
+      required: ['pattern'],
+      additionalProperties: false,
     },
-    required: ['pattern'],
-    additionalProperties: false,
-  },
-  isConcurrencySafe: true,
-  isReadOnly: true,
-  execute: async ({ pattern, path = '.' }: { pattern: string; path?: string }) => {
-    const results = await fg(pattern, {
-      cwd: resolve(path),
-      ignore: ['node_modules/**', '.git/**'],
-      dot: false,
-      onlyFiles: true,
-      followSymbolicLinks: false,
-    })
-    if (results.length === 0) return `没有找到匹配 "${pattern}" 的文件`
-    return results.sort().join('\n')
-  },
-}
+    isConcurrencySafe: true,
+    isReadOnly: true,
+    maxResultChars: 3_000,
+    execute: async ({ pattern, path = '.' }: { pattern: string; path?: string }) => {
+      if (pattern.length > 200) return '正则表达式过长（最大 200 字符）'
 
-export const grepTool: ToolDefinition = {
-  name: 'grep',
-  description: '在文件中搜索匹配指定模式的内容。返回匹配的行号和内容',
-  parameters: {
-    type: 'object',
-    properties: {
-      pattern: { type: 'string', description: '搜索模式（正则表达式）' },
-      path: { type: 'string', description: '搜索路径（文件或目录），默认当前目录' },
-    },
-    required: ['pattern'],
-    additionalProperties: false,
-  },
-  isConcurrencySafe: true,
-  isReadOnly: true,
-  maxResultChars: 3000,
-  execute: async ({ pattern, path = '.' }: { pattern: string; path?: string }) => {
-    const baseDir = resolve(path)
-    let regex: RegExp
-    try {
-      regex = new RegExp(pattern, 'i')
-    } catch {
-      return `无效的正则表达式: "${pattern}"。请检查语法是否正确`
-    }
-    const matches: string[] = []
-    const SKIP = new Set(['node_modules', '.git', 'dist'])
-    const BIN_EXT = new Set(['.png', '.jpg', '.gif', '.woff', '.woff2', '.ico', '.lock'])
-
-    function searchFile(filePath: string) {
-      if (matches.length >= 50) return
-      const ext = filePath.slice(filePath.lastIndexOf('.'))
-      if (BIN_EXT.has(ext)) return
-
-      let content: string
+      let regex: RegExp
       try {
-        content = readFileSync(filePath, 'utf-8')
+        regex = new RegExp(pattern, 'i')
       } catch {
-        return
+        return `无效的正则表达式: "${pattern}"`
       }
 
-      const lines = content.split('\n')
-      const rel = relative(baseDir, filePath)
-      for (let i = 0; i < lines.length; i++) {
-        if (regex.test(lines[i])) {
-          matches.push(`${rel}:${i + 1}: ${lines[i].trimEnd()}`)
-          if (matches.length >= 50) return
-        }
-      }
-    }
+      const base = workspace.resolveExisting(path)
+      const baseStat = await stat(base)
+      const files = baseStat.isFile()
+        ? [base]
+        : (await fg('**/*', {
+            cwd: base,
+            absolute: true,
+            onlyFiles: true,
+            followSymbolicLinks: false,
+            ignore: ['node_modules/**', '.git/**', 'dist/**'],
+          })).slice(0, MAX_SEARCH_FILES)
+      const matches: string[] = []
 
-    function walk(dir: string) {
-      if (matches.length >= 50) return
-      let entries: string[]
-      try {
-        entries = readdirSync(dir)
-      } catch {
-        return
-      }
+      for (const file of files) {
+        if (matches.length >= MAX_MATCHES) break
+        const fileStat = await stat(file)
+        if (fileStat.size > MAX_SEARCH_FILE_BYTES) continue
 
-      for (const name of entries) {
-        if (SKIP.has(name)) continue
-        const full = join(dir, name)
+        let content: string
         try {
-          const stat = statSync(full)
-          if (stat.isDirectory()) walk(full)
-          else searchFile(full)
+          content = await readFile(file, 'utf-8')
         } catch {
-          /* skip */
+          continue
+        }
+
+        const lines = content.split('\n')
+        for (let index = 0; index < lines.length; index++) {
+          // Bound regex work per line; matching output is truncated separately.
+          if (!regex.test(lines[index].slice(0, 10_000))) continue
+          const line = lines[index].trimEnd()
+          const preview = line.length > MAX_MATCH_LINE_CHARS
+            ? `${line.slice(0, MAX_MATCH_LINE_CHARS)}…`
+            : line
+          matches.push(`${relative(baseStat.isFile() ? workspace.root : base, file)}:${index + 1}: ${preview}`)
+          if (matches.length >= MAX_MATCHES) break
         }
       }
-    }
 
-    const stat = statSync(baseDir)
-    if (stat.isFile()) {
-      searchFile(baseDir)
-    } else {
-      walk(baseDir)
-    }
+      if (matches.length === 0) return `没有找到匹配 "${pattern}" 的内容`
+      const suffix = matches.length >= MAX_MATCHES ? '\n... (结果已截断)' : ''
+      return matches.join('\n') + suffix
+    },
+  }
 
-    if (matches.length === 0) return `没有找到匹配 "${pattern}" 的内容`
-    const suffix = matches.length >= 50 ? '\n... (结果已截断，共 50+ 条匹配)' : ''
-    return matches.join('\n') + suffix
-  },
+  return [readFileTool, writeFileTool, listDirectoryTool, editFileTool, globTool, grepTool]
 }
-
-export const fileTools: ToolDefinition[] = [
-  readFileTool,
-  writeFileTool,
-  listDirectoryTool,
-  editFileTool,
-  globTool,
-  grepTool,
-]

@@ -1,5 +1,19 @@
-import { jsonSchema } from 'ai'
-import type { MCPClient } from '../mcp/mcp-client.js'
+import { jsonSchema, type ToolExecutionOptions, type ToolSet } from 'ai'
+import { AsyncReadWriteLock } from './async-rw-lock.js'
+
+export interface MCPToolDescriptor {
+  name: string
+  description: string
+  inputSchema: Record<string, unknown>
+}
+
+/** Narrow port keeps the registry independent from the MCP transport implementation. */
+export interface MCPToolClient {
+  connect(): Promise<void>
+  listTools(): Promise<MCPToolDescriptor[]>
+  callTool(name: string, args: Record<string, unknown>): Promise<unknown>
+  close(): Promise<void>
+}
 
 export interface ToolDefinition {
   name: string
@@ -7,128 +21,141 @@ export interface ToolDefinition {
   parameters: Record<string, unknown>
   isConcurrencySafe?: boolean
   isReadOnly?: boolean
+  requiresApproval?: boolean
   maxResultChars?: number
+  // Tool input is validated by the AI SDK against `parameters` before execution.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   execute: (input: any) => Promise<unknown>
+  dispose?: () => Promise<void> | void
   shouldDefer?: boolean
   searchHint?: string
 }
 
-const DEFAULT_MAX_RESULT_CHARS = 3000
+export interface ToolInvocation {
+  tool: ToolDefinition
+  input: unknown
+  toolCallId: string
+}
+
+export interface ToolRuntimeHooks {
+  inspectToolCall?: (invocation: ToolInvocation) => boolean | Promise<boolean>
+  onExecutionStart?: (invocation: ToolInvocation) => void | Promise<void>
+  onToolResult?: (
+    invocation: ToolInvocation,
+    result: { ok: boolean; output: string },
+  ) => void | Promise<void>
+}
+
+export interface ToolExecutionResult {
+  ok: boolean
+  output: string
+}
+
+const DEFAULT_MAX_RESULT_CHARS = 3_000
 
 export class ToolRegistry {
-  private tools = new Map<string, ToolDefinition>()
-  private mcpClients: Array<MCPClient> = []
+  private readonly tools = new Map<string, ToolDefinition>()
+  private readonly mcpClients: MCPToolClient[] = []
+  private readonly discoveredTools = new Set<string>()
+  private readonly executionLock = new AsyncReadWriteLock()
+  private closePromise: Promise<void> | undefined
+  private closed = false
 
-  private exclusiveLock = false
-  private concurrentCount = 0
-  private waitQueue: Array<() => void> = []
-
-  private discoveredTools = new Set<string>()
-
-  register(...tools: ToolDefinition[]): void {
+  register(...tools: ToolDefinition[]) {
+    if (this.closed) throw new Error('ToolRegistry 已关闭，不能继续注册工具')
+    const incomingNames = new Set<string>()
+    for (const tool of tools) {
+      if (this.tools.has(tool.name) || incomingNames.has(tool.name)) {
+        throw new Error(`工具重复注册: ${tool.name}`)
+      }
+      incomingNames.add(tool.name)
+    }
     for (const tool of tools) {
       this.tools.set(tool.name, tool)
     }
   }
 
-  async registerMCPServer(serverName: string, client: MCPClient): Promise<string[]> {
-    await client.connect()
-    this.mcpClients.push(client)
+  async registerMCPServer(serverName: string, client: MCPToolClient) {
+    if (this.closed) throw new Error('ToolRegistry 已关闭，不能连接 MCP Server')
 
-    const tools = await client.listTools()
-    const registered: string[] = []
+    try {
+      await client.connect()
+      const tools = await client.listTools()
+      const definitions: ToolDefinition[] = []
 
-    for (const tool of tools) {
-      const prefixedName = `mcp__${serverName}__${tool.name}`
-      if (this.tools.has(prefixedName)) continue
+      for (const tool of tools) {
+        const prefixedName = `mcp__${serverName}__${tool.name}`
+        if (this.tools.has(prefixedName)) continue
 
-      const toolClient = client
-      const originalName = tool.name
+        const originalName = tool.name
+        definitions.push({
+          name: prefixedName,
+          description: `[MCP:${serverName}] ${tool.description}`,
+          parameters: tool.inputSchema,
+          // MCP schemas do not expose trustworthy read/write metadata. Default to
+          // serialized execution with explicit approval.
+          isConcurrencySafe: false,
+          isReadOnly: false,
+          requiresApproval: true,
+          maxResultChars: 3_000,
+          shouldDefer: true,
+          searchHint: `${serverName} ${tool.name} ${tool.description}`,
+          execute: (input) => client.callTool(originalName, input),
+        })
+      }
 
-      this.register({
-        name: prefixedName,
-        description: `[MCP:${serverName}] ${tool.description}`,
-        parameters: tool.inputSchema as Record<string, unknown>,
-        // 真实 MCP 工具的读写属性无法确定，保守起见走串行 + 读写标记，
-        // 避免把 create_issue 等写工具当只读并发执行。
-        isConcurrencySafe: false,
-        isReadOnly: false,
-        maxResultChars: 3000,
-        shouldDefer: true,
-        searchHint: `${serverName} ${tool.name} ${tool.description}`,
-        execute: async (input) => {
-          return toolClient.callTool(originalName, input)
-        },
-      })
-
-      registered.push(prefixedName)
+      this.register(...definitions)
+      this.mcpClients.push(client)
+      return definitions.map((tool) => tool.name)
+    } catch (error) {
+      try {
+        await client.close()
+      } catch (closeError) {
+        throw new AggregateError([error, closeError], `MCP Server ${serverName} 注册及回滚均失败`)
+      }
+      throw error
     }
-
-    return registered
   }
 
-  async closeAllMCP(): Promise<void> {
-    for (const client of this.mcpClients) {
-      await client.close()
-    }
-    this.mcpClients = []
-  }
-
-  get(name: string): ToolDefinition | undefined {
+  get(name: string) {
     return this.tools.get(name)
   }
 
-  getAll(): ToolDefinition[] {
+  getAll() {
     return Array.from(this.tools.values())
   }
 
-  /** 工具是否被延迟加载且尚未被 tool_search 发现。 */
-  private isDeferred(tool: ToolDefinition): boolean {
-    return !!tool.shouldDefer && !this.discoveredTools.has(tool.name)
-  }
-
-  getActiveTools(): ToolDefinition[] {
+  getActiveTools() {
     return this.getAll().filter((tool) => !this.isDeferred(tool))
   }
 
-  getDeferredToolSummary(): string {
+  getDeferredToolSummary() {
     const deferred = this.getAll().filter((tool) => this.isDeferred(tool))
-
     if (deferred.length === 0) return ''
 
-    const lines = deferred.map((t) => {
-      const hint = t.searchHint ? ` — ${t.searchHint}` : ''
-      return `  - ${t.name}${hint}`
+    const lines = deferred.map((tool) => {
+      const hint = tool.searchHint ? ` — ${tool.searchHint}` : ''
+      return `  - ${tool.name}${hint}`
     })
-
     return `\n以下工具可用，但需要先通过 tool_search 搜索获取完整定义：\n${lines.join('\n')}`
   }
 
-  searchTools(query: string): ToolDefinition[] {
-    const q = query.trim()
+  searchTools(query: string) {
+    const names = query.includes(',')
+      ? query.split(',').map((name) => name.trim()).filter(Boolean)
+      : [query.trim()]
     const results: ToolDefinition[] = []
-
-    // 支持逗号分隔的多个工具名，如 "mcp__github__list_issues,mcp__github__search_repositories"
-    const names = q.includes(',')
-      ? q
-          .split(',')
-          .map((n) => n.trim())
-          .filter(Boolean)
-      : [q]
 
     for (const name of names) {
       const tool = this.tools.get(name)
-      if (tool && tool.name !== 'tool_search') {
-        results.push(tool)
-        this.discoveredTools.add(tool.name)
-      }
+      if (!tool || tool.name === 'tool_search') continue
+      results.push(tool)
+      this.discoveredTools.add(tool.name)
     }
-
     return results
   }
 
-  countTokenEstimate(): { active: number; deferred: number; total: number } {
+  countTokenEstimate() {
     let active = 0
     let deferred = 0
 
@@ -139,107 +166,107 @@ export class ToolRegistry {
         parameters: tool.parameters,
       }).length
       const tokens = Math.ceil(schemaSize / 4)
-
-      if (this.isDeferred(tool)) {
-        deferred += tokens
-      } else {
-        active += tokens
-      }
+      if (this.isDeferred(tool)) deferred += tokens
+      else active += tokens
     }
-
     return { active, deferred, total: active + deferred }
   }
 
-  /**
-   * 获取并发读锁：等待排他锁释放后，concurrentCount++。
-   *
-   * 被唤醒后必须重新检查 exclusiveLock——不能假设被唤醒就意味着条件满足，
-   * 因为 release 时一次性唤醒了所有等待者，可能多个 concurrent 和 exclusive
-   * 同时醒来，exclusive 醒来后拿到锁，concurrent 醒来后应继续等待。
-   */
-  private async acquireConcurrent(): Promise<void> {
-    while (this.exclusiveLock) {
-      await new Promise<void>((r) => this.waitQueue.push(r))
-    }
-    this.concurrentCount++
-  }
-
-  private releaseConcurrent(): void {
-    this.concurrentCount--
-    if (this.concurrentCount === 0) this.drainQueue()
-  }
-
-  /**
-   * 获取独占写锁：等待所有并发读完成 + 无其他排他锁。
-   *
-   * 同样在唤醒后重新检查条件，避免与 concurrent 竞争。
-   */
-  private async acquireExclusive(): Promise<void> {
-    while (this.exclusiveLock || this.concurrentCount > 0) {
-      await new Promise<void>((r) => this.waitQueue.push(r))
-    }
-    this.exclusiveLock = true
-  }
-
-  private releaseExclusive(): void {
-    this.exclusiveLock = false
-    this.drainQueue()
-  }
-
-  /**
-   * 唤醒所有等待者。每个等待者在 resolve 后会回到 while 循环重新检查条件，
-   * 不满足的会重新入队等待下一次唤醒，从而避免锁竞态。
-   */
-  private drainQueue(): void {
-    const waiting = this.waitQueue.splice(0)
-    for (const resolve of waiting) resolve()
-  }
-
-  toAISDKFormat(): Record<string, unknown> {
+  toAISDKFormat(hooks: ToolRuntimeHooks = {}) {
     const result: Record<string, unknown> = {}
-    const activeTools = this.getActiveTools()
 
-    for (const tool of activeTools) {
-      const maxChars = tool.maxResultChars
-      const executeFn = tool.execute
-      const isSafe = tool.isConcurrencySafe === true
-      const registry = this
-
+    for (const tool of this.getActiveTools()) {
       result[tool.name] = {
         description: tool.description,
         inputSchema: jsonSchema(tool.parameters),
-        execute: async (input: Record<string, unknown>) => {
-          if (isSafe) {
-            await registry.acquireConcurrent()
-          } else {
-            await registry.acquireExclusive()
-          }
-          try {
-            const raw = await executeFn(input)
-            const text = typeof raw === 'string' ? raw : JSON.stringify(raw, null, 2)
-            return truncateResult(text, maxChars)
-          } finally {
-            if (isSafe) {
-              registry.releaseConcurrent()
-            } else {
-              registry.releaseExclusive()
-            }
-          }
+        needsApproval: async (input: unknown, options: ToolExecutionOptions) => {
+          const invocation = { tool, input, toolCallId: options.toolCallId }
+          const forcedApproval = await hooks.inspectToolCall?.(invocation)
+          return forcedApproval === true || tool.requiresApproval === true || tool.isReadOnly !== true
+        },
+        execute: async (input: unknown, options: ToolExecutionOptions) => {
+          const execution = await this.executeTool(tool.name, input, options.toolCallId, hooks)
+          if (!execution.ok) throw new Error(execution.output)
+          return execution.output
         },
       }
     }
-    return result
+
+    return result as ToolSet
+  }
+
+  async executeTool(
+    toolName: string,
+    input: unknown,
+    toolCallId: string,
+    hooks: ToolRuntimeHooks = {},
+  ) {
+    if (this.closed) return { ok: false, output: 'ToolRegistry 已关闭' }
+    const tool = this.tools.get(toolName)
+    if (!tool) return { ok: false, output: `工具不存在: ${toolName}` }
+
+    const release = tool.isConcurrencySafe
+      ? await this.executionLock.acquireRead()
+      : await this.executionLock.acquireWrite()
+    const invocation = { tool, input, toolCallId }
+
+    try {
+      let execution: ToolExecutionResult
+      try {
+        await hooks.onExecutionStart?.(invocation)
+        const raw = await tool.execute(input)
+        const serialized = typeof raw === 'string' ? raw : JSON.stringify(raw, null, 2) ?? String(raw)
+        execution = { ok: true, output: truncateResult(serialized, tool.maxResultChars) }
+      } catch (error) {
+        execution = { ok: false, output: error instanceof Error ? error.message : String(error) }
+      }
+
+      // Result observers run exactly once. Hook failures intentionally propagate:
+      // silently swallowing them would desynchronize loop detection from execution.
+      await hooks.onToolResult?.(invocation, execution)
+      return execution
+    } finally {
+      release()
+    }
+  }
+
+  async close() {
+    if (this.closePromise) return this.closePromise
+    this.closed = true
+    this.closePromise = this.closeResources()
+    return this.closePromise
+  }
+
+  private async closeResources() {
+    const release = await this.executionLock.acquireWrite()
+    try {
+      const disposers = this.getAll().flatMap((tool) => (tool.dispose ? [tool.dispose] : []))
+      const operations = [
+        ...disposers.map((dispose) => Promise.resolve().then(dispose)),
+        ...this.mcpClients.map((client) => client.close()),
+      ]
+      this.mcpClients.length = 0
+
+      const results = await Promise.allSettled(operations)
+      const errors = results
+        .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+        .map((result) => result.reason)
+      if (errors.length > 0) throw new AggregateError(errors, '部分工具资源关闭失败')
+    } finally {
+      release()
+    }
+  }
+
+  private isDeferred(tool: ToolDefinition) {
+    return tool.shouldDefer === true && !this.discoveredTools.has(tool.name)
   }
 }
 
-export function truncateResult(text: string, maxChars: number = DEFAULT_MAX_RESULT_CHARS): string {
+export function truncateResult(text: string, maxChars = DEFAULT_MAX_RESULT_CHARS) {
   if (text.length <= maxChars) return text
 
   const headSize = Math.floor(maxChars * 0.6)
   const tailSize = maxChars - headSize
-  const head = text.slice(0, headSize)
-  const tail = text.slice(-tailSize)
   const dropped = text.length - headSize - tailSize
-
-  return `${head}\n\n... [省略 ${dropped} 字符] ...\n\n${tail}`
+  return `${text.slice(0, headSize)}\n\n... [省略 ${dropped} 字符] ...\n\n${text.slice(-tailSize)}`
 }

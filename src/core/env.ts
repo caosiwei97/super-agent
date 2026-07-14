@@ -8,7 +8,7 @@ let canSpawnCache: boolean | null = null
  * WebContainer 等沙箱环境不支持 execSync，会在首次调用时抛错。
  * 用模块级缓存避免每次工具调用都重复探测。
  */
-export function canSpawnProcess(): boolean {
+export function canSpawnProcess() {
   if (canSpawnCache !== null) return canSpawnCache
   try {
     execSync('echo test', { stdio: 'ignore' })

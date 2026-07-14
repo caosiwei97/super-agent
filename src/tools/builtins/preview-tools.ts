@@ -1,17 +1,13 @@
-import { readFileSync, existsSync } from 'node:fs'
-import { extname, join, resolve, sep } from 'node:path'
-import { createServer, Server } from 'node:http'
+import { readFile, realpath, stat } from 'node:fs/promises'
+import { extname, isAbsolute, relative, resolve, sep } from 'node:path'
+import { createServer, type Server } from 'node:http'
 import type { ToolDefinition } from '../../core/tool-registry.js'
-
-let previewServer: Server | null = null
+import type { Workspace } from '../../core/workspace.js'
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.js': 'application/javascript; charset=utf-8',
-  '.tsx': 'application/javascript; charset=utf-8',
-  '.ts': 'application/javascript; charset=utf-8',
-  '.jsx': 'application/javascript; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
@@ -19,60 +15,91 @@ const MIME: Record<string, string> = {
   '.ico': 'image/x-icon',
 }
 
-export const startPreviewTool: ToolDefinition = {
-  name: 'start_preview',
-  description: '启动 app/ 目录的预览服务器，让浏览器能访问生成的网页应用。生成应用文件后必须立即调用此工具',
-  parameters: {
-    type: 'object',
-    properties: {
-      port: { type: 'number', description: '端口号，默认 8080' },
+export function createPreviewTools(workspace: Workspace) {
+  let server: Server | undefined
+  let serverPort: number | undefined
+
+  const tool: ToolDefinition = {
+    name: 'start_preview',
+    description: '启动工作区 app/ 目录的静态预览服务器，需要用户审批',
+    parameters: {
+      type: 'object',
+      properties: { port: { type: 'number', description: '端口号，默认 8080' } },
+      required: [],
+      additionalProperties: false,
     },
-    required: [],
-    additionalProperties: false,
-  },
-  isConcurrencySafe: false,
-  isReadOnly: false,
-  execute: async ({ port = 8080 }: { port?: number } = {}) => {
-    const root = resolve('app')
-    if (!existsSync(root)) return '错误：app/ 目录不存在，请先用 write_file 生成应用文件'
-
-    if (previewServer) return `预览服务器已在运行 → http://localhost:${port}`
-
-    previewServer = createServer((req, res) => {
-      const urlPath = (req.url?.split('?')[0] || '/').replace(/\/$/, '/index.html')
-      const filePath = join(root, urlPath === '/' ? '/index.html' : urlPath)
+    isConcurrencySafe: false,
+    isReadOnly: false,
+    requiresApproval: true,
+    execute: async ({ port = 8080 }: { port?: number } = {}) => {
+      if (!Number.isInteger(port) || port < 1 || port > 65_535) return `非法端口: ${port}`
+      let root: string
       try {
-        // 路径穿越校验：resolve 后必须仍在 root 目录内。
-        // 用 root + sep 避免 "app-evil/" 这种前缀匹配绕过。
-        const resolvedPath = resolve(filePath)
-        if (resolvedPath !== root && !resolvedPath.startsWith(root + sep)) {
-          res.writeHead(403)
-          res.end('Forbidden')
-          return
-        }
-        const content = readFileSync(filePath)
-        res.writeHead(200, {
-          'Content-Type': MIME[extname(filePath).toLowerCase()] || 'application/octet-stream',
-          'Cache-Control': 'no-cache',
-          'Access-Control-Allow-Origin': '*',
-        })
-        res.end(content)
+        root = workspace.resolveExisting('app')
+        if (!(await stat(root)).isDirectory()) return '错误：工作区 app/ 目录不存在'
       } catch {
-        res.writeHead(404)
-        res.end('Not Found')
+        return '错误：工作区 app/ 目录不存在'
       }
-    })
+      if (server) return `预览服务器已在运行 → http://localhost:${serverPort}`
 
-    return new Promise<string>((resolve, reject) => {
-      previewServer!.once('error', (err: any) => {
-        if (err.code === 'EADDRINUSE') resolve(`端口 ${port} 已被占用，预览可能已经在跑了`)
-        else reject(err)
+      const candidate = createServer(async (request, response) => {
+        try {
+          if (!['GET', 'HEAD'].includes(request.method || 'GET')) {
+            response.writeHead(405, { Allow: 'GET, HEAD' }).end('Method Not Allowed')
+            return
+          }
+          const pathname = decodeURIComponent(new URL(request.url || '/', 'http://localhost').pathname)
+          const requestedPath = pathname.endsWith('/') ? `${pathname}index.html` : pathname
+          const filePath = resolve(root, `.${requestedPath}`)
+          const relativePath = relative(root, filePath)
+          if (relativePath === '..' || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
+            response.writeHead(403).end('Forbidden')
+            return
+          }
+
+          // The lexical check above blocks ../. realpath also blocks a symlink
+          // inside app/ from serving files elsewhere in the workspace.
+          const realFilePath = await realpath(filePath)
+          const realRelativePath = relative(root, realFilePath)
+          if (
+            realRelativePath === '..' ||
+            realRelativePath.startsWith(`..${sep}`) ||
+            isAbsolute(realRelativePath)
+          ) {
+            response.writeHead(403).end('Forbidden')
+            return
+          }
+
+          const content = await readFile(realFilePath)
+          response.writeHead(200, {
+            'Content-Type': MIME[extname(realFilePath).toLowerCase()] || 'application/octet-stream',
+            'Cache-Control': 'no-cache',
+            'X-Content-Type-Options': 'nosniff',
+          })
+          response.end(request.method === 'HEAD' ? undefined : content)
+        } catch {
+          response.writeHead(404).end('Not Found')
+        }
       })
-      previewServer!.listen(port, () => {
-        resolve(`✓ 预览服务器已启动 → http://localhost:${port}（点击 WebContainer 的 Preview 标签查看）`)
+
+      await new Promise<void>((resolvePromise, reject) => {
+        candidate.once('error', reject)
+        candidate.listen(port, '127.0.0.1', resolvePromise)
       })
-    })
-  },
+      server = candidate
+      serverPort = port
+      return `✓ 预览服务器已启动 → http://localhost:${port}`
+    },
+    dispose: async () => {
+      if (!server) return
+      const active = server
+      server = undefined
+      serverPort = undefined
+      await new Promise<void>((resolvePromise, reject) => {
+        active.close((error) => (error ? reject(error) : resolvePromise()))
+      })
+    },
+  }
+
+  return [tool]
 }
-
-export const previewTools: ToolDefinition[] = [startPreviewTool]

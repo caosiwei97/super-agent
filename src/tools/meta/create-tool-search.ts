@@ -1,4 +1,4 @@
-import type { ToolDefinition, ToolRegistry } from '../../core/tool-registry.js'
+import type { ToolRegistry } from '../../core/tool-registry.js'
 
 /**
  * 构造 tool_search 元工具。
@@ -8,7 +8,7 @@ import type { ToolDefinition, ToolRegistry } from '../../core/tool-registry.js'
  * 再用这个工具把名字换成带完整 parameters 的定义，
  * registry 同时把该工具标记为「已发现」，下一轮它就会出现在 activeTools 中。
  */
-export function createToolSearch(registry: ToolRegistry): ToolDefinition {
+export function createToolSearch(registry: ToolRegistry) {
   return {
     name: 'tool_search',
     description:
