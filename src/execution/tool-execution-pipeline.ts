@@ -13,6 +13,7 @@ import {
   preflightResolvedInvocation,
   type ConstraintGateErrorCode,
 } from './internal-tool-dispatch.js'
+import type { ExecutionPlan } from './execution-router.js'
 import {
   TOOL_CAPABILITIES,
   type ExecutionConstraints,
@@ -105,6 +106,7 @@ interface PreparedCall {
   readonly invalidReason?: string
   readonly invalidCode?: DenialCode
   decision?: PolicyDecision
+  executionPlan?: ExecutionPlan
   projection: OperationProjection
 }
 
@@ -255,6 +257,7 @@ export class ToolExecutionPipeline {
           ? resolution.code
           : protection.error === undefined ? undefined : 'input_not_persistable'
         let decision: PolicyDecision | undefined
+        let executionPlan: ExecutionPlan | undefined
         if (resolution.ok && invalidReason === undefined) {
           decision = await this.policyEngine.evaluate({
             toolName: resolution.invocation.tool.name,
@@ -277,7 +280,11 @@ export class ToolExecutionPipeline {
           }
           if (decision.behavior !== 'deny') {
             try {
-              preflightResolvedInvocation(resolution.invocation, decision.constraints)
+              executionPlan = preflightResolvedInvocation(
+                this.registry,
+                resolution.invocation,
+                decision.constraints,
+              )
             } catch (error) {
               if (!(error instanceof ConstraintGateError)) throw error
               invalidReason = error.message
@@ -309,6 +316,7 @@ export class ToolExecutionPipeline {
           ...(invalidReason === undefined ? {} : { invalidReason }),
           ...(invalidCode === undefined ? {} : { invalidCode }),
           ...(decision === undefined ? {} : { decision }),
+          ...(executionPlan === undefined ? {} : { executionPlan }),
           projection,
         })
       }
@@ -402,10 +410,11 @@ export class ToolExecutionPipeline {
     budgetUsed?: number,
   ): Promise<PipelineOutcome> {
     assertContext(context)
-    if (!item.invocation || !item.decision || item.decision.behavior === 'deny') {
+    if (!item.invocation || !item.decision || item.decision.behavior === 'deny' || !item.executionPlan) {
       throw new Error(`operation ${item.operationId} 缺少已授权的 resolved invocation`)
     }
     let started: OperationProjection | undefined
+    const attemptId = randomUUID()
     const result: ToolDispatchResult = await dispatchResolvedInvocation(
       this.registry,
       item.invocation,
@@ -413,17 +422,32 @@ export class ToolExecutionPipeline {
         signal: context.signal,
         deadline: context.deadline,
         constraints: item.decision.constraints,
+        plan: item.executionPlan,
+        operationId: item.operationId,
+        attemptId,
+        ...(item.projection.latestEvent.idempotencyKey === undefined
+          ? {}
+          : { idempotencyKey: item.projection.latestEvent.idempotencyKey }),
         beforeDispatch: async () => {
           assertContext(context)
           started = await this.transition(item.projection, {
             kind: 'start',
-            attemptId: randomUUID(),
+            attemptId,
           }, 'durable')
           item.projection = started
         },
       },
     )
     if (!started) throw new Error(`工具 ${item.call.toolName} 未经过 durable start gate`)
+
+    if (result.outcome === 'failed') {
+      item.projection = await this.transition(started, {
+        kind: 'fail',
+        proof: result.proof,
+        errorCode: result.errorCode,
+      }, 'durable')
+      return this.commitTerminal(item.projection, budgetUsed)
+    }
 
     if (result.outcome === 'uncertain') {
       item.projection = await this.transition(started, {

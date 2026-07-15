@@ -9,9 +9,15 @@ import {
   parseExecutionConstraints,
   type ExecutionConstraints,
 } from '../security/capabilities.js'
+import type { ExecutionPlan } from './execution-router.js'
+import { ExecutionRoutingError } from './execution-router.js'
 
 export interface InternalToolDispatchOptions extends ToolRuntimeContext {
   readonly constraints: ExecutionConstraints
+  readonly plan: ExecutionPlan
+  readonly operationId: string
+  readonly attemptId: string
+  readonly idempotencyKey?: string
   readonly beforeDispatch?: (invocation: ResolvedToolInvocation) => void | Promise<void>
 }
 
@@ -20,7 +26,13 @@ type DispatchHandler = (
   options: InternalToolDispatchOptions,
 ) => Promise<ToolDispatchResult>
 
+type PreflightHandler = (
+  invocation: ResolvedToolInvocation,
+  constraints: ExecutionConstraints,
+) => ExecutionPlan
+
 const handlers = new WeakMap<ToolRegistry, DispatchHandler>()
+const preflightHandlers = new WeakMap<ToolRegistry, PreflightHandler>()
 const KERNEL_CONSTRAINTS = new Set<keyof ExecutionConstraints>(['maxResultChars'])
 
 export type ConstraintGateErrorCode =
@@ -28,6 +40,7 @@ export type ConstraintGateErrorCode =
   | 'constraint_unsupported'
   | 'constraint_relaxation'
   | 'sandbox_unavailable'
+  | 'legacy_execution_kind'
 
 export class ConstraintGateError extends Error {
   override readonly name = 'ConstraintGateError'
@@ -59,6 +72,7 @@ function sameConstraints(left: ExecutionConstraints, right: ExecutionConstraints
 }
 
 export function preflightResolvedInvocation(
+  registry: ToolRegistry,
   invocation: ResolvedToolInvocation,
   value: ExecutionConstraints,
 ) {
@@ -77,12 +91,6 @@ export function preflightResolvedInvocation(
   if (unsupported) {
     throw new ConstraintGateError('constraint_unsupported', `工具不支持执行约束: ${unsupported}`)
   }
-  if (effective.requireSandbox === true || invocation.constraints.requireSandbox === true) {
-    throw new ConstraintGateError(
-      'sandbox_unavailable',
-      'requireSandbox 尚无可用执行后端，拒绝 dispatch',
-    )
-  }
   const tightened = intersectExecutionConstraints(invocation.constraints, effective)
   if (tightened === null || !sameConstraints(tightened, effective)) {
     throw new ConstraintGateError(
@@ -90,15 +98,32 @@ export function preflightResolvedInvocation(
       'effective constraints 不能放宽 resolved invocation constraints',
     )
   }
-  return sameConstraints(effective, invocation.constraints)
+  const constraints = sameConstraints(effective, invocation.constraints)
     ? invocation.constraints
     : effective
+  const preflight = preflightHandlers.get(registry)
+  if (!preflight) throw new Error('ToolRegistry execution router 未安装')
+  try {
+    return preflight(invocation, constraints)
+  } catch (error) {
+    if (error instanceof ExecutionRoutingError) {
+      throw new ConstraintGateError(error.code, error.message, { cause: error })
+    }
+    throw error
+  }
 }
 
 /** Install the registry-owned closure without exposing it on ToolRegistry's public surface. */
-export function installInternalToolDispatcher(registry: ToolRegistry, handler: DispatchHandler) {
-  if (handlers.has(registry)) throw new Error('ToolRegistry internal dispatcher 已安装')
+export function installInternalToolDispatcher(
+  registry: ToolRegistry,
+  handler: DispatchHandler,
+  preflight: PreflightHandler,
+) {
+  if (handlers.has(registry) || preflightHandlers.has(registry)) {
+    throw new Error('ToolRegistry internal dispatcher 已安装')
+  }
   handlers.set(registry, handler)
+  preflightHandlers.set(registry, preflight)
 }
 
 /** Package-internal gate; deliberately absent from the package public index. */
@@ -109,8 +134,17 @@ export async function dispatchResolvedInvocation(
 ) {
   const handler = handlers.get(registry)
   if (!handler) throw new Error('ToolRegistry internal dispatcher 未安装')
+  const defensivePlan = preflightResolvedInvocation(registry, invocation, options.constraints)
+  if (
+    defensivePlan.executionKind !== options.plan.executionKind
+    || defensivePlan.backend !== options.plan.backend
+    || defensivePlan.executionKindSource !== options.plan.executionKindSource
+  ) {
+    throw new ConstraintGateError('constraint_relaxation', 'execution plan 在审批后发生变化')
+  }
   return handler(invocation, {
     ...options,
-    constraints: preflightResolvedInvocation(invocation, options.constraints),
+    constraints: defensivePlan.constraints,
+    plan: defensivePlan,
   })
 }

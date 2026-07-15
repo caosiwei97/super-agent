@@ -9,6 +9,7 @@ import {
 } from '../src/core/tool-registry.js'
 import {
   dispatchResolvedInvocation,
+  preflightResolvedInvocation,
   type InternalToolDispatchOptions,
 } from '../src/execution/internal-tool-dispatch.js'
 import { streamSequenceModel } from './helpers.js'
@@ -28,18 +29,35 @@ function dispatchOptions() {
   return { signal: new AbortController().signal, deadline: Date.now() + 60_000 }
 }
 
+function governedOptions(
+  registry: ToolRegistry,
+  invocation: Extract<ReturnType<ToolRegistry['resolveInvocation']>, { ok: true }>['invocation'],
+  constraints = invocation.constraints,
+) {
+  return {
+    ...dispatchOptions(),
+    constraints,
+    plan: preflightResolvedInvocation(registry, invocation, constraints),
+    operationId: `operation-${invocation.toolCallId}`,
+    attemptId: `attempt-${invocation.toolCallId}`,
+  }
+}
+
 async function dispatchTool(
   registry: ToolRegistry,
   toolName: string,
   input: unknown,
   toolCallId: string,
-  options: Omit<InternalToolDispatchOptions, 'constraints'> = dispatchOptions(),
+  options: Omit<
+    InternalToolDispatchOptions,
+    'constraints' | 'plan' | 'operationId' | 'attemptId'
+  > = dispatchOptions(),
 ) {
   const resolution = registry.resolveInvocation(toolName, input, toolCallId)
   if (!resolution.ok) throw new Error(`工具 ${toolName} 输入或能力解析无效: ${resolution.error}`)
   return dispatchResolvedInvocation(registry, resolution.invocation, {
+    ...governedOptions(registry, resolution.invocation),
     ...options,
-    constraints: resolution.invocation.constraints,
   })
 }
 
@@ -103,6 +121,7 @@ describe('ToolRegistry', () => {
         additionalProperties: false,
       },
       getCapabilities: () => { calls.capabilities++; return ['filesystem.read'] },
+      executionKind: 'filesystem',
       getConstraints: () => { calls.constraints++; return { filesystemReadRoots: ['/safe'] } },
       supportedConstraintKeys: ['filesystemReadRoots'],
       isConcurrencySafe: () => { calls.concurrency++; return true },
@@ -114,11 +133,12 @@ describe('ToolRegistry', () => {
     if (!resolution.ok) return
     assert.equal(Object.isFrozen(resolution.invocation), true)
     assert.equal(Object.isFrozen(resolution.invocation.input), true)
+    assert.equal(resolution.invocation.executionKind, 'filesystem')
+    assert.equal(resolution.invocation.executionKindSource, 'explicit')
     assert.deepEqual(calls, { capabilities: 1, constraints: 1, concurrency: 1 })
 
     const result = await dispatchResolvedInvocation(registry, resolution.invocation, {
-      ...dispatchOptions(),
-      constraints: resolution.invocation.constraints,
+      ...governedOptions(registry, resolution.invocation),
     })
     assert.equal(result.outcome, 'succeeded')
     assert.deepEqual(calls, { capabilities: 1, constraints: 1, concurrency: 1 })
@@ -193,12 +213,12 @@ describe('ToolRegistry', () => {
     assert.equal(constrained.ok, true)
     if (!constrained.ok) return
     await assert.rejects(dispatchResolvedInvocation(registry, constrained.invocation, {
-      ...dispatchOptions(),
+      ...governedOptions(registry, constrained.invocation),
       constraints: { filesystemReadRoots: ['/'] },
       beforeDispatch: () => { starts++ },
     }), /不能放宽/)
     await assert.rejects(dispatchResolvedInvocation(registry, constrained.invocation, {
-      ...dispatchOptions(),
+      ...governedOptions(registry, constrained.invocation),
       constraints: {
         filesystemReadRoots: ['/safe'],
         networkHosts: ['example.com'],
@@ -208,11 +228,11 @@ describe('ToolRegistry', () => {
     const sandboxed = registry.resolveInvocation('sandboxed', {}, 'sandbox-call')
     assert.equal(sandboxed.ok, true)
     if (!sandboxed.ok) return
-    await assert.rejects(dispatchResolvedInvocation(registry, sandboxed.invocation, {
-      ...dispatchOptions(),
-      constraints: sandboxed.invocation.constraints,
-      beforeDispatch: () => { starts++ },
-    }), /requireSandbox 尚无可用执行后端/)
+    assert.throws(() => preflightResolvedInvocation(
+      registry,
+      sandboxed.invocation,
+      sandboxed.invocation.constraints,
+    ), /requireSandbox 尚无可用执行后端/)
     assert.equal(starts, 0)
     assert.equal(executions, 0)
   })
@@ -456,13 +476,111 @@ describe('ToolRegistry', () => {
     })
 
     const result = await dispatchResolvedInvocation(registry, resolution.invocation, {
+      ...governedOptions(registry, resolution.invocation),
       ...execution,
-      constraints: resolution.invocation.constraints,
     })
 
     assert.equal(result.outcome, 'succeeded')
     assert.equal(observedSignal, execution.signal)
     assert.equal(observedDeadline, execution.deadline)
     await registry.close()
+  })
+
+  it('accepts the known GitHub MCP schema annotation without weakening strict validation', async () => {
+    const registry = new ToolRegistry()
+    const client: MCPToolClient = {
+      endpointOrigin: 'https://mcp.example',
+      connect: async () => {},
+      listTools: async () => [{
+        name: 'annotated',
+        description: 'annotation compatibility probe',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            owner: { type: 'string', 'x-mcp-header': 'X-GitHub-Owner' },
+            issue: { type: ['string', 'number'] },
+            state: { type: 'string' },
+            state_reason: { type: 'string' },
+          },
+          required: ['owner'],
+          dependentRequired: { state: ['state_reason'] },
+          additionalProperties: false,
+        },
+      }],
+      callTool: async () => 'ok',
+      close: async () => {},
+    }
+
+    await registry.registerMCPServer('github', client)
+    assert.equal(
+      registry.validateToolInput('mcp__github__annotated', { owner: 'openai' }).ok,
+      true,
+    )
+    assert.equal(
+      registry.validateToolInput('mcp__github__annotated', { owner: 'openai', issue: 42 }).ok,
+      true,
+    )
+    assert.equal(
+      registry.validateToolInput('mcp__github__annotated', { owner: 'openai', issue: false }).ok,
+      false,
+    )
+    assert.equal(
+      registry.validateToolInput('mcp__github__annotated', { owner: 'openai', state: 'closed' }).ok,
+      false,
+    )
+    assert.equal(
+      registry.validateToolInput('mcp__github__annotated', { owner: 42 }).ok,
+      false,
+    )
+    assert.equal(
+      registry.validateToolInput('mcp__github__annotated', { owner: 'openai', extra: true }).ok,
+      false,
+    )
+    assert.equal(
+      registry.validateToolInput('mcp__github__annotated', {}).ok,
+      false,
+    )
+    assert.equal(
+      (registry.getDescriptor('mcp__github__annotated')!.parameters.properties as
+        Record<string, Record<string, unknown>>).owner['x-mcp-header'],
+      'X-GitHub-Owner',
+    )
+    await registry.close()
+
+    const strictRegistry = new ToolRegistry()
+    let closes = 0
+    const unknownAnnotation: MCPToolClient = {
+      ...client,
+      listTools: async () => [{
+        name: 'unknown_annotation',
+        description: 'must fail closed',
+        inputSchema: {
+          type: 'object',
+          'x-unknown-security-constraint': true,
+          properties: {},
+          additionalProperties: false,
+        },
+      }],
+      close: async () => { closes++ },
+    }
+    await assert.rejects(
+      strictRegistry.registerMCPServer('strict', unknownAnnotation),
+      /unknown keyword/,
+    )
+    assert.equal(closes, 1)
+    assert.equal(strictRegistry.getDescriptor('mcp__strict__unknown_annotation'), undefined)
+    await strictRegistry.close()
+
+    const localRegistry = new ToolRegistry()
+    assert.throws(() => localRegistry.register({
+      ...definition('local_annotation', async () => 'never'),
+      parameters: {
+        type: 'object',
+        'x-mcp-header': 'X-Must-Remain-MCP-Only',
+        properties: {},
+        additionalProperties: false,
+      },
+    }), /unknown keyword/)
+    await localRegistry.close()
   })
 })

@@ -16,7 +16,10 @@ import {
   ToolExecutionPipeline,
   type ToolExecutionPipelineOptions,
 } from '../src/execution/tool-execution-pipeline.js'
-import { dispatchResolvedInvocation } from '../src/execution/internal-tool-dispatch.js'
+import {
+  dispatchResolvedInvocation,
+  preflightResolvedInvocation,
+} from '../src/execution/internal-tool-dispatch.js'
 import type { OperationEventDraft, OperationProjection } from '../src/execution/operation-types.js'
 import {
   SessionStore,
@@ -161,6 +164,7 @@ describe('ToolExecutionPipeline', () => {
     let executions = 0
     let approvals = 0
     registry.register(definition('sandbox_required', async () => { executions++; return 'never' }, {
+      executionKind: 'process',
       getCapabilities: () => ['process.execute'],
       getConstraints: () => ({ requireSandbox: true }),
       supportedConstraintKeys: ['requireSandbox'],
@@ -296,8 +300,10 @@ describe('ToolExecutionPipeline', () => {
   it('persists proposed, durable start, terminal and materialized result in order', async (context) => {
     const { store, registry, pipeline } = await setup(context)
     let executions = 0
-    registry.register(definition('probe', async ({ value }) => {
+    let executionContext: Parameters<ToolDefinition['execute']>[1] | undefined
+    registry.register(definition('probe', async ({ value }, current) => {
       executions++
+      executionContext = current
       return `done:${value}`
     }))
 
@@ -317,6 +323,14 @@ describe('ToolExecutionPipeline', () => {
       'proposed', 'approved', 'started', 'succeeded', 'messages',
     ])
     assert.equal(typeof events[4]?.materializationId, 'string')
+    const started = events.find((event) => event.type === 'operation'
+      && parseOperationEvent(event).status === 'started')
+    assert.ok(started?.type === 'operation')
+    if (started?.type === 'operation') {
+      const attemptId = parseOperationEvent(started).attemptId
+      assert.equal(executionContext?.attemptId, attemptId)
+      assert.equal(executionContext?.operationId, parseOperationEvent(started).operationId)
+    }
   })
 
   it('strictly denies invalid input without exposing a tool closure', async (context) => {
@@ -664,6 +678,13 @@ describe('ToolExecutionPipeline', () => {
     const blocker = dispatchResolvedInvocation(registry, blockerResolution.invocation, {
       ...blockerContext,
       constraints: blockerResolution.invocation.constraints,
+      plan: preflightResolvedInvocation(
+        registry,
+        blockerResolution.invocation,
+        blockerResolution.invocation.constraints,
+      ),
+      operationId: 'blocker-operation',
+      attemptId: 'blocker-attempt',
     })
     await blockerReady
 

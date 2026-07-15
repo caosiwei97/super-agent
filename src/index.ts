@@ -132,6 +132,36 @@ export type {
   ProcessExecutionResult,
   ProcessTerminationReason,
 } from './execution/process-executor.js'
+export {
+  assertSerializableExecutionRequest,
+  TOOL_EXECUTION_KINDS,
+} from './execution/executor.js'
+export type {
+  ExecutionControl,
+  ExecutionProfile,
+  ExecutionRequest,
+  ExecutionResult,
+  Executor,
+  ExecutorKind,
+  ExecutorProbeResult,
+  ToolExecutionKind,
+} from './execution/executor.js'
+export { ExecutionRouter, ExecutionRoutingError } from './execution/execution-router.js'
+export type {
+  ExecutionBackendKind,
+  ExecutionKindSource,
+  ExecutionPlan,
+  ExecutionPreflightInput,
+  ExecutionRouterOptions,
+  ExecutionRoutingErrorCode,
+} from './execution/execution-router.js'
+export { LocalExecutor } from './execution/local-executor.js'
+export { ProcessController } from './execution/process-controller.js'
+export {
+  SandboxExecutor,
+  SandboxUnavailableError,
+} from './execution/sandbox-executor.js'
+export type { SandboxExecutorOptions } from './execution/sandbox-executor.js'
 export type {
   CancellationProof,
   FailureProof,

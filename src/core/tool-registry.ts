@@ -1,5 +1,6 @@
 import { jsonSchema, type ToolSet } from 'ai'
 import Ajv, { type ErrorObject, type ValidateFunction } from 'ajv'
+import Ajv2020 from 'ajv/dist/2020.js'
 import {
   parseToolCapabilities,
   resolveToolInvocation as resolveToolSecurity,
@@ -10,6 +11,12 @@ import {
   installInternalToolDispatcher,
   type InternalToolDispatchOptions,
 } from '../execution/internal-tool-dispatch.js'
+import { ExecutionRouter } from '../execution/execution-router.js'
+import type {
+  ExecutionResult,
+  ToolExecutionKind,
+} from '../execution/executor.js'
+import { TOOL_EXECUTION_KINDS } from '../execution/executor.js'
 import { AsyncReadWriteLock } from './async-rw-lock.js'
 
 export interface MCPToolDescriptor {
@@ -56,6 +63,8 @@ export interface ToolDefinition extends Omit<
   shouldDefer?: boolean
   /** Registry provenance; MCP registration sets this structurally. */
   toolSource?: ToolSource
+  /** M3 execution lane. Optional for one compatibility release only. */
+  executionKind?: ToolExecutionKind
 }
 
 export interface ToolInvocation {
@@ -76,6 +85,8 @@ export interface ResolvedToolInvocation extends ToolInvocation {
   readonly securitySource: 'explicit' | 'legacy'
   readonly legacyRequiresApproval: boolean
   readonly toolSource: ToolSource
+  readonly executionKind: ToolExecutionKind
+  readonly executionKindSource: 'explicit' | 'legacy'
 }
 
 export type ToolInvocationResolution =
@@ -94,6 +105,10 @@ export interface ToolRuntimeContext {
 }
 
 export interface ToolExecutionContext extends ToolRuntimeContext {
+  /** Present on every governed Pipeline dispatch; optional only for one direct-test compatibility release. */
+  readonly operationId?: string
+  readonly attemptId?: string
+  readonly idempotencyKey?: string
   readonly capabilities: readonly ToolCapability[]
   readonly constraints: ExecutionConstraints
 }
@@ -104,12 +119,19 @@ export type ToolInputValidationResult =
 
 export interface ToolRegistryOptions {
   readonly onLegacyWarning?: (message: string) => void
+  readonly executionRouter?: ExecutionRouter
 }
 
 export type ToolDispatchResult =
   | {
       readonly outcome: 'succeeded'
       readonly rawOutput: unknown
+      readonly descriptor: ToolDescriptor
+    }
+  | {
+      readonly outcome: 'failed'
+      readonly errorCode: string
+      readonly proof: 'no_side_effect'
       readonly descriptor: ToolDescriptor
     }
   | {
@@ -144,6 +166,8 @@ interface RegisteredTool {
   readonly securitySource: 'explicit' | 'legacy'
   readonly legacyRequiresApproval: boolean
   readonly toolSource: ToolSource
+  readonly executionKind?: ToolExecutionKind
+  readonly executionKindSource: 'explicit' | 'legacy'
 }
 
 function deepFreeze<T>(value: T): T {
@@ -173,14 +197,8 @@ function formatValidationErrors(errors: ErrorObject[] | null | undefined) {
   }).join('; ')
 }
 
-export class ToolRegistry {
-  private readonly tools = new Map<string, RegisteredTool>()
-  private readonly mcpClients: MCPToolClient[] = []
-  private readonly discoveredTools = new Set<string>()
-  private readonly executionLock = new AsyncReadWriteLock()
-  private readonly resolvedInvocations = new WeakSet<object>()
-  private readonly legacyWarnings = new Set<string>()
-  private readonly ajv = new Ajv({
+function createStrictAjv() {
+  return new Ajv({
     allErrors: true,
     coerceTypes: false,
     removeAdditional: false,
@@ -188,12 +206,48 @@ export class ToolRegistry {
     strict: true,
     validateFormats: false,
   })
+}
+
+function createStrictMcpAjv() {
+  return new Ajv2020({
+    allErrors: true,
+    coerceTypes: false,
+    removeAdditional: false,
+    useDefaults: false,
+    strict: true,
+    validateFormats: false,
+    allowUnionTypes: true,
+  }).addKeyword({
+    // GitHub's hosted MCP currently annotates generated input schemas with
+    // this extension. It has no validation semantics, so accept only this
+    // known annotation while keeping every other unknown keyword strict.
+    keyword: 'x-mcp-header',
+    valid: true,
+  })
+}
+
+export class ToolRegistry {
+  private readonly tools = new Map<string, RegisteredTool>()
+  private readonly mcpClients: MCPToolClient[] = []
+  private readonly discoveredTools = new Set<string>()
+  private readonly executionLock = new AsyncReadWriteLock()
+  private readonly resolvedInvocations = new WeakSet<object>()
+  private readonly legacyWarnings = new Set<string>()
+  private readonly localAjv = createStrictAjv()
+  private readonly mcpAjv = createStrictMcpAjv()
   private closePromise: Promise<void> | undefined
   private closed = false
+  private readonly executionRouter: ExecutionRouter
 
   constructor(private readonly options: ToolRegistryOptions = {}) {
+    this.executionRouter = options.executionRouter ?? new ExecutionRouter()
     installInternalToolDispatcher(this, (invocation, dispatchOptions) =>
-      this.dispatchInternal(invocation, dispatchOptions))
+      this.dispatchInternal(invocation, dispatchOptions), (invocation, constraints) =>
+      this.executionRouter.preflight({
+        executionKind: invocation.executionKind,
+        executionKindSource: invocation.executionKindSource,
+        constraints,
+      }))
   }
 
   register(...tools: ToolDefinition[]) {
@@ -205,6 +259,9 @@ export class ToolRegistry {
         throw new Error(`工具重复注册: ${tool.name}`)
       }
       incomingNames.add(tool.name)
+      if (tool.executionKind !== undefined && !TOOL_EXECUTION_KINDS.includes(tool.executionKind)) {
+        throw new TypeError(`工具 ${tool.name} executionKind 非法: ${String(tool.executionKind)}`)
+      }
 
       const parameters = deepFreeze(
         cloneJsonValue(tool.parameters, `工具 ${tool.name} parameters`) as Record<string, unknown>,
@@ -233,6 +290,7 @@ export class ToolRegistry {
         tool.requiresApproval === true || tool.isReadOnly !== true
       )
       const toolSource = this.parseToolSource(tool.toolSource)
+      const executionKindSource = tool.executionKind === undefined ? 'legacy' : 'explicit'
       if (!explicitSecurity) this.warnLegacyOnce(tool.name)
 
       const descriptor = deepFreeze({
@@ -245,7 +303,7 @@ export class ToolRegistry {
       } satisfies ToolDescriptor)
       registrations.push({
         descriptor,
-        validate: this.ajv.compile(parameters),
+        validate: (toolSource.kind === 'mcp' ? this.mcpAjv : this.localAjv).compile(parameters),
         execute: tool.execute,
         getCapabilities,
         getConstraints,
@@ -254,6 +312,8 @@ export class ToolRegistry {
         securitySource: explicitSecurity ? 'explicit' : 'legacy',
         legacyRequiresApproval,
         toolSource,
+        ...(tool.executionKind === undefined ? {} : { executionKind: tool.executionKind }),
+        executionKindSource,
         ...(tool.dispose === undefined ? {} : { dispose: tool.dispose }),
       })
     }
@@ -297,6 +357,7 @@ export class ToolRegistry {
           shouldDefer: true,
           searchHint: `${serverName} ${tool.name} ${tool.description}`,
           toolSource: { kind: 'mcp', serverName },
+          executionKind: 'mcp',
           execute: (input, context) => client.callTool(originalName, input, context),
         })
       }
@@ -437,6 +498,11 @@ export class ToolRegistry {
         securitySource: tool.securitySource,
         legacyRequiresApproval: tool.legacyRequiresApproval,
         toolSource: tool.toolSource,
+        executionKind: tool.executionKind ?? this.inferLegacyExecutionKind(
+          security.capabilities,
+          tool.toolSource,
+        ),
+        executionKindSource: tool.executionKindSource,
       } satisfies ResolvedToolInvocation)
       this.resolvedInvocations.add(invocation)
       return { ok: true, invocation }
@@ -471,16 +537,38 @@ export class ToolRegistry {
       await options.beforeDispatch?.(invocation)
       this.assertExecutionContext(options)
       try {
-        return {
-          outcome: 'succeeded',
-          rawOutput: await tool.execute(invocation.input, {
-            signal: options.signal,
-            deadline: options.deadline,
+        const executionResult = await this.executionRouter.dispatch(
+          options.plan,
+          {
+            schemaVersion: 1,
+            operationId: options.operationId,
+            attemptId: options.attemptId,
+            ...(options.idempotencyKey === undefined ? {} : { idempotencyKey: options.idempotencyKey }),
+            toolCallId: invocation.toolCallId,
+            toolName: invocation.tool.name,
+            executionKind: invocation.executionKind,
+            input: invocation.input,
             capabilities: invocation.capabilities,
             constraints: options.constraints,
+            deadline: options.deadline,
+          },
+          { signal: options.signal },
+          async (): Promise<ExecutionResult> => ({
+            outcome: 'succeeded',
+            rawOutput: await tool.execute(invocation.input, {
+              signal: options.signal,
+              deadline: options.deadline,
+              operationId: options.operationId,
+              attemptId: options.attemptId,
+              ...(options.idempotencyKey === undefined
+                ? {}
+                : { idempotencyKey: options.idempotencyKey }),
+              capabilities: invocation.capabilities,
+              constraints: options.constraints,
+            }),
           }),
-          descriptor: tool.descriptor,
-        }
+        )
+        return { ...executionResult, descriptor: tool.descriptor }
       } catch {
         // Once invocation begins, a generic rejection cannot prove that no side
         // effect occurred. The Pipeline may reconcile it, but must not mark failed.
@@ -510,6 +598,7 @@ export class ToolRegistry {
       const operations = [
         ...disposers.map((dispose) => Promise.resolve().then(dispose)),
         ...this.mcpClients.map((client) => client.close()),
+        this.executionRouter.close(),
       ]
       this.mcpClients.length = 0
 
@@ -541,6 +630,17 @@ export class ToolRegistry {
       throw new TypeError('toolSource MCP serverName 必须为非空字符串')
     }
     return Object.freeze({ kind: 'mcp', serverName: source.serverName })
+  }
+
+  private inferLegacyExecutionKind(
+    capabilities: readonly ToolCapability[],
+    source: ToolSource,
+  ): ToolExecutionKind {
+    if (source.kind === 'mcp') return 'mcp'
+    if (capabilities.includes('process.execute')) return 'process'
+    if (capabilities.includes('network.egress')) return 'network'
+    if (capabilities.some((capability) => capability.startsWith('filesystem.'))) return 'filesystem'
+    return 'pure'
   }
 
   private parseSupportedConstraintKeys(
