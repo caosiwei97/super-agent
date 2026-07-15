@@ -2,6 +2,7 @@ import type { ToolDefinition } from '../../core/tool-registry.js'
 
 export const weatherTool: ToolDefinition = {
   name: 'get_weather',
+  executionKind: 'pure',
   description: '查询指定城市的天气信息',
   parameters: {
     type: 'object',
@@ -28,6 +29,7 @@ export const weatherTool: ToolDefinition = {
 
 export const calculatorTool: ToolDefinition = {
   name: 'calculator',
+  executionKind: 'pure',
   description: '计算数学表达式的结果。当用户提问涉及数学运算时使用',
   parameters: {
     type: 'object',

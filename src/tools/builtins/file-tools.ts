@@ -43,6 +43,7 @@ function assertSensitiveRead(context: ToolExecutionContext, target: string, work
 export function createFileTools(workspace: Workspace) {
   const readFileTool: ToolDefinition = {
     name: 'read_file',
+    executionKind: 'filesystem',
     description: '读取工作区内指定路径的 UTF-8 文件内容',
     parameters: {
       type: 'object',
@@ -73,6 +74,7 @@ export function createFileTools(workspace: Workspace) {
 
   const writeFileTool: ToolDefinition = {
     name: 'write_file',
+    executionKind: 'filesystem',
     description: '写入工作区内的文件；文件存在时会覆盖，需要用户审批',
     parameters: {
       type: 'object',
@@ -102,6 +104,7 @@ export function createFileTools(workspace: Workspace) {
 
   const listDirectoryTool: ToolDefinition = {
     name: 'list_directory',
+    executionKind: 'filesystem',
     description: '列出工作区内指定目录的文件和子目录',
     parameters: {
       type: 'object',
@@ -134,6 +137,7 @@ export function createFileTools(workspace: Workspace) {
 
   const editFileTool: ToolDefinition = {
     name: 'edit_file',
+    executionKind: 'filesystem',
     description: '精确替换工作区文件中的唯一文本片段，需要用户审批',
     parameters: {
       type: 'object',
@@ -188,6 +192,7 @@ export function createFileTools(workspace: Workspace) {
 
   const globTool: ToolDefinition = {
     name: 'glob',
+    executionKind: 'filesystem',
     description: '在工作区内按 glob 模式搜索文件，如 src/**/*.ts',
     parameters: {
       type: 'object',
@@ -242,6 +247,7 @@ export function createFileTools(workspace: Workspace) {
 
   const grepTool: ToolDefinition = {
     name: 'grep',
+    executionKind: 'filesystem',
     description: '在工作区文件中按正则表达式搜索，返回最多 50 条匹配',
     parameters: {
       type: 'object',

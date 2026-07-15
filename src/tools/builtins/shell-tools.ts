@@ -7,6 +7,7 @@ export function createShellTools(workspace: Workspace): ToolDefinition[] {
   return [
     {
       name: 'bash',
+      executionKind: 'process',
       description: '在工作区目录执行 shell 命令；命令拥有当前进程权限，每次执行均需审批',
       parameters: {
         type: 'object',

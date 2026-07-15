@@ -207,6 +207,7 @@ export function createWebTools(dependencies: WebToolDependencies = {}): ToolDefi
   return [
     {
       name: 'fetch_url',
+      executionKind: 'network',
       description: '抓取公网 HTTP(S) 页面并转换为纯文本；阻止本地网段、非常用端口和超大响应',
       parameters: {
         type: 'object',

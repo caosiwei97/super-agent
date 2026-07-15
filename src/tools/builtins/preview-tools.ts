@@ -40,6 +40,7 @@ export function createPreviewTools(workspace: Workspace) {
 
   const tool: ToolDefinition = {
     name: 'start_preview',
+    executionKind: 'preview',
     description: '启动工作区 app/ 目录的静态预览服务器，需要用户审批',
     parameters: {
       type: 'object',
