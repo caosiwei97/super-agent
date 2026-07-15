@@ -33,19 +33,37 @@ describe('Workspace', () => {
 })
 
 describe('web tool SSRF guard', () => {
-  it('blocks local, private, mapped and transition addresses', () => {
+  it('blocks IANA special-purpose, mapped, compatible and scoped addresses', () => {
     for (const address of [
+      '0.0.0.1',
       '127.0.0.1',
       '10.1.2.3',
       '169.254.169.254',
+      '192.31.196.1',
+      '192.52.193.1',
+      '192.88.99.2',
+      '192.175.48.1',
       '::1',
       '::ffff:127.0.0.1',
+      '::ffff:8.8.8.8',
       '::127.0.0.1',
+      '::8.8.8.8',
       'fc00::1',
       'fe80::1',
+      'fe80::1%lo0',
+      '2606:4700:4700::1111%eth0',
       'fec0::1',
+      '100:0:0:1::1',
+      '2001:2::1',
+      '2001:20::1',
+      '2001:30::1',
       '2002:7f00:1::',
       '64:ff9b::7f00:1',
+      '64:ff9b:1::a00:1',
+      '2620:4f:8000::1',
+      '3fff::1',
+      '4000::1',
+      '5f00::1',
     ]) {
       assert.equal(isPublicAddress(address), false, address)
     }
@@ -54,25 +72,32 @@ describe('web tool SSRF guard', () => {
   })
 
   it('rejects a hostname if any DNS answer is non-public', async () => {
-    await assert.rejects(
-      validatePublicUrl('https://mixed.example/path', async () => [
-        { address: '93.184.216.34', family: 4 },
-        { address: '127.0.0.1', family: 4 },
-      ]),
-      /禁止访问非公网地址/,
-    )
+    for (const special of [
+      { address: '127.0.0.1', family: 4 },
+      { address: '64:ff9b:1::a00:1', family: 6 },
+      { address: '::ffff:127.0.0.1', family: 6 },
+    ]) {
+      await assert.rejects(
+        validatePublicUrl('https://mixed.example/path', async () => [
+          { address: '93.184.216.34', family: 4 },
+          special,
+        ]),
+        /禁止访问非公网地址/,
+      )
+    }
   })
 
   it('revalidates redirect targets and handles malformed URLs as tool output', async () => {
-    let fetches = 0
+    let dials = 0
     const [fetchTool] = createWebTools({
       lookup: async () => [{ address: '93.184.216.34', family: 4 }],
-      fetch: async () => {
-        fetches++
-        return new Response(null, {
+      dial: async () => {
+        dials++
+        return {
           status: 302,
           headers: { location: 'http://127.0.0.1/private' },
-        })
+          body: '',
+        }
       },
     })
     const context = {
@@ -86,21 +111,21 @@ describe('web tool SSRF guard', () => {
       String(await fetchTool.execute({ url: 'https://public.example' }, context)),
       /超出已授权网络约束/,
     )
-    assert.equal(fetches, 1)
+    assert.equal(dials, 1)
     assert.match(
       String(await fetchTool.execute({ url: 'not a url' }, context)),
       /抓取失败：Invalid URL|抓取失败：无效 URL/,
     )
   })
 
-  it('propagates the root abort signal through fetch', async () => {
-    let fetchSignal: AbortSignal | undefined
+  it('propagates the root abort signal through the pinned dialer', async () => {
+    let dialSignal: AbortSignal | undefined
     const [fetchTool] = createWebTools({
       lookup: async () => [{ address: '93.184.216.34', family: 4 }],
-      fetch: async (_input, init) => {
-        fetchSignal = init?.signal as AbortSignal
-        return new Promise<Response>((_resolve, reject) => {
-          fetchSignal!.addEventListener('abort', () => reject(fetchSignal!.reason), { once: true })
+      dial: async (request) => {
+        dialSignal = request.signal
+        return new Promise((_resolve, reject) => {
+          dialSignal!.addEventListener('abort', () => reject(dialSignal!.reason), { once: true })
         })
       },
     })
@@ -113,13 +138,13 @@ describe('web tool SSRF guard', () => {
     })
 
     const waitDeadline = Date.now() + 2_000
-    while (!fetchSignal) {
-      if (Date.now() >= waitDeadline) throw new Error('fetch did not start')
+    while (!dialSignal) {
+      if (Date.now() >= waitDeadline) throw new Error('dial did not start')
       await new Promise((resolve) => setTimeout(resolve, 1))
     }
     controller.abort(new DOMException('cancel fetch', 'AbortError'))
 
     await assert.rejects(execution, { name: 'AbortError' })
-    assert.equal(fetchSignal.aborted, true)
+    assert.equal(dialSignal.aborted, true)
   })
 })

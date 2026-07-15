@@ -153,18 +153,19 @@ describe('M2 external tool policy migration', () => {
 
   it('checks policy constraints before DNS/fetch and on every redirect', async () => {
     const lookups: string[] = []
-    let fetches = 0
+    let dials = 0
     const [fetchTool] = createWebTools({
       lookup: async (hostname) => {
         lookups.push(hostname)
         return [{ address: '93.184.216.34', family: 4 }]
       },
-      fetch: async () => {
-        fetches++
-        return new Response(null, {
+      dial: async () => {
+        dials++
+        return {
           status: 302,
           headers: { location: 'https://other.example/private' },
-        })
+          body: '',
+        }
       },
     })
     const context = {
@@ -178,16 +179,16 @@ describe('M2 external tool policy migration', () => {
       String(await fetchTool.execute({ url: 'https://public.example/start' }, context)),
       /超出已授权网络约束/,
     )
-    assert.equal(fetches, 1)
+    assert.equal(dials, 1)
     assert.deepEqual(lookups, ['public.example'])
 
-    fetches = 0
+    dials = 0
     lookups.length = 0
     assert.match(
       String(await fetchTool.execute({ url: 'https://unapproved.example' }, context)),
       /超出已授权网络约束/,
     )
-    assert.equal(fetches, 0)
+    assert.equal(dials, 0)
     assert.deepEqual(lookups, [])
   })
 
