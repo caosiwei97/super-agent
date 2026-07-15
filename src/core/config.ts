@@ -1,4 +1,24 @@
-import { resolve } from 'node:path'
+import { isAbsolute, resolve } from 'node:path'
+import type { ExecutionProfile } from '../execution/executor.js'
+
+export type { ExecutionProfile } from '../execution/executor.js'
+
+function executionProfile(env: NodeJS.ProcessEnv): ExecutionProfile {
+  const raw = env.SUPER_AGENT_EXECUTION_PROFILE || 'development'
+  if (raw !== 'development' && raw !== 'production') {
+    throw new Error(
+      `SUPER_AGENT_EXECUTION_PROFILE 必须是 development 或 production，当前值: ${raw}`,
+    )
+  }
+  return raw
+}
+
+function optionalAbsolutePath(env: NodeJS.ProcessEnv, name: string) {
+  const raw = env[name]
+  if (raw === undefined || raw === '') return undefined
+  if (!isAbsolute(raw)) throw new Error(`${name} 必须是绝对路径，当前值: ${raw}`)
+  return resolve(raw)
+}
 
 function positiveInteger(env: NodeJS.ProcessEnv, name: string, fallback: number) {
   const raw = env[name]
@@ -42,6 +62,7 @@ function booleanValue(env: NodeJS.ProcessEnv, name: string, fallback: boolean) {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
+  const profile = executionProfile(env)
   return {
     model: {
       baseURL: env.MODEL_BASE_URL || 'https://api.deepseek.com',
@@ -64,6 +85,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     },
     workspaceRoot: resolve(env.SUPER_AGENT_WORKSPACE || process.cwd()),
     autoApprove: booleanValue(env, 'SUPER_AGENT_AUTO_APPROVE', false),
+    execution: {
+      profile,
+      sandbox: {
+        bwrapPath: optionalAbsolutePath(env, 'SUPER_AGENT_BWRAP_PATH') || '/usr/bin/bwrap',
+        rootfsPath: optionalAbsolutePath(env, 'SUPER_AGENT_SANDBOX_ROOTFS'),
+        seccompProfilePath: optionalAbsolutePath(env, 'SUPER_AGENT_SANDBOX_SECCOMP_PROFILE'),
+        cgroupRoot: optionalAbsolutePath(env, 'SUPER_AGENT_SANDBOX_CGROUP_ROOT'),
+      },
+    },
     githubMcp: {
       token: env.GITHUB_PERSONAL_ACCESS_TOKEN,
     },

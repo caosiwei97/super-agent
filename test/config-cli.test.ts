@@ -31,6 +31,39 @@ describe('configuration', () => {
       token: 'token',
     })
   })
+
+  it('defaults to development execution and validates production sandbox paths', () => {
+    assert.equal(loadConfig({}).execution.profile, 'development')
+    const execution = loadConfig({
+      SUPER_AGENT_EXECUTION_PROFILE: 'production',
+      SUPER_AGENT_BWRAP_PATH: '/opt/super-agent/bin/bwrap',
+      SUPER_AGENT_SANDBOX_ROOTFS: '/opt/super-agent/rootfs',
+      SUPER_AGENT_SANDBOX_SECCOMP_PROFILE: '/opt/super-agent/seccomp.bpf',
+      SUPER_AGENT_SANDBOX_CGROUP_ROOT: '/sys/fs/cgroup/super-agent',
+    }).execution
+
+    assert.deepEqual(execution, {
+      profile: 'production',
+      sandbox: {
+        bwrapPath: '/opt/super-agent/bin/bwrap',
+        rootfsPath: '/opt/super-agent/rootfs',
+        seccompProfilePath: '/opt/super-agent/seccomp.bpf',
+        cgroupRoot: '/sys/fs/cgroup/super-agent',
+      },
+    })
+    assert.throws(
+      () => loadConfig({ SUPER_AGENT_EXECUTION_PROFILE: 'staging' }),
+      /development 或 production/,
+    )
+    for (const name of [
+      'SUPER_AGENT_BWRAP_PATH',
+      'SUPER_AGENT_SANDBOX_ROOTFS',
+      'SUPER_AGENT_SANDBOX_SECCOMP_PROFILE',
+      'SUPER_AGENT_SANDBOX_CGROUP_ROOT',
+    ]) {
+      assert.throws(() => loadConfig({ [name]: 'relative/path' }), /必须是绝对路径/)
+    }
+  })
 })
 
 describe('CLI options', () => {

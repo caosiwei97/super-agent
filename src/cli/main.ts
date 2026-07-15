@@ -8,6 +8,13 @@ import { printStartupStats, runOnce, startRepl } from './repl.js'
 import { cliUsage, parseCliOptions, type OpsCliOptions } from './args.js'
 import { SessionStore } from '../session/store.js'
 import { RecoveryCoordinator } from '../execution/recovery-coordinator.js'
+import type { Executor } from '../execution/executor.js'
+import { LocalExecutor } from '../execution/local-executor.js'
+import {
+  SandboxExecutor,
+  SandboxUnavailableError,
+} from '../execution/sandbox-executor.js'
+import { ExecutionRouter } from '../execution/execution-router.js'
 
 function printableOperation(operation: Awaited<ReturnType<RecoveryCoordinator['listOperations']>>[number]) {
   return {
@@ -65,9 +72,21 @@ export async function runCli(args: string[]) {
   if (cli.command === 'ops') return runOps(cli)
 
   const config = loadConfig()
+  const executor: Executor = config.execution.profile === 'production'
+    ? new SandboxExecutor(config.execution.sandbox)
+    : new LocalExecutor()
+  const executorProbe = await executor.probe()
+  if (config.execution.profile === 'production' && !executorProbe.available) {
+    await executor.close()
+    throw new SandboxUnavailableError(executorProbe.reasonCode || 'sandbox_probe_failed')
+  }
   const workspace = new Workspace(config.workspaceRoot)
   const registry = new ToolRegistry({
     onLegacyWarning: (warning) => console.warn(`[Security] ${warning}`),
+    executionRouter: new ExecutionRouter({
+      profile: config.execution.profile,
+      processExecutor: executor,
+    }),
   })
   let store: SessionStore | undefined
 
