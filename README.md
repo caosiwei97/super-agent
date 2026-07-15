@@ -11,6 +11,8 @@ pnpm link --global
 super-agent --help
 ```
 
+Session 单写者使用原生内核文件锁。源码安装需要 Python 与 C/C++ 编译工具链；锁语义面向本机文件系统，不支持把 session 目录放在 NFS 等远程文件系统上。
+
 首次运行前从 `.env-example` 创建 `.env`：macOS/Linux 使用 `cp .env-example .env`，PowerShell 使用 `Copy-Item .env-example .env`。
 
 包提供两套互不混淆的入口：
@@ -74,6 +76,8 @@ pnpm test
 pnpm build
 ```
 
+当前 M1 可靠性验收在 POSIX 平台包含 11 个真实子进程 `SIGKILL` 注入点；Windows 会显式跳过这组用例。它们覆盖 `proposed`、`approved`、`started` write/datasync、dispatch、副作用、terminal、tool-result 与 checkpoint 之间的崩溃窗口，并在 fresh writer 上重复恢复以验证无静默重放和结果物化幂等。
+
 ## 运行链路
 
 ```mermaid
@@ -82,23 +86,46 @@ flowchart TD
     Bin["bin/super-agent.ts\n跨平台可执行入口"] --> CLI["CLI Main\nrun / chat"]
     CLI --> Runner["ConversationRunner\n单轮事务边界"]
     PublicAPI --> Runner
+    CLI --> Cancel["Root AbortController\nSIGINT + Turn Deadline"]
+    Cancel -.-> Runner
     Runner --> Compact["Context Compactor\nMicrocompact + LLM Summary"]
-    Runner --> Loop["Agent Loop\nStep、重试、预算、循环检测"]
-    Runner --> Store["SessionStore\nJSONL 原始事件 + Checkpoint"]
-    Loop --> Registry["ToolRegistry\nSchema、审批、读写锁、截断"]
+    Runner --> Recovery["Recovery Coordinator\nuncertain gate / reconciliation"]
+    Runner --> Loop["Agent Loop\nSchema-only model phase"]
+    Loop --> Model["ModelGateway\nStable requestId + Commit Guard"]
+    Model --> Provider["LLM Provider"]
+    Model --> Audit["Model attempt audit\nstarted / failed / retried / completed"]
+    Runner --> Store["SessionStore\nVersioned JSONL Event Store\n单写者锁 + Durable Append"]
+    Audit --> Store
+    Recovery --> Store
+    Loop --> Pipeline["ToolExecutionPipeline\n唯一运行时执行入口"]
+    Pipeline --> Registry["ToolRegistry Catalog / Dispatcher\nSchema、Ajv 校验、读写锁"]
+    Pipeline --> Ledger["Operation Ledger\nproposed → started → terminal"]
+    Ledger --> Store
     Registry --> Builtin["Builtin Tools\nFile / Shell / Web / Preview"]
     Registry --> MCP["MCP Tools\n运行时注册 + 延迟发现"]
+    Builtin --> Process["ProcessExecutor\nOutput Bound + Process Group Reaping"]
+    Cancel -.-> Compact
+    Cancel -.-> Model
+    Cancel -.-> Pipeline
+    Cancel -.-> Registry
+    Cancel -.-> MCP
+    Cancel -.-> Process
+    Pipeline --> Guard["Result Guard\n截断 + 结构化/文本嵌套脱敏"]
+    Guard --> Store
 ```
 
 一轮对话按以下顺序执行：
 
 1. 用户消息先写入 append-only JSONL，再进入内存上下文。
 2. 发送模型前执行压缩；若上下文或预算发生变化，立即写 checkpoint。
-3. `AgentLoop` 每个 step 都重建 system prompt 和活跃工具集合。
-4. 只读工具可并行执行；读写工具和循环可疑调用生成正式审批请求。
-5. 每个成功 step 的原始消息与累计 token 预算写进同一条 JSONL 事件后落盘。
-6. 下一 step 前再次压缩，避免长工具链持续膨胀上下文。
-7. Agent Loop 结束后执行最后一次压缩，并无条件写恢复 checkpoint。
+3. `AgentLoop` 每个 step 都重建 system prompt 和活跃工具集合；ModelGateway 集中处理稳定 requestId、deadline 和 retry。
+4. text delta 或完整 tool call 一旦对用户可见，当前 attempt 失败时不再整体重试；每次 attempt 写入脱敏审计事件。
+5. 完整 assistant response 先写入 journal；持久化失败时不创建 operation、不执行工具。
+6. Pipeline 严格校验输入并写入 `proposed/approved`；dispatch 前必须获得 durable `started` ack。
+7. 只读且并发安全的工具可并行；写工具、未知能力和 MCP 默认串行并需审批。
+8. terminal event 立即持久化并物化恰好一条 tool-result；未知结果进入 `uncertain`，不会伪造失败结果或继续模型 step。
+9. root signal 和 absolute deadline 贯穿模型、摘要、审批、锁、Pipeline、Web、MCP 与子进程；dispatch 前取消落 `cancelled`，durable `started` 后未知结果落 `uncertain`。
+10. 下一 step 前再次压缩；Agent Loop 结束后执行最后一次压缩并写恢复 checkpoint。
 
 因此，会话文件同时保留两种视图：原始 `messages` 事件用于审计，最新 checkpoint 用于恢复压缩后的工作上下文。旧版分离的 `message`/`budget` JSONL 仍可继续读取。
 
@@ -122,9 +149,10 @@ flowchart TD
 | `src/agent/agent-loop.ts` | 多 step 推理、重试、审批、预算和事件通知 |
 | `src/agent/loop-detection.ts` | 每次 Agent Loop 独立的重复、乒乓和无进展检测 |
 | `src/context/` | Prompt 组装与上下文压缩 |
-| `src/core/tool-registry.ts` | 工具注册、延迟发现、审批策略、并发锁和生命周期 |
+| `src/core/tool-registry.ts` | 工具 Catalog、严格 schema 校验、内部 dispatch、并发锁和生命周期 |
+| `src/execution/` | Operation Ledger、Tool Execution Pipeline、恢复 gate、结果物化与显式对账 |
 | `src/core/workspace.ts` | 文件工具的工作区路径与 symlink 边界 |
-| `src/session/store.ts` | 流式加载 append-only JSONL 和 checkpoint 恢复 |
+| `src/session/store.ts` | 版本化 append-only JSONL、单写者锁、durable append 和 checkpoint 恢复 |
 | `src/tools/` | 内置工具和真实 MCP 工具的延迟发现 `tool_search` |
 | `src/mcp/` | GitHub 托管 Streamable HTTP MCP 客户端 |
 | `src/cli/` | 子命令解析、run/chat 执行、终端展示和人工审批 |
@@ -141,6 +169,8 @@ flowchart TD
 | `TOKEN_BUDGET` | `1000000` | 会话累计 token 上限 |
 | `AGENT_MAX_STEPS` | `15` | 单轮最大 step 数 |
 | `AGENT_MAX_RETRIES` | `10` | 每个模型请求的重试次数，可为 0 |
+| `AGENT_TURN_TIMEOUT_MS` | `120000` | 单轮总墙钟上限，形成贯穿模型、审批和工具的 absolute deadline |
+| `MODEL_REQUEST_TIMEOUT_MS` | `60000` | 单次模型 request 的上限，同时受 turn deadline 约束 |
 | `CONTEXT_TOKEN_THRESHOLD` | `12000` | 触发摘要的估算 token 阈值 |
 | `CONTEXT_KEEP_RECENT_MESSAGES` | `8` | 摘要后保留的最近消息数目标 |
 | `CONTEXT_KEEP_RECENT_TOOL_MESSAGES` | `4` | 不做 Microcompact 的最近工具消息数 |
@@ -160,7 +190,11 @@ flowchart TD
 - Shell、写文件、编辑、预览和 MCP 调用默认需要审批。
 - GitHub token 只发送到代码中固定的官方 HTTPS MCP 地址。
 - 工具结果长度、文件大小、搜索文件数和匹配数均有上限。
+- Session journal 使用固定 lock inode 上的内核单写者锁、单调事件序号、`0700/0600` 权限和显式 durable append；旧版无版本 JSONL 仍可恢复。
+- 每轮取消与 deadline 贯穿模型、摘要、审批、锁、Web、MCP 和工具；POSIX Shell 取消/超时会回收独立进程组，Windows 当前仅保证直接子进程终止。
 
-这个 Demo 不宣称提供 OS 级沙箱：获批的 Shell 仍拥有当前进程权限；DNS 校验与实际连接之间仍存在 DNS rebinding 的理论窗口；外部写操作是 at-least-once 语义，真正需要 exactly-once 时应让工具端支持以 `toolCallId` 为幂等键。同一 session 采用单写者模型，不应让多个进程并发 `--continue`；`grep` 的 JavaScript 正则虽限制了长度和单行输入，仍没有硬超时。token 数量也是保守估算，生产环境应接入 RE2/worker 隔离、模型 tokenizer、JSONL 归档/轮转和指标系统。
+当前实现仍不宣称提供 OS 级沙箱：获批的 Shell 仍拥有当前进程权限；DNS 校验与实际连接之间仍存在 DNS rebinding 的理论窗口。Pipeline/Recovery 已提供 durable-start、unknown-outcome fail-closed、流式 Commit Guard、统一取消、Crash Matrix 和人工对账，但不宣称下游通用 exactly-once。能力策略、生产沙箱、RE2/worker 隔离、模型 tokenizer、JSONL 归档/轮转和指标系统仍属于后续里程碑。
 
 循环检测的细节见 [`src/agent/loop-detection.md`](src/agent/loop-detection.md)。
+
+从当前 Demo 骨架演进到单机生产 Agent 内核的目标架构、里程碑和验收门槛，见 [`docs/production-agent-spec.md`](docs/production-agent-spec.md)。
