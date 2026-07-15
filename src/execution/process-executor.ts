@@ -61,6 +61,8 @@ export interface ProcessExecutionOptions {
   /** Combined stdout and stderr byte budget. */
   readonly maxOutputBytes?: number
   readonly terminationGraceMs?: number
+  /** Numeric parent descriptors inherited as child fd 3, 4, ... . */
+  readonly extraFileDescriptors?: readonly number[]
 }
 
 export interface ProcessExecutionResult {
@@ -97,6 +99,11 @@ function validateOptions(options: ProcessExecutionOptions) {
   if (options.maxOutputBytes !== undefined &&
       (!Number.isSafeInteger(options.maxOutputBytes) || options.maxOutputBytes <= 0)) {
     throw new Error('maxOutputBytes 必须为正安全整数')
+  }
+  if (options.extraFileDescriptors?.some(
+    (descriptor) => !Number.isSafeInteger(descriptor) || descriptor < 0,
+  )) {
+    throw new Error('extraFileDescriptors 必须全部为非负安全整数')
   }
 }
 
@@ -179,7 +186,7 @@ export async function executeProcess(
     env: options.env,
     detached: process.platform !== 'win32',
     shell: false,
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['ignore', 'pipe', 'pipe', ...(options.extraFileDescriptors ?? [])],
     windowsHide: true,
   })
   if (process.platform !== 'win32' && child.pid !== undefined) {

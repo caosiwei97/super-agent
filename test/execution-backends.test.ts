@@ -68,7 +68,7 @@ describe('LocalExecutor', () => {
   })
 })
 
-describe('SandboxExecutor PR9 bootstrap', () => {
+describe('SandboxExecutor bootstrap', () => {
   it('fails closed on non-Linux without inspecting host paths', async () => {
     const executor = new SandboxExecutor({
       bwrapPath: '/missing/bwrap',
@@ -81,7 +81,7 @@ describe('SandboxExecutor PR9 bootstrap', () => {
     assert.equal(executor.supports('process', { requireSandbox: true }), false)
   })
 
-  it('requires every production prerequisite on Linux and still does not claim PR10 isolation', async () => {
+  it('requires every production prerequisite before claiming Linux isolation', async () => {
     const incomplete = new SandboxExecutor({
       bwrapPath: '/missing/bwrap',
       platform: 'linux',

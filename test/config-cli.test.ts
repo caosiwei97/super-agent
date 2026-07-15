@@ -39,6 +39,7 @@ describe('configuration', () => {
       SUPER_AGENT_BWRAP_PATH: '/opt/super-agent/bin/bwrap',
       SUPER_AGENT_SANDBOX_ROOTFS: '/opt/super-agent/rootfs',
       SUPER_AGENT_SANDBOX_SECCOMP_PROFILE: '/opt/super-agent/seccomp.bpf',
+      SUPER_AGENT_SANDBOX_SECCOMP_SHA256: 'a'.repeat(64),
       SUPER_AGENT_SANDBOX_CGROUP_ROOT: '/sys/fs/cgroup/super-agent',
     }).execution
 
@@ -48,7 +49,11 @@ describe('configuration', () => {
         bwrapPath: '/opt/super-agent/bin/bwrap',
         rootfsPath: '/opt/super-agent/rootfs',
         seccompProfilePath: '/opt/super-agent/seccomp.bpf',
+        seccompProfileSha256: 'a'.repeat(64),
         cgroupRoot: '/sys/fs/cgroup/super-agent',
+        maxCgroupMemoryBytes: 1024 * 1024 * 1024,
+        maxCgroupPids: 64,
+        maxCgroupCpuMicrosPerSecond: 1_000_000,
       },
     })
     assert.throws(
@@ -63,6 +68,11 @@ describe('configuration', () => {
     ]) {
       assert.throws(() => loadConfig({ [name]: 'relative/path' }), /必须是绝对路径/)
     }
+    assert.throws(
+      () => loadConfig({ SUPER_AGENT_SANDBOX_SECCOMP_SHA256: 'not-a-digest' }),
+      /SHA-256/,
+    )
+    assert.throws(() => loadConfig({ SUPER_AGENT_SANDBOX_MAX_PIDS: '0' }), /正整数/)
   })
 })
 

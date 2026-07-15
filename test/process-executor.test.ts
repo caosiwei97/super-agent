@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { readFile, rm } from 'node:fs/promises'
+import { open, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
@@ -90,6 +90,52 @@ describe('executeProcess', () => {
 
     assert.equal(result.stdout, value)
     assert.equal(result.terminationReason, 'exited')
+  })
+
+  it('inherits only explicit numeric extra file descriptors after stderr', async (context) => {
+    const path = join(tmpdir(), `super-agent-extra-fd-${process.pid}-${Date.now()}`)
+    const workspacePath = `${path}-workspace`
+    await writeFile(path, 'seccomp-profile-bytes')
+    await writeFile(workspacePath, 'workspace-anchor-bytes')
+    const handle = await open(path, 'r')
+    const workspaceHandle = await open(workspacePath, 'r')
+    context.after(async () => {
+      await handle.close().catch(() => undefined)
+      await workspaceHandle.close().catch(() => undefined)
+      await rm(path, { force: true })
+      await rm(workspacePath, { force: true })
+    })
+
+    const result = await nodeScript(
+      "const fs=require('node:fs');process.stdout.write(fs.readFileSync(3,'utf8')+'|'+fs.readFileSync(4,'utf8'))",
+      { extraFileDescriptors: [handle.fd, workspaceHandle.fd] },
+    )
+    assert.equal(result.stdout, 'seccomp-profile-bytes|workspace-anchor-bytes')
+    assert.equal((await handle.stat()).isFile(), true)
+    assert.equal((await workspaceHandle.stat()).isFile(), true)
+    await assert.rejects(
+      executeProcess({ command: process.execPath, extraFileDescriptors: [-1] }),
+      /非负安全整数/,
+    )
+  })
+
+  it('does not take ownership of inherited descriptors on pre-spawn cancellation', async () => {
+    const path = join(tmpdir(), `super-agent-cancelled-fd-${process.pid}-${Date.now()}`)
+    await writeFile(path, 'still-open')
+    const handle = await open(path, 'r')
+    const controller = new AbortController()
+    controller.abort()
+    try {
+      const result = await nodeScript('process.exit(99)', {
+        signal: controller.signal,
+        extraFileDescriptors: [handle.fd],
+      })
+      assert.equal(result.terminationReason, 'aborted')
+      assert.equal((await handle.stat()).isFile(), true)
+    } finally {
+      await handle.close()
+      await rm(path, { force: true })
+    }
   })
 
   it('reaps redirected background descendants after a natural leader exit', {

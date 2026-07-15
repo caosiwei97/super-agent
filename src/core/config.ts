@@ -20,6 +20,15 @@ function optionalAbsolutePath(env: NodeJS.ProcessEnv, name: string) {
   return resolve(raw)
 }
 
+function optionalSha256(env: NodeJS.ProcessEnv, name: string) {
+  const raw = env[name]
+  if (raw === undefined || raw === '') return undefined
+  if (!/^[a-f0-9]{64}$/.test(raw)) {
+    throw new Error(`${name} 必须是 64 位小写十六进制 SHA-256`)
+  }
+  return raw
+}
+
 function positiveInteger(env: NodeJS.ProcessEnv, name: string, fallback: number) {
   const raw = env[name]
   if (raw === undefined || raw === '') return fallback
@@ -91,7 +100,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
         bwrapPath: optionalAbsolutePath(env, 'SUPER_AGENT_BWRAP_PATH') || '/usr/bin/bwrap',
         rootfsPath: optionalAbsolutePath(env, 'SUPER_AGENT_SANDBOX_ROOTFS'),
         seccompProfilePath: optionalAbsolutePath(env, 'SUPER_AGENT_SANDBOX_SECCOMP_PROFILE'),
+        seccompProfileSha256: optionalSha256(env, 'SUPER_AGENT_SANDBOX_SECCOMP_SHA256'),
         cgroupRoot: optionalAbsolutePath(env, 'SUPER_AGENT_SANDBOX_CGROUP_ROOT'),
+        maxCgroupMemoryBytes: positiveInteger(
+          env,
+          'SUPER_AGENT_SANDBOX_MAX_MEMORY_BYTES',
+          1024 * 1024 * 1024,
+        ),
+        maxCgroupPids: positiveInteger(env, 'SUPER_AGENT_SANDBOX_MAX_PIDS', 64),
+        maxCgroupCpuMicrosPerSecond: positiveInteger(
+          env,
+          'SUPER_AGENT_SANDBOX_MAX_CPU_MICROS_PER_SECOND',
+          1_000_000,
+        ),
       },
     },
     githubMcp: {
