@@ -1,6 +1,6 @@
 # Super-Agent
 
-一个刻意保持小体量、但逐步补齐生产边界的 TypeScript Agent 内核。当前已完成 M3 PR9 执行端口与生产启动门禁；它不是平台化框架，也尚未宣称 production-ready，但已经包含多步 Agent Loop、能力策略、耐久操作账本、Execution Router、统一取消、上下文双层压缩、可恢复会话和 MCP 延迟加载。
+一个刻意保持小体量、但逐步补齐生产边界的 TypeScript Agent 内核。当前 M3 PR10 已实现 Linux Sandbox、Filesystem/Network Broker 与正则 worker 的代码边界，但目标 Linux 真实集成尚未验收；它不是平台化框架，也尚未宣称 production-ready。
 
 ## 快速开始
 
@@ -38,7 +38,7 @@ super-agent run "执行可信的写操作" --yes
 tmux new-session -s super-agent 'super-agent chat --continue --session <session-id>'
 ```
 
-`run` 不会等待交互审批。`--yes` 只会自动批准 Policy 返回的 `ask`，不能越过 hard deny、执行约束、耐久账本或沙箱要求；当前 `bash` 要求尚未实现的沙箱，因此即使传入 `--yes` 也会拒绝执行。
+`run` 不会等待交互审批。`--yes` 只会自动批准 Policy 返回的 `ask`，不能越过 hard deny、执行约束、耐久账本或沙箱要求。当前 `bash` 按最坏情况声明 filesystem、process、network 与 secret 能力，会在 preflight 前被外传 hard deny；即使配置 production Sandbox 或传入 `--yes` 也不会执行。
 
 ## 开发与调试
 
@@ -82,6 +82,10 @@ M2 完成时全量 `pnpm check` 为 173/173，`typecheck`、`build` 与 diff che
 
 M3 PR9 完成时全量 `pnpm check` 为 185/185。production profile 在当前 macOS 上通过 `pnpm start` 实测为 `sandbox_platform_unsupported`、退出码 1，且在 MCP、Session 和 Provider 初始化前停止，没有创建 session；development profile 使用 `.env` 中真实 Key 完成 Provider → `calculator` → Router → durable operation → Provider 的两 step CLI 链路。GitHub 托管 MCP 的 44 个真实 schema 也完成 strict 编译验证；验证不打印 Key，临时 session 已清理。
 
+M3 PR10 当前全量检查为 226 tests、221 pass、5 skip、0 fail，typecheck 通过；5 项均为本机 macOS 无法执行的 Linux-only `/proc/self/fd`、bwrap、seccomp、cgroup 真实集成。因此 PR10 代码边界已实现，但不能据此把 M3 标记完成，仍需在目标 Linux 环境运行真实 integration gate。
+
+2026-07-15 的非 CI 真实 Key E2E 使用 development profile 和 `.env` Provider，真实注册 GitHub MCP 44 个工具；模型先调用 `fetch_url(https://example.com/)`，自动批准后经 pinned NetworkBroker 返回 Example Domain，再在第二 step 输出标题，Operation journal 为 `succeeded`。production profile 在同一台 macOS 上复验为退出码 1、`sandbox_platform_unsupported`，且未创建 session。全过程未打印 Key，临时 session 与 lock 已清理。
+
 ## 运行链路
 
 ```mermaid
@@ -108,21 +112,31 @@ flowchart TD
     Policy -->|"deny"| Ledger
     Policy -->|"allow / ask"| Gate["Constraint + Router Preflight\nSupported Keys + Tightening Subset\nLane Availability"]
     Gate -->|"reject before approval"| Ledger
-    Gate -->|"frozen execution plan"| Ledger
+    Gate --> Plan["Frozen ExecutionPlan\nKind + Backend\nCapabilities + Constraints"]
+    Plan --> Ledger
     Ledger -->|"ask"| Approval["Approval Port\ninteractive / --yes"]
     Approval -->|"approve / deny"| Ledger
     Pipeline --> Ledger["Operation Ledger\nproposed → started → terminal"]
     Ledger --> Store
     Ledger -->|"approved"| Start["Durable Start Gate\nSame attemptId + append started + fsync"]
     Start -->|"durable ack"| Router["Execution Router\nSerializable Request + Out-of-band Control\nDefensive Plan Recheck"]
-    Router --> Host["Governed Host Lanes\nPure / Filesystem / Network / Preview / MCP"]
+    Router --> Pure["Host Pure Lane"]
+    Router --> FileLane["Host Filesystem Lane"]
+    Router --> NetworkLane["Host Network Lane"]
+    Router --> PreviewLane["Host Preview Lane\nDevelopment only"]
+    Router --> MCP["Host MCP Lane\nEndpoint-bound"]
     Router --> ProcessLane["Process Lane"]
     ProcessLane --> Local["LocalExecutor\nDevelopment + no requireSandbox"]
-    ProcessLane --> Sandbox["SandboxExecutor Probe\nProduction, PR10 backend pending"]
-    Host --> Builtin["Builtin Tools\nFile / Web / Preview"]
-    Host --> MCP["MCP Tools\n运行时注册 + 延迟发现"]
+    ProcessLane --> Sandbox["Linux SandboxExecutor\nProduction, offline + read-only\n真实集成待验收"]
+    FileLane --> FS["FilesystemBroker\nPersistent Root FD + /proc/self/fd Walk\nAtomic temp + fsync + rename"]
+    NetworkLane --> NetPolicy["NetworkBroker\nPolicy URL"]
+    NetPolicy --> DNS["Resolve All DNS\nReject Any Special IP"]
+    DNS --> Pin["Pinned Socket\nHost + TLS SNI"]
+    Pin --> Redirect["Redirect Loop\nPolicy + DNS + Pin Again"]
+    FS -.->|"grep only"| Regex["Regex Worker\nHard Timeout + Terminate"]
+    Redirect -->|"3xx"| NetPolicy
     Local --> Controller["ProcessController"]
-    Sandbox -.->|"PR10"| Controller
+    Sandbox --> Controller
     Controller --> Process["ProcessExecutor\nOutput Bound + Process Group Reaping"]
     Cancel -.-> Compact
     Cancel -.-> Model
@@ -131,6 +145,13 @@ flowchart TD
     Cancel -.-> MCP
     Cancel -.-> Process
     Pipeline --> Guard["Result Guard\n截断 + 结构化/文本嵌套脱敏"]
+    Pure --> Guard
+    FS --> Guard
+    Regex --> Guard
+    Redirect -->|"terminal"| Guard
+    PreviewLane --> Guard
+    MCP --> Guard
+    Process --> Guard
     Guard --> Store
 ```
 
@@ -143,7 +164,7 @@ flowchart TD
 5. 完整 assistant response 先写入 journal；持久化失败时不创建 operation、不执行工具。
 6. Pipeline 严格校验输入，并只解析一次冻结的 resolved snapshot：capabilities、constraints、supported constraint keys、并发属性与结构化 tool source；Policy、Ledger、锁和执行共用该快照。
 7. Policy 按 hard deny → Hook → typed rule 固定顺序执行，约束只能求交收紧；只有 `ask` 进入人工审批，`--yes` 也不能批准 `deny`。
-8. Policy 的非 `deny` 决策先经过 Constraint 与 Router Preflight，冻结 execution kind、约束和后端计划；随后统一写入 `proposed`。Policy deny 或预检拒绝直接进入 `denied`，不会触发人工审批；`allow` 或获批的 `ask` 才写入 `approved`。
+8. Policy 的非 `deny` 决策先经过 Constraint 与 Router Preflight，冻结包含 execution kind、backend、capabilities 与 constraints 的 `ExecutionPlan`；随后统一写入 `proposed`。Policy deny 或预检拒绝直接进入 `denied`，不会触发人工审批；`allow` 或获批的 `ask` 才写入 `approved`。
 9. Pipeline 在执行前生成唯一 `attemptId`；同一个值进入 durable `started`、可序列化 `ExecutionRequest` 和 `ToolExecutionContext`。只有获得 fsync ack 才允许 Router dispatch，dispatch 前再次防御性复核冻结计划；`AbortSignal` 通过独立 `ExecutionControl` 传递，不混入 JSON 请求。
 10. 只有 resolved 动态并发属性为安全的工具才可并行；写工具、bash 和未知 MCP 默认串行。
 11. terminal event 立即持久化并物化恰好一条 tool-result；未知结果进入 `uncertain`，不会伪造失败结果或继续模型 step。
@@ -173,7 +194,7 @@ flowchart TD
 | `src/agent/loop-detection.ts` | 每次 Agent Loop 独立的重复、乒乓和无进展检测 |
 | `src/context/` | Prompt 组装与上下文压缩 |
 | `src/core/tool-registry.ts` | 公开只读工具 Catalog、严格 schema 校验、resolved snapshot 与资源生命周期；不公开 dispatch |
-| `src/execution/` | Operation Ledger、Tool Execution Pipeline、Execution Router、Local/Sandbox Executor、恢复 gate、结果物化与显式对账 |
+| `src/execution/` | Operation Ledger、Pipeline/Router、Linux Sandbox、Filesystem/Network Broker、正则 worker、恢复与对账 |
 | `src/security/` | 动态能力、可执行约束、typed policy rules 与 hard-deny 外传门禁 |
 | `src/core/workspace.ts` | 文件工具的工作区路径与 symlink 边界 |
 | `src/session/store.ts` | 版本化 append-only JSONL、单写者锁、durable append 和 checkpoint 恢复 |
@@ -202,10 +223,14 @@ flowchart TD
 | `SUPER_AGENT_WORKSPACE` | 当前目录 | 文件、Shell 和预览工具的工作区 |
 | `SUPER_AGENT_AUTO_APPROVE` | `false` | 自动批准 Policy 的 `ask`；不能越过 hard deny 与执行约束 |
 | `SUPER_AGENT_EXECUTION_PROFILE` | `development` | `development` 使用 Local process backend；`production` 只接受 Sandbox backend |
-| `SUPER_AGENT_BWRAP_PATH` | `/usr/bin/bwrap` | production Linux 的 bwrap 绝对路径；PR10 前探针仍返回 unavailable |
-| `SUPER_AGENT_SANDBOX_ROOTFS` | 无 | production sandbox rootfs 绝对路径 |
-| `SUPER_AGENT_SANDBOX_SECCOMP_PROFILE` | 无 | production seccomp profile 绝对路径 |
-| `SUPER_AGENT_SANDBOX_CGROUP_ROOT` | 无 | production cgroup 根目录绝对路径 |
+| `SUPER_AGENT_BWRAP_PATH` | `/usr/bin/bwrap` | production Linux 的可信 bwrap 绝对路径 |
+| `SUPER_AGENT_SANDBOX_ROOTFS` | 无 | root-owned、不可写的 sandbox rootfs 绝对路径 |
+| `SUPER_AGENT_SANDBOX_SECCOMP_PROFILE` | 无 | seccomp BPF profile 绝对路径 |
+| `SUPER_AGENT_SANDBOX_SECCOMP_SHA256` | 无 | seccomp profile 的 64 位小写 SHA-256 |
+| `SUPER_AGENT_SANDBOX_CGROUP_ROOT` | 无 | 当前进程所在有界 cgroup v2 的可信根目录 |
+| `SUPER_AGENT_SANDBOX_MAX_MEMORY_BYTES` | `1073741824` | shared cgroup 允许的最大 `memory.max` |
+| `SUPER_AGENT_SANDBOX_MAX_PIDS` | `64` | shared cgroup 允许的最大 `pids.max` |
+| `SUPER_AGENT_SANDBOX_MAX_CPU_MICROS_PER_SECOND` | `1000000` | shared cgroup 每秒允许的最大 CPU quota |
 | `GITHUB_PERSONAL_ACCESS_TOKEN` | 无 | GitHub MCP 的 PAT；未配置时不接入 |
 
 配置 PAT 后直接连接 GitHub 官方托管的远程 MCP，不启动本地 MCP 进程，也不需要安装任何 binary。缺少可信能力元数据的 MCP 工具按 `network.egress + external.write`、串行、需审批处理，并绑定 endpoint 的 scheme、host 和 port；Policy 使用结构化 server identity，不从工具名称猜测来源。
@@ -216,18 +241,21 @@ flowchart TD
 
 - 文件读写限制在显式 workspace 内；敏感文件按 canonical realpath 分类，因此 symlink 不能隐藏 `.env`、SSH、云凭据、macOS Keychain 或常见 token 文件。目录 glob/grep 默认过滤敏感候选，显式敏感读取追加 `secret.read`。
 - Preview 每个 HTTP 请求重新解析 realpath，并在读取前对敏感目标或敏感 symlink 返回 `403`。
-- Web 抓取限制 HTTP(S)、批准的 scheme/host/port、响应大小和重定向次数；初始 URL 与每一跳 redirect 都重新验证约束，并阻止本地/私网 DNS 结果。
+- 全部内置文件工具通过 FilesystemBroker。production Linux 启动时持有 workspace root FD，并逐级经 `/proc/self/fd` 打开目录、拒绝 symlink/hardlink 越界；最终文件以 `O_NONBLOCK` 打开并在 I/O 前拒绝 FIFO/device 等特殊类型。写入使用同目录临时文件、文件 `fsync`、原子 rename 和目录 `fsync`。该协议保证耐久原子替换，但不是跨进程 compare-and-swap；同 UID 并发写者仍需上层单写者协议。
+- Web 请求通过 NetworkBroker：先验证 policy scheme/host/port，再解析全部 DNS answer；IPv6 仅接受当前 global-unicast `2000::/3`，任一 special/private/loopback/link-local/metadata 地址都会拒绝。实际 socket 固定到已验证 IP，同时保留 HTTP Host 与 TLS SNI；每一跳 redirect 都重新执行 policy → DNS → pinned dial。
 - 同一调用或 batch 的 `secret.read + network.egress` 会 hard deny；会话中已经成功的敏感读取也会阻止后续网络外传。旧 journal 的 `legacy.read` 保守映射为 `secret.read`。
 - `secret.read` 的工具结果按能力整体替换为 `[REDACTED]`，不进入模型上下文、终端 observer 或 durable journal；带供应商/环境前缀的常见 secret 字段也会被通用结果守卫识别。
-- Constraint Gate 在开始执行前检查约束支持范围与收紧关系；缺少可执行支持、约束交集为空或 `requireSandbox` 无后端时均 fail closed。
-- Shell 按最坏情况声明 filesystem、process、network 和 secret 能力，并要求 sandbox；PR9 只实现 production probe，PR10 前没有可用 sandbox backend，因此 `bash` 当前仍禁用，`--yes` 不能绕过。
+- Constraint Gate 与 Router Preflight 冻结 capabilities、constraints、execution kind 和 backend；审批、durable start 与 dispatch 使用同一 `ExecutionPlan`，dispatch 前再次防御性复核。
+- production process backend 使用 Linux bwrap：rootfs 与 workspace 均只读，workspace 通过 `--ro-bind-fd` 锚定；清空环境、隔离 user/PID/IPC/UTS/network/cgroup namespace、drop capabilities、`no-new-privileges`，并使用有界 tmpfs。seccomp profile 每次打开后校验 digest，启动探针还运行 immutable rootfs 中的固定 helper 验证禁用 syscall。CPU、memory、PID 与 FD 边界来自当前进程已加入的 shared bounded cgroup，并以全局 single-flight 避免并发争用；当前 lane 仅支持 offline、read-only process。
+- Shell 按最坏情况声明 filesystem、process、network 和 secret 能力，会触发外传 hard deny；当前 `bash` 仍禁用，`--yes` 不能绕过。Preview 带 `process.execute` 却位于 host preview lane，production 同样在 preflight 拒绝。
+- `glob` 使用受限的字面路径、`*`、`**`、`?` 语法，并以独立 1 秒 hard deadline 同时约束 Broker walk 与同步匹配；`grep` 在独立 worker thread 中编译和执行 ECMAScript RegExp，灾难性回溯由 hard timeout/AbortSignal 直接 terminate，输入、匹配数、行长、worker heap/stack 和结果均有上限，所有路径等待 worker 退出。
 - 未知 MCP 默认声明 `network.egress + external.write`，绑定 endpoint origin、拒绝 HTTP redirect、串行执行并要求审批。
 - GitHub token 只发送到代码中固定的官方 HTTPS MCP 地址。
 - 工具结果长度、文件大小、搜索文件数和匹配数均有上限。
 - Session journal 使用固定 lock inode 上的内核单写者锁、单调事件序号、`0700/0600` 权限和显式 durable append；旧版无版本 JSONL 仍可恢复。
 - 每轮取消与 deadline 贯穿模型、摘要、审批、锁、Web、MCP 和工具；POSIX Shell 取消/超时会回收独立进程组，Windows 当前仅保证直接子进程终止。
 
-当前实现已经提供生产 profile、Execution Router、可序列化请求/控制分离和 Local/Sandbox 执行端口，但仍不宣称具备 OS 级沙箱或 Filesystem/Network Broker。production 在 PR10 完成前会启动失败；要求 sandbox 的调用会直接拒绝，不会降级到宿主执行。DNS 校验与实际连接之间仍存在 DNS rebinding 的理论窗口。Pipeline/Recovery 已提供 capability policy、durable-start、unknown-outcome fail-closed、流式 Commit Guard、统一取消、Crash Matrix 和人工对账，但不宣称下游通用 exactly-once。Linux bwrap/seccomp/cgroup、Broker、RE2/worker 隔离、模型 tokenizer、JSONL 归档/轮转和指标系统仍属于后续里程碑。
+PR10 尚未完成目标环境验收：当前开发机是 macOS，Linux `/proc/self/fd`、bwrap、seccomp fixed-helper 与 cgroup 的真实 integration 测试均跳过。只读 workspace 的 FD 锚定防止顶层 pathname 被替换，但不会冻结子树内容；同 UID 进程可在检查后修改子项，强快照语义仍需 staging/snapshot。当前 cgroup 是 agent 进程继承的 shared bound，不是 per-operation cgroup，尚未隔离 Agent 自身或校验 `memory.swap.max`。seccomp helper 源码、canonical BPF 制品和项目认可 digest 也尚未纳入仓库；单一禁用 syscall 探针不能证明完整策略。Regex worker 仍使用 ECMAScript RegExp，而非线性时间 RE2。上述边界在目标 Linux 验收前均不能扩大宣称为 M3 完成或 production-ready。
 
 循环检测的细节见 [`src/agent/loop-detection.md`](src/agent/loop-detection.md)。
 

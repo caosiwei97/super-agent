@@ -6,7 +6,7 @@
 >
 > 最后更新：2026-07-15
 >
-> 实施状态：M0、M1A、M1B、M1C、M2、M3 PR9 已完成；下一阶段为 M3 PR10（Linux Sandbox 与 Broker）
+> 实施状态：M0、M1A、M1B、M1C、M2、M3 PR9 已完成；M3 PR10 代码边界已实现，目标 Linux 真实集成验收未完成
 
 ## 1. 背景与结论
 
@@ -52,21 +52,22 @@ Super-Agent 当前已经具备多步 Agent Loop、能力策略、耐久操作账
 - 模型请求重试、累计 token 预算和循环检测。
 - 工具 schema 校验、审批回调、读写锁和结果截断。
 - 工作区路径、symlink、Web 私网访问和响应大小检查。
+- 冻结 ExecutionPlan、Filesystem/Network Broker、Linux read-only/offline Sandbox 与正则 worker 硬超时。
 - append-only JSONL 原始消息与 checkpoint 恢复。
 - Microcompact 与 LLM Summary 双层上下文压缩。
 - MCP 工具延迟发现。
 
 ### 4.2 剩余 P0 差距
 
-- M2 已移除内置与 MCP 工具对 `isReadOnly` 权限语义的依赖，并让 `--yes` 只能批准 `ask`。
-- M3 PR9 已建立 Execution Router、Local/Sandbox 执行端口和 production 启动探针；当前仍无真正的进程、文件系统、网络和资源隔离。为避免静默降级，production 在 PR10 前启动失败，`requireSandbox` 调用在 dispatch 前拒绝，`bash` 仍不可用。
+- PR10 已实现 Linux bwrap/seccomp/cgroup、Filesystem/Network Broker 与正则 worker 的代码边界；但当前 macOS 环境跳过 5 项 Linux-only 真实 integration，尚不能关闭 M3。
+- 当前 `bash` 因最坏能力集合触发 secret-to-egress hard deny，Preview 因 `process.execute` 位于 host preview lane 而被 production preflight 拒绝；现有用户工具尚不能证明 production process lane 的端到端可用性。
 
 ### 4.3 P1 差距
 
 - 会话 journal 尚缺轮转、配额、归档和长期保留策略。
-- Web 访问仍需消除 DNS 校验与实际连接之间的 rebinding 窗口。
-- JavaScript 正则执行缺少硬隔离和硬超时。
-- 缺少统一审计事件、结构化指标和敏感字段脱敏策略。
+- 缺少统一可插拔审计出口、结构化指标与长期运维告警。
+- read-only workspace FD anchor 不提供子树 snapshot；同 UID 并发修改需要 staging/snapshot 才能获得强一致视图。
+- 当前 sandbox 继承 agent 所在的 shared bounded cgroup，只能以 single-flight 使用；尚无 per-operation cgroup。
 
 ## 5. 目标架构
 
@@ -95,6 +96,7 @@ flowchart TB
         Capability["Capability Resolver"]
         PreHook["PreToolUse Hooks"]
         Policy["Policy Engine<br/>allow / ask / deny + constraints"]
+        Plan["Frozen ExecutionPlan<br/>Kind / Backend / Capabilities / Constraints"]
         Approval["Approval Port<br/>interactive / non-interactive"]
         Ledger["Operation Ledger<br/>immutable state transitions"]
         Scheduler["Bounded Scheduler<br/>约束感知并发"]
@@ -132,9 +134,11 @@ flowchart TB
     Loop -->|"tool call"| Pipeline
     Registry -->|"definition"| Validate
     Pipeline --> Validate --> Capability --> PreHook --> Policy
-    Policy -->|"allow"| Ledger
-    Policy -->|"ask"| Approval
+    Policy -->|"allow"| Plan
+    Policy -->|"ask"| Plan
     Policy -->|"deny"| Ledger
+    Plan -->|"ask"| Approval
+    Plan -->|"allow"| Ledger
     Approval -->|"approve / deny"| Ledger
     Ledger -->|"denied / cancelled durable result"| Pipeline
     Ledger -->|"approved"| Scheduler
@@ -770,7 +774,7 @@ M1 总退出条件：
 - `ToolRegistry.resolveInvocation()` 在 strict schema 后只解析一次规范化输入、动态能力、可执行约束、约束支持键、并发属性与结构化 tool provenance；Pipeline、Ledger、锁和执行共用同一冻结快照。
 - `ExecutionConstraints` 仅覆盖当前可落实的文件根、网络 scheme/host/port、loopback 监听端口、sandbox 要求和结果上限；Hook 与 rule 只能通过求交收紧。
 - `ToolRegistry` 的公开 API 只提供 Catalog、schema 校验和 resolution，不暴露 dispatch；Pipeline 在人工审批前完成约束预检，不可执行约束落 `proposed → denied`。Package 内部 dispatch 边界只接受 Registry 产生的 invocation，防御性复核后写入 durable `started`，获得 ack 才调用私有执行 closure。
-- Constraint Gate 在 dispatch 前验证有效约束只会收紧 resolved 约束，并拒绝工具未声明支持的约束键；`requireSandbox` 在 M3 后端可用前一律拒绝，不向宿主执行静默降级。
+- Constraint Gate 在 dispatch 前验证有效约束只会收紧 resolved 约束，并拒绝工具未声明支持的约束键；Router Preflight 进一步冻结 execution kind、backend、capabilities 与 constraints，不支持的 sandbox 组合不向宿主执行静默降级。
 - `PolicyEngine` 固定执行 hard deny → async tightening Hook → typed rule/default。Hook/rule 不能把 `deny` 或 `ask` 放宽，异常、非法决策和空约束交集均拒绝。
 - 同一调用或 batch 出现 `secret.read + network.egress` 时 hard deny；Ledger 中已成功的 `secret.read` 会形成可恢复的 session capability history，之后的 egress 默认拒绝。
 - `--yes` 不进入 PolicyContext，只能作为 `ask` 分支的 approval handler；`allow` 不调用人工审批，`deny` 永不调用审批或工具 closure。
@@ -800,13 +804,13 @@ PR7 验收：
 - 文件能力和约束基于 canonical realpath。`.env/.env.*`、SSH key、AWS/GCloud/Azure/Kube 凭据、macOS Keychain、常见包管理器 token、`*.pem/*.key` 与 credentials/service-account JSON 统一归类为敏感路径，symlink 别名不能隐藏该分类。
 - 普通目录 glob/grep 在执行阶段过滤敏感候选；只有显式请求敏感文件或敏感 pattern 并携带 `secret.read` 时才允许读取。`edit_file` 因读后写而声明 `filesystem.read + filesystem.write`，敏感目标再追加 `secret.read`。
 - Preview 只绑定策略批准的 `127.0.0.1:port` 和 `app/` 读取根；每个 HTTP 请求都重新解析 realpath，读取前对敏感目标、敏感 symlink 与越界路径返回 `403`。
-- Fetch 把初始 URL 固化为 scheme/host/port 约束，在 DNS/fetch 前验证，并对每一跳 redirect 重新执行 URL 约束和公网地址检查；M2 仍不把该检查扩大解释为已经消除 DNS rebinding。
+- Fetch 把初始 URL 固化为 scheme/host/port 约束；PR10 NetworkBroker 已把每一跳扩展为 policy → 全量 DNS answer 校验 → pinned socket，redirect 重新执行完整循环。
 - 未知 MCP 使用结构化 `{ kind: 'mcp', serverName }` provenance，声明 `network.egress + external.write`，绑定 transport endpoint 的 scheme、host、port，并强制 manual redirect 后拒绝全部 HTTP 3xx；server rule 不依赖工具名前缀反向猜测身份。
-- `bash` 按自由命令最坏情况声明 `process.execute + filesystem.read + filesystem.write + network.egress + secret.read`。它既触发外传 hard deny，又要求 `requireSandbox`；PR10 前一律拒绝，`--yes` 不能绕过。
+- `bash` 按自由命令最坏情况声明 `process.execute + filesystem.read + filesystem.write + network.egress + secret.read`。它触发外传 hard deny；即使 PR10 Sandbox 已实现或设置 `--yes`，当前也不会进入 preflight/dispatch。
 - `--yes` 只自动确认 `ask`，不能越过 hard deny、约束支持检查、约束子集检查、Operation Ledger 或 sandbox 要求。
 - 任意 `secret.read` 结果在物化到模型上下文、终端 observer 和 durable journal 前整体替换为 `[REDACTED]`；通用结果守卫同时识别带供应商或环境前缀的常见 secret 字段。
 
-当前 M3 PR9 运行架构：
+当前 M3 PR10 运行架构：
 
 ```mermaid
 flowchart LR
@@ -817,24 +821,39 @@ flowchart LR
     Policy -->|"deny"| Ledger["Operation Ledger<br/>proposed → terminal"]
     Policy -->|"allow / ask"| Gate["Constraint + Router Preflight<br/>Supported + Tightening Subset<br/>Backend Availability"]
     Gate -->|"reject"| Ledger
-    Gate -->|"frozen plan"| Ledger
+    Gate --> Plan["Frozen ExecutionPlan<br/>Kind + Backend<br/>Capabilities + Constraints"]
+    Plan --> Ledger
     Ledger -->|"ask"| Approval["Approval Port<br/>interactive / --yes"]
     Approval -->|"approve / deny"| Ledger
     Ledger -->|"approved"| Start["Durable Start Gate<br/>Same attemptId + append started + fsync"]
     Start -->|"durable ack"| Router["Execution Router<br/>JSON Request + Out-of-band Control<br/>Defensive Plan Recheck"]
-    Router --> Host["Governed Host Lanes<br/>Pure / Filesystem / Network / Preview / MCP"]
+    Router --> Pure["Host Pure Lane"]
+    Router --> File["Host Filesystem Lane"]
+    Router --> Network["Host Network Lane"]
+    Router --> Preview["Host Preview Lane<br/>Development only"]
+    Router --> MCP["Host MCP Lane<br/>Endpoint-bound"]
     Router --> Process["Process Lane"]
     Process --> Local["LocalExecutor<br/>Development only"]
-    Process --> Sandbox["SandboxExecutor Probe<br/>Production, unavailable until PR10"]
-    Host --> MCP["Remote MCP<br/>Endpoint-bound + Structured Source"]
-    Host --> Result["Result Guard + Terminal Event"]
+    Process --> Sandbox["Linux SandboxExecutor<br/>Production offline/read-only<br/>真实集成待验收"]
+    File --> FS["FilesystemBroker<br/>Persistent Root FD + /proc/self/fd<br/>Atomic temp + fsync + rename"]
+    FS -.->|"grep only"| Regex["Regex Worker<br/>Hard Timeout + Terminate"]
+    Network --> PolicyURL["Policy URL"]
+    PolicyURL --> DNS["Resolve All DNS<br/>Reject Any Special IP"]
+    DNS --> Pin["Pinned Socket<br/>Host + TLS SNI"]
+    Pin --> Redirect["Redirect Loop"]
+    Redirect -->|"3xx"| PolicyURL
+    Pure --> Result["Result Guard + Terminal Event"]
+    FS --> Result
+    Regex --> Result
+    Redirect -->|"terminal"| Result
+    Preview --> Result
     Local --> Result
     Sandbox --> Result
     MCP --> Result
     Result --> Ledger
 ```
 
-该图描述 PR9 已实现边界。Host lanes 仍是受治理的 Node closure，并不等同于 Broker；`SandboxExecutor` 也只实现严格配置和启动探针，始终报告 unavailable。Linux bwrap/seccomp/cgroup、Filesystem/Network Broker、DNS pinned connection 与安全写入属于 PR10，当前不会用 Local backend 冒充 production 隔离。
+该图描述 PR10 当前代码边界。pure/filesystem/network/preview/MCP 是显式 host lane，其中 filesystem 与 network 分别进入 Broker；process 才能选择 Local/Sandbox backend。production 禁止 `process.execute` 留在 host lane，因此 Preview 当前 fail closed。Sandbox 只接受 `process.execute + filesystem.read`、单一只读 workspace root、无 network/listener grant 的窄能力集合；这不是对任意工具 closure 的自动容器化。
 
 M2 退出条件：
 
@@ -844,7 +863,7 @@ M2 退出条件：
 - 全量 `pnpm check` 通过，173/173 测试通过；`pnpm typecheck`、`pnpm build` 与 `git diff --check` 通过。
 - 本地手工真实 Key E2E（2026-07-15，OpenAI-compatible Provider，非 CI）通过：Provider 分两个 step 先调用 `read_file` 读取仅含合成测试值的 `.env.synthetic`，Operation 以 `filesystem.read + secret.read` 完成 `succeeded`，模型、终端与 journal 结果均为 `[REDACTED]`；随后调用 `fetch_url`，其 `network.egress + external.read` Operation 只到 `proposed → denied(policy_denied)`，没有 `approved/started`、没有进入工具 closure。验证不记录真实 Key，临时 fixture 与 session 均已清理。
 
-M3 PR9 已完成，下一阶段进入 PR10 Linux Sandbox 与 Broker 加固。
+M3 PR9 已完成；PR10 代码实现与本机测试已收口，等待目标 Linux 真实集成验收。
 
 ### 7.7 M3：执行隔离
 
@@ -864,18 +883,35 @@ M3 PR9 已完成，下一阶段进入 PR10 Linux Sandbox 与 Broker 加固。
 - development 只在约束允许时使用 Local Backend；production 只接受 Sandbox Backend。平台或探针不支持时在 MCP、Session、Provider 初始化前启动失败，不允许静默回退。
 - PR9 已完成：全量 `pnpm check` 185/185、`pnpm build` 与 diff check 通过；production macOS `pnpm start` 实测退出码 1、未创建 session。development 使用真实 Key 完成 Provider → calculator → Router → durable operation → Provider 两 step；GitHub MCP 44 个真实 schema 通过独立 strict JSON Schema 2020-12 编译。Key 未打印，临时 session 已清理。
 
-#### PR 10：Linux Sandbox 与 Broker 加固
+#### PR 10：Linux Sandbox 与 Broker 加固（代码实现完成，目标 Linux 验收未完成）
 
-首个生产版本只承诺 Linux，最低要求：
+已实现：
 
-- rootless/user namespace、drop capabilities、`no-new-privileges`、seccomp。
-- read-only root filesystem、独立 PID namespace、受限 workspace mount。
-- 默认无网络，域名允许列表经受控代理或绑定解析 IP 到实际连接。
-- 禁止 Docker socket、SSH agent、云元数据地址和宿主 Unix socket。
-- CPU、内存、磁盘、PID、FD、输出字节和墙钟限制。
-- 启动时清扫遗留临时目录。
+- `ExecutionRouter.preflight()` 严格解析并冻结 `ExecutionPlan`，其中同时包含 execution kind、backend、capabilities 与 constraints；人工审批、durable `started`、可序列化 `ExecutionRequest` 和 dispatch 前防御性复核使用同一计划。
+- host lane 明确分为 `pure/filesystem/network/preview/mcp`。所有内置文件工具通过 `FilesystemBroker`，Fetch 通过 `NetworkBroker`；MCP 继续由 endpoint-bound remote client 治理。production 中携带 `process.execute` 的非 process lane 一律拒绝，因此 Preview 当前不会留在宿主执行。
+- production Linux `FilesystemBroker` 在启动时持有 persistent workspace root FD，逐段通过 `/proc/self/fd/<fd>` 进行 openat-like 目录遍历并使用 `O_NOFOLLOW`；`read_file/list_directory/glob/grep/write_file/edit_file` 全部进入 Broker，读取同时拒绝 hardlink，最终文件使用 `O_NONBLOCK` 并在 I/O 前拒绝 FIFO/device 等特殊类型。
+- 文件写入使用同目录 `O_EXCL` 临时文件、保留目标 mode、完整写入、文件 `fsync`、原子 rename 与父目录 `fsync`，取消/失败时清理临时文件。这保证单次替换的原子性与耐久性，但不是跨进程 compare-and-swap；外部同 UID 写者仍可能产生 last-writer-wins。
+- `NetworkBroker` 对每一跳执行固定循环：验证 policy scheme/host/port → 解析全部 DNS answer → IPv6 仅接受当前 global-unicast `2000::/3`，任一 special/private/loopback/link-local/metadata/transition 地址即拒绝 → 选择已验证 IP 建立 pinned socket，同时保留 HTTP Host 与 TLS SNI → 对 redirect 从头重复。请求不使用 global fetch、shared Agent 或 proxy environment。
+- Linux Sandbox 使用 bwrap argv-only 启动：user/PID/IPC/UTS/network/cgroup namespace、drop all capabilities、`no-new-privileges` 探针、清空环境、只读 rootfs、经 `--ro-bind-fd` 锚定的只读 workspace、受限 tmpfs、完整进程树回收与输出/墙钟限制。首个 process lane 只接受 `process.execute + filesystem.read`，默认且固定 offline/read-only。
+- bwrap、rootfs 与 seccomp 要求可信绝对路径和不可写祖先；cgroup 使用 canonical realpath，并验证当前进程 membership 落在配置根内。四者都在运行前复核 identity。seccomp BPF 每次通过 FD 打开并校验配置的 SHA-256；启动探针执行 immutable rootfs 内固定 helper，只有目标禁用 syscall 返回 `EPERM/SIGSYS` 标记才接受 profile，同时检查 `NoNewPrivs` 与空 effective capabilities。
+- 资源边界要求 agent 已位于有界 cgroup v2 subtree，验证 `memory.max`、`pids.max`、`cpu.max` 与 open-files hard limit；probe 与 sandbox process 共用全局 single-flight gate。当前是 shared inherited cgroup，不是 per-operation cgroup。
+- 启动只清理保留前缀、同 UID 且超过年龄阈值的 probe 临时目录，不扫描或删除任意 `/tmp` 内容。
+- `glob` 缩减为字面路径、`*`、`**`、`?` 的有界语法，并用独立 1 秒 hard deadline 贯穿 Broker walk 和同步匹配；`grep` 的不可信 ECMAScript RegExp 仅在独立 worker thread 编译和执行。每次调用有 absolute deadline、硬超时、AbortSignal、输入/行长/匹配数/heap/stack 上限；timeout、取消、非法消息与异常退出均 terminate worker、丢弃部分结果并 fail closed。
 
-同时完成文件安全写入、Web DNS rebinding 防护和正则 worker/RE2 硬超时。
+当前验收：
+
+- 全量 `pnpm check` 为 226 tests、221 pass、5 skip、0 fail，typecheck 通过。
+- 5 项 skip 均为当前 macOS 环境无法运行的 Linux-only `/proc/self/fd`、真实 bwrap、seccomp fixed-helper 与 bounded cgroup integration；单元测试、argv contract、失败门禁、Network pinned dial、Filesystem Broker 与 Regex worker 已通过。
+- 本地手工真实 Key E2E（2026-07-15，OpenAI-compatible Provider，非 CI）通过：development profile 从 `.env` 启动并真实注册 GitHub MCP 44 个工具；Step 1 模型调用 `fetch_url(https://example.com/)`，自动批准后经 pinned NetworkBroker 返回 Example Domain，Step 2 输出页面标题，对应 Operation journal 为 `succeeded`。production profile 在同一台 macOS 上复验为退出码 1、`sandbox_platform_unsupported`，且没有创建 session。验证未打印 Key，临时 session 与 lock 已清理。
+- 因目标 Linux integration 尚未运行，PR10 与 M3 不标记完成，production-ready 声明保持关闭。
+
+未关闭边界：
+
+- `withReadOnlyWorkspaceFd()` 固定 workspace 顶层 inode，并在 bind 前检查 sensitive path、hardlink 与特殊文件，但同 UID 进程仍可在检查后修改子树内容。需要 immutable staging/snapshot 才能提供强一致 workspace 视图。
+- shared cgroup 只能靠全局 single-flight 避免并发 sandbox 争用，不能隔离 Agent 自身，也尚未验证 `memory.swap.max`；后续需要带 `cgroup.kill` 的 per-operation cgroup。
+- seccomp 当前只校验运维配置 profile 的 digest，并通过外部 immutable rootfs helper 探测一个禁用 syscall；仓库尚未包含可复现 helper 源码、canonical BPF 和项目认可 digest，因此不能证明完整 syscall allowlist。
+- 当前 `bash` 的最坏能力集合包含 `secret.read + network.egress`，在 Policy hard deny 阶段停止；Preview 则因 production process-boundary mismatch 停止。需要新增窄 capability、可序列化 argv 的受控 process tool，才能完成真实业务 process lane E2E。
+- Regex worker 仍是受硬边界保护的 ECMAScript RegExp，不是线性时间 RE2。
 
 M3 退出条件：生产 profile 的 `process.execute` 只能经过 Sandbox Backend；sandbox escape、socket、metadata、egress、resource bomb、DNS rebinding、symlink swap 和进程树测试全部通过。
 
