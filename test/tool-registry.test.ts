@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
+import { streamText } from 'ai'
 import { AsyncReadWriteLock } from '../src/core/async-rw-lock.js'
 import {
   ToolRegistry,
   type MCPToolClient,
   type ToolDefinition,
 } from '../src/core/tool-registry.js'
+import { streamSequenceModel } from './helpers.js'
 
 function definition(name: string, execute: ToolDefinition['execute']) {
   return {
@@ -16,6 +18,10 @@ function definition(name: string, execute: ToolDefinition['execute']) {
     isReadOnly: true,
     execute,
   }
+}
+
+function dispatchOptions() {
+  return { signal: new AbortController().signal, deadline: Date.now() + 60_000 }
 }
 
 describe('AsyncReadWriteLock', () => {
@@ -41,54 +47,177 @@ describe('AsyncReadWriteLock', () => {
     await Promise.all([writer, laterReader])
     assert.deepEqual(order, ['writer', 'reader'])
   })
+
+  it('removes an aborted waiter without poisoning the queue', async () => {
+    const lock = new AsyncReadWriteLock()
+    const releaseWriter = await lock.acquireWrite()
+    const controller = new AbortController()
+    const cancelled = lock.acquireRead(controller.signal)
+    const next = lock.acquireWrite()
+
+    controller.abort(new DOMException('cancel wait', 'AbortError'))
+    await assert.rejects(cancelled, { name: 'AbortError' })
+    releaseWriter()
+    const releaseNext = await next
+    releaseNext()
+  })
 })
 
 describe('ToolRegistry', () => {
-  it('notifies each result once and preserves toolCallId under parallel completion', async () => {
+  it('exposes schema-only model tools and metadata without execution closures', async () => {
     const registry = new ToolRegistry()
-    registry.register(
-      definition('slow', async () => {
-        await new Promise((resolve) => setTimeout(resolve, 10))
-        return 'slow-result'
-      }),
-      definition('fast', async () => 'fast-result'),
-    )
-    const observed: Array<[string, string]> = []
+    let executions = 0
+    const source = definition('read_demo', async () => {
+      executions++
+      return 'must not run during generation'
+    })
+    registry.register(source)
 
-    await Promise.all([
-      registry.executeTool('slow', {}, 'id-slow', {
-        onToolResult: (invocation, result) => {
-          observed.push([invocation.toolCallId, result.output])
-        },
-      }),
-      registry.executeTool('fast', {}, 'id-fast', {
-        onToolResult: (invocation, result) => {
-          observed.push([invocation.toolCallId, result.output])
-        },
-      }),
-    ])
+    const descriptor = registry.getDescriptor('read_demo')
+    assert.ok(descriptor)
+    assert.equal('execute' in descriptor, false)
+    assert.equal('dispose' in descriptor, false)
+    assert.equal(Object.isFrozen(descriptor), true)
+    assert.equal(Object.isFrozen(descriptor.parameters), true)
 
-    assert.deepEqual(new Map(observed), new Map([
-      ['id-fast', 'fast-result'],
-      ['id-slow', 'slow-result'],
-    ]))
+    const modelTools = registry.toModelToolSet() as Record<string, Record<string, unknown>>
+    assert.equal('execute' in modelTools.read_demo!, false)
+    assert.equal('needsApproval' in modelTools.read_demo!, false)
+
+    const { model } = streamSequenceModel([{ type: 'tools', calls: [
+      { id: 'call-1', name: 'read_demo', input: {} },
+    ] }])
+    const result = streamText({
+      model,
+      tools: registry.toModelToolSet(),
+      messages: [{ role: 'user', content: 'read' }],
+      maxRetries: 0,
+    })
+    for await (const _part of result.fullStream) {
+      // Consuming the full model stream must still not invoke the tool closure.
+    }
+    assert.equal(executions, 0)
+    assert.equal((await result.response).messages[0]?.role, 'assistant')
   })
 
-  it('does not invoke a failing result observer twice', async () => {
+  it('strictly validates and freezes tool input without coercion or unknown fields', async () => {
     const registry = new ToolRegistry()
-    registry.register(definition('read', async () => 'ok'))
-    let calls = 0
+    let executions = 0
+    registry.register({
+      ...definition('strict_tool', async () => {
+        executions++
+        return 'ok'
+      }),
+      parameters: {
+        type: 'object',
+        properties: { count: { type: 'integer' } },
+        required: ['count'],
+        additionalProperties: false,
+      },
+    })
+
+    const valid = registry.validateToolInput('strict_tool', { count: 2 })
+    assert.equal(valid.ok, true)
+    if (valid.ok) assert.equal(Object.isFrozen(valid.input), true)
+    assert.equal(registry.validateToolInput('strict_tool', { count: '2' }).ok, false)
+    assert.equal(registry.validateToolInput('strict_tool', { count: 2, surprise: true }).ok, false)
+    assert.equal(registry.validateToolInput('missing', {}).ok, false)
 
     await assert.rejects(
-      registry.executeTool('read', {}, 'call-1', {
-        onToolResult: () => {
-          calls++
-          throw new Error('observer failed')
+      registry.dispatchTool('strict_tool', { count: 2, surprise: true }, 'invalid-call', dispatchOptions()),
+      /输入无效|additional properties/i,
+    )
+    assert.equal(executions, 0)
+  })
+
+  it('propagates beforeDispatch failure and never invokes the tool closure', async () => {
+    const registry = new ToolRegistry()
+    let executions = 0
+    registry.register(definition('write', async () => {
+      executions++
+      return 'wrote'
+    }))
+
+    await assert.rejects(
+      registry.dispatchTool('write', {}, 'call-1', {
+        ...dispatchOptions(),
+        beforeDispatch: () => {
+          throw new Error('durable started failed')
         },
       }),
-      /observer failed/,
+      /durable started failed/,
     )
-    assert.equal(calls, 1)
+    assert.equal(executions, 0)
+  })
+
+  it('keeps successful raw output separate from uncertain execution outcome', async () => {
+    const registry = new ToolRegistry()
+    const circular: Record<string, unknown> = {}
+    circular.self = circular
+    registry.register(
+      definition('circular_result', async () => circular),
+      definition('rejected_execution', async () => {
+        throw new Error('remote connection disappeared')
+      }),
+    )
+
+    const dispatched = await registry.dispatchTool(
+      'circular_result', {}, 'call-success', dispatchOptions(),
+    )
+    assert.equal(dispatched.outcome, 'succeeded')
+    if (dispatched.outcome === 'succeeded') assert.equal(dispatched.rawOutput, circular)
+
+    assert.deepEqual(
+      await registry.dispatchTool('rejected_execution', {}, 'call-unknown', dispatchOptions()),
+      {
+        outcome: 'uncertain',
+        errorCode: 'tool_execution_error',
+        descriptor: registry.getDescriptor('rejected_execution'),
+      },
+    )
+  })
+
+  it('keeps concurrency-safe dispatches parallel and serializes unsafe dispatches', async () => {
+    const registry = new ToolRegistry()
+    let safeActive = 0
+    let safeMaxActive = 0
+    registry.register(
+      definition('safe', async () => {
+        safeActive++
+        safeMaxActive = Math.max(safeMaxActive, safeActive)
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        safeActive--
+        return 'ok'
+      }),
+      {
+        ...definition('unsafe', async ({ id }: { id: string }) => {
+          unsafeOrder.push(`${id}:start`)
+          await new Promise((resolve) => setTimeout(resolve, 10))
+          unsafeOrder.push(`${id}:end`)
+          return id
+        }),
+        parameters: {
+          type: 'object',
+          properties: { id: { type: 'string' } },
+          required: ['id'],
+          additionalProperties: false,
+        },
+        isConcurrencySafe: false,
+      },
+    )
+    const unsafeOrder: string[] = []
+
+    await Promise.all([
+      registry.dispatchTool('safe', {}, 'safe-1', dispatchOptions()),
+      registry.dispatchTool('safe', {}, 'safe-2', dispatchOptions()),
+    ])
+    assert.equal(safeMaxActive, 2)
+
+    await Promise.all([
+      registry.dispatchTool('unsafe', { id: 'one' }, 'unsafe-1', dispatchOptions()),
+      registry.dispatchTool('unsafe', { id: 'two' }, 'unsafe-2', dispatchOptions()),
+    ])
+    assert.deepEqual(unsafeOrder, ['one:start', 'one:end', 'two:start', 'two:end'])
   })
 
   it('rejects duplicate registration and disposes resources only once', async () => {
@@ -113,10 +242,10 @@ describe('ToolRegistry', () => {
     await registry.close()
     await registry.close()
     assert.equal(disposed, 1)
-    assert.deepEqual(await registry.executeTool('resource', {}, 'late-call'), {
-      ok: false,
-      output: 'ToolRegistry 已关闭',
-    })
+    await assert.rejects(
+      registry.dispatchTool('resource', {}, 'late-call', dispatchOptions()),
+      /已关闭/,
+    )
     assert.throws(() => registry.register(definition('late', async () => 'no')), /已关闭/)
   })
 
@@ -138,5 +267,34 @@ describe('ToolRegistry', () => {
     assert.equal(closed, 1)
     await registry.close()
     assert.equal(closed, 1, 'failed clients must not remain registered for shutdown')
+  })
+
+  it('passes the same cancellation context into MCP calls', async () => {
+    const registry = new ToolRegistry()
+    let observedSignal: AbortSignal | undefined
+    let observedDeadline: number | undefined
+    const client: MCPToolClient = {
+      connect: async () => {},
+      listTools: async () => [{
+        name: 'probe',
+        description: 'probe',
+        inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      }],
+      callTool: async (_name, _input, context) => {
+        observedSignal = context.signal
+        observedDeadline = context.deadline
+        return 'ok'
+      },
+      close: async () => {},
+    }
+    await registry.registerMCPServer('test', client)
+    const execution = dispatchOptions()
+
+    const result = await registry.dispatchTool('mcp__test__probe', {}, 'mcp-call', execution)
+
+    assert.equal(result.outcome, 'succeeded')
+    assert.equal(observedSignal, execution.signal)
+    assert.equal(observedDeadline, execution.deadline)
+    await registry.close()
   })
 })

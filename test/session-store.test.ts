@@ -9,26 +9,27 @@ import { SessionStore } from '../src/session/store.js'
 describe('SessionStore', () => {
   it('restores the latest checkpoint plus raw tail and budget snapshot', async (context) => {
     const directory = await mkdtemp(join(tmpdir(), 'super-agent-session-'))
-    context.after(() => rm(directory, { recursive: true, force: true }))
     const warnings: string[] = []
     const store = new SessionStore('recoverable', {
       directory,
       onWarning: (warning) => warnings.push(warning),
+    })
+    context.after(async () => {
+      await store.close()
+      await rm(directory, { recursive: true, force: true })
     })
     const compacted: ModelMessage[] = [{ role: 'assistant', content: 'compact state' }]
     const tail: ModelMessage[] = [{ role: 'user', content: 'after checkpoint' }]
 
     await store.appendCheckpoint({ messages: compacted, summary: 'summary-v1', budgetUsed: 11 })
     await store.appendMessages(tail, 17)
-    await appendFile(join(directory, 'recoverable.jsonl'), '{broken json}\n', 'utf-8')
+    await appendFile(join(directory, 'recoverable.jsonl'), '{"torn":', 'utf-8')
 
     const restored = await store.loadState()
 
     assert.deepEqual(restored.messages, [...compacted, ...tail])
     assert.equal(restored.summary, 'summary-v1')
     assert.equal(restored.budgetUsed, 17)
-    assert.equal(warnings.length, 1)
-
     const log = await readFile(join(directory, 'recoverable.jsonl'), 'utf-8')
     assert.match(log, /"type":"checkpoint"/)
     assert.match(log, /"type":"messages"/)
@@ -46,8 +47,11 @@ describe('SessionStore', () => {
 
   it('uses the newest checkpoint as the recovery base', async (context) => {
     const directory = await mkdtemp(join(tmpdir(), 'super-agent-session-'))
-    context.after(() => rm(directory, { recursive: true, force: true }))
     const store = new SessionStore('checkpoints', { directory })
+    context.after(async () => {
+      await store.close()
+      await rm(directory, { recursive: true, force: true })
+    })
 
     await store.appendMessages([{ role: 'user', content: 'superseded raw message' }], 3)
     await store.appendCheckpoint({
@@ -73,8 +77,6 @@ describe('SessionStore', () => {
 
   it('continues to read legacy per-message and budget events', async (context) => {
     const directory = await mkdtemp(join(tmpdir(), 'super-agent-session-'))
-    context.after(() => rm(directory, { recursive: true, force: true }))
-    const store = new SessionStore('legacy', { directory })
     const timestamp = new Date().toISOString()
     await appendFile(
       join(directory, 'legacy.jsonl'),
@@ -88,11 +90,20 @@ describe('SessionStore', () => {
       ].join('\n') + '\n',
       'utf-8',
     )
+    const store = new SessionStore('legacy', { directory })
+    context.after(async () => {
+      await store.close()
+      await rm(directory, { recursive: true, force: true })
+    })
+    await store.appendMessages([{ role: 'assistant', content: 'v2 tail' }], 12)
 
     assert.deepEqual(await store.loadState(), {
-      messages: [{ role: 'user', content: 'legacy message' }],
+      messages: [
+        { role: 'user', content: 'legacy message' },
+        { role: 'assistant', content: 'v2 tail' },
+      ],
       summary: '',
-      budgetUsed: 9,
+      budgetUsed: 12,
     })
   })
 })

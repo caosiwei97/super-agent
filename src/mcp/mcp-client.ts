@@ -1,5 +1,6 @@
 import { Client } from '@modelcontextprotocol/sdk/client'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+import type { ToolExecutionContext } from '../core/tool-registry.js'
 
 export interface MCPClientOptions {
   url: string
@@ -55,10 +56,17 @@ export class MCPClient {
     }))
   }
 
-  async callTool(name: string, args: Record<string, unknown>) {
+  async callTool(name: string, args: Record<string, unknown>, context: ToolExecutionContext) {
     if (!this.client) throw new Error('MCP client 未连接')
     // SDK 返回类型里的 content 是更严格的联合类型，这里统一按文本块抽取，做一次结构断言即可。
-    const result = (await this.client.callTool({ name, arguments: args })) as MCPCallResult
+    const result = (await this.client.callTool(
+      { name, arguments: args },
+      undefined,
+      {
+        signal: context.signal,
+        timeout: Math.max(1, context.deadline - Date.now()),
+      },
+    )) as MCPCallResult
     if (result.isError) {
       throw new Error(`MCP 工具调用失败: ${name}`)
     }

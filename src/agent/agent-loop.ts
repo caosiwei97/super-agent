@@ -1,24 +1,30 @@
 import {
-  streamText,
   type LanguageModel,
   type LanguageModelUsage,
   type ModelMessage,
-  type ToolModelMessage,
 } from 'ai'
+import { randomUUID } from 'node:crypto'
 import { LoopDetector, type DetectionResult, type ToolCallRecord } from './loop-detection.js'
-import { calculateDelay, isRetryable, sleep } from './retry.js'
 import {
   ToolRegistry,
   type ToolInvocation,
-  type ToolRuntimeHooks,
 } from '../core/tool-registry.js'
+import {
+  type CompleteToolCall,
+  type PipelineApprovalRequest,
+  type ToolExecutionPipeline,
+} from '../execution/tool-execution-pipeline.js'
+import {
+  ModelGateway,
+  type ModelAttemptAuditEvent,
+} from '../model/model-gateway.js'
 
 export interface BudgetState {
   used: number
   limit: number
 }
 
-export type AgentStopReason = 'completed' | 'budget' | 'loop_detected' | 'max_steps'
+export type AgentStopReason = 'completed' | 'budget' | 'loop_detected' | 'uncertain' | 'max_steps'
 
 export interface AgentLoopResult {
   steps: number
@@ -39,18 +45,28 @@ export interface AgentLoopObserver {
   onStop?: (result: AgentLoopResult) => void
 }
 
-export type ToolApprovalHandler = (invocation: ToolInvocation) => Promise<boolean>
+export type ToolApprovalHandler = (invocation: PipelineApprovalRequest) => Promise<boolean>
 
 export interface AgentLoopOptions {
   model: LanguageModel
   registry: ToolRegistry
+  pipeline: ToolExecutionPipeline
+  sessionId: string
+  turnId: string
   messages: ModelMessage[]
   buildSystem: () => string
   budget: BudgetState
+  modelGateway?: ModelGateway
+  signal: AbortSignal
+  deadline: number
+  modelRequestTimeoutMs?: number
   approveTool?: ToolApprovalHandler
   observer?: AgentLoopObserver
   beforeStep?: (step: number) => Promise<void>
-  onMessages?: (messages: ModelMessage[]) => Promise<void>
+  onMessages: (messages: ModelMessage[]) => Promise<void>
+  onModelAttemptAudit: (
+    event: ModelAttemptAuditEvent & { readonly stepId: string },
+  ) => Promise<void>
   maxSteps?: number
   maxRetries?: number
 }
@@ -59,11 +75,6 @@ interface GuardedCall {
   invocation: ToolInvocation
   record: ToolCallRecord
   detection: DetectionResult
-}
-
-interface ApprovalRequest {
-  approvalId: string
-  toolCallId: string
 }
 
 const DEFAULT_MAX_STEPS = 15
@@ -81,15 +92,6 @@ function usageTokens(usage: LanguageModelUsage | undefined) {
   return (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0)
 }
 
-function deniedToolResult(call: GuardedCall, reason: string) {
-  return {
-    type: 'tool-result',
-    toolCallId: call.invocation.toolCallId,
-    toolName: call.invocation.tool.name,
-    output: { type: 'execution-denied', reason },
-  } satisfies ToolModelMessage['content'][number]
-}
-
 /**
  * Runs one agent turn with retry, budget, approval and loop protection.
  *
@@ -101,13 +103,21 @@ export async function agentLoop(options: AgentLoopOptions) {
   const {
     model,
     registry,
+    pipeline,
+    sessionId,
+    turnId,
     messages,
     buildSystem,
     budget,
+    modelGateway = new ModelGateway(),
+    signal,
+    deadline,
+    modelRequestTimeoutMs,
     approveTool = async () => false,
     observer = {},
     beforeStep,
     onMessages,
+    onModelAttemptAudit,
     maxSteps = DEFAULT_MAX_STEPS,
     maxRetries = DEFAULT_MAX_RETRIES,
   } = options
@@ -137,27 +147,6 @@ export async function agentLoop(options: AgentLoopOptions) {
   }
 
   const detector = new LoopDetector()
-  const guardedCalls = new Map<string, GuardedCall>()
-
-  const runtimeHooks: ToolRuntimeHooks = {
-    inspectToolCall: (invocation) => {
-      const existing = guardedCalls.get(invocation.toolCallId)
-      if (existing) return existing.detection.stuck
-
-      const detection = detector.detect(invocation.tool.name, invocation.input)
-      const record = detector.recordCall(invocation.tool.name, invocation.input)
-      guardedCalls.set(invocation.toolCallId, { invocation, record, detection })
-
-      if (detection.stuck) {
-        notify(() => observer.onLoopDetection?.({ invocation, detection }))
-      }
-      return detection.stuck
-    },
-    onToolResult: (invocation, result) => {
-      const call = guardedCalls.get(invocation.toolCallId)
-      if (call) detector.recordResult(call.record, result)
-    },
-  }
 
   for (let step = 1; step <= maxSteps; step++) {
     await beforeStep?.(step)
@@ -166,147 +155,119 @@ export async function agentLoop(options: AgentLoopOptions) {
     }
 
     notify(() => observer.onStepStart?.({ step }))
-    let hasToolCall = false
-    let responseMessages: ModelMessage[] = []
-    let stepUsage: LanguageModelUsage | undefined
-    let approvalRequests: ApprovalRequest[] = []
-
-    for (let attempt = 1; ; attempt++) {
-      try {
-        const currentApprovals: ApprovalRequest[] = []
-        const result = streamText({
-          model,
-          system: buildSystem(),
-          tools: registry.toAISDKFormat(runtimeHooks),
-          messages,
-          maxRetries: 0,
-          providerOptions: { openai: { parallelToolCalls: true } },
-          onError: (error) => notify(() => observer.onStreamError?.({ error })),
-        })
-
-        for await (const part of result.fullStream) {
-          switch (part.type) {
-            case 'text-delta':
-              notify(() => observer.onTextDelta?.({ text: part.text }))
-              break
-
-            case 'tool-call':
-              hasToolCall = true
-              notify(() => observer.onToolCall?.({
-                toolCallId: part.toolCallId,
-                toolName: part.toolName,
-                input: part.input,
-              }))
-              break
-
-            case 'tool-result':
-              notify(() => observer.onToolResult?.({
-                toolCallId: part.toolCallId,
-                toolName: part.toolName,
-                output: part.output,
-              }))
-              break
-
-            case 'tool-approval-request':
-              currentApprovals.push({
-                approvalId: part.approvalId,
-                toolCallId: part.toolCall.toolCallId,
-              })
-              break
-          }
-        }
-
-        responseMessages = (await result.response).messages
-        stepUsage = await result.usage
-        approvalRequests = currentApprovals
-        break
-      } catch (error) {
+    const stepId = `${turnId}:step:${step}`
+    const requestId = randomUUID()
+    const generated = await modelGateway.stream({
+      requestId,
+      model,
+      system: buildSystem(),
+      tools: registry.toModelToolSet(),
+      messages,
+      signal,
+      deadline,
+      requestTimeoutMs: modelRequestTimeoutMs,
+      maxRetries,
+      providerOptions: { openai: { parallelToolCalls: true } },
+      onTextDelta: ({ text }) => notify(() => observer.onTextDelta?.({ text })),
+      onToolCall: ({ call }) => notify(() => observer.onToolCall?.({
+        toolCallId: call.toolCallId,
+        toolName: call.toolName,
+        input: call.input,
+      })),
+      onStreamError: ({ error }) => notify(() => observer.onStreamError?.({ error })),
+      onAttemptError: ({ attempt, error }) => {
         notify(() => observer.onAttemptError?.({ attempt, error }))
-        if (attempt > maxRetries || !isRetryable(error)) throw error
-
-        const delay = calculateDelay(attempt)
-        notify(() => observer.onRetry?.({ attempt, maxRetries, delayMs: delay }))
-        await sleep(delay)
-        hasToolCall = false
-      }
-    }
+      },
+      onAttemptAudit: async (event) => {
+        await onModelAttemptAudit({ ...event, stepId })
+        if (event.phase === 'retry_scheduled') {
+          notify(() => observer.onRetry?.({
+            attempt: event.attempt,
+            maxRetries,
+            delayMs: event.delayMs,
+          }))
+        }
+      },
+    })
+    const responseMessages = generated.responseMessages
+    const stepUsage: LanguageModelUsage = generated.usage
+    const toolCalls: CompleteToolCall[] = [...generated.toolCalls]
 
     budget.used += usageTokens(stepUsage)
-    const committedMessages = [...responseMessages]
-    let criticalLoopDetected = false
 
-    if (approvalRequests.length > 0) {
-      const approvalContent: ToolModelMessage['content'] = []
-      const calls = approvalRequests.map((request) => {
-        const call = guardedCalls.get(request.toolCallId)
-        if (!call) throw new Error(`找不到待审批工具调用: ${request.toolCallId}`)
-        return { request, call }
-      })
-      criticalLoopDetected = calls.some(
-        ({ call }) => call.detection.stuck && call.detection.level === 'critical',
-      )
+    // Persist the complete assistant response before proposing or dispatching
+    // any operation. This keeps the causal chain recoverable after a crash.
+    await onMessages(responseMessages)
+    messages.push(...responseMessages)
 
-      for (const { request, call } of calls) {
-        const loopBlocked = call.detection.stuck
-        const approved = !criticalLoopDetected && !loopBlocked && (await approveTool(call.invocation))
-        const reason = criticalLoopDetected
-          ? '同一步检测到严重循环，已阻止全部待执行工具'
-          : loopBlocked
-            ? call.detection.message
-            : approved
-              ? undefined
-              : '用户拒绝执行'
+    const guardedCalls = new Map<string, GuardedCall>()
+    for (const call of toolCalls) {
+      const descriptor = registry.getDescriptor(call.toolName)
+      if (!descriptor) continue
 
-        approvalContent.push({
-          type: 'tool-approval-response',
-          approvalId: request.approvalId,
-          approved,
-          reason,
-        })
-
-        if (!approved) {
-          const denied = deniedToolResult(call, reason || '工具执行被拒绝')
-          approvalContent.push(denied)
-          detector.recordResult(call.record, denied)
-          continue
-        }
-
-        const execution = await registry.executeTool(
-          call.invocation.tool.name,
-          call.invocation.input,
-          call.invocation.toolCallId,
-          runtimeHooks,
-        )
-        approvalContent.push({
-          type: 'tool-result',
-          toolCallId: call.invocation.toolCallId,
-          toolName: call.invocation.tool.name,
-          output: execution.ok
-            ? { type: 'text', value: execution.output }
-            : { type: 'error-text', value: execution.output },
-        })
-        notify(() => observer.onToolResult?.({
-          toolCallId: call.invocation.toolCallId,
-          toolName: call.invocation.tool.name,
-          output: execution.output,
-        }))
+      const invocation: ToolInvocation = {
+        tool: descriptor,
+        input: call.input,
+        toolCallId: call.toolCallId,
       }
-
-      committedMessages.push({ role: 'tool', content: approvalContent })
+      const detection = detector.detect(call.toolName, call.input)
+      const record = detector.recordCall(call.toolName, call.input)
+      guardedCalls.set(call.toolCallId, { invocation, detection, record })
+      if (detection.stuck) {
+        notify(() => observer.onLoopDetection?.({ invocation, detection }))
+      }
     }
 
-    await onMessages?.(committedMessages)
-    messages.push(...committedMessages)
+    const criticalLoopDetected = [...guardedCalls.values()].some(
+      (call) => call.detection.stuck && call.detection.level === 'critical',
+    )
+    const batch = toolCalls.length === 0
+      ? undefined
+      : await pipeline.executeBatch(
+        { sessionId, turnId, stepId, requestId, signal, deadline },
+        toolCalls,
+        {
+          approve: approveTool,
+          budgetUsed: budget.used,
+          denyReason: (request) => {
+            if (criticalLoopDetected) {
+              return '同一步检测到严重循环，已阻止全部待执行工具'
+            }
+            const guarded = guardedCalls.get(request.toolCallId)
+            return guarded?.detection.stuck ? guarded.detection.message : undefined
+          },
+          onOutcome: (outcome) => {
+            const event = outcome.operation.latestEvent
+            const guarded = guardedCalls.get(event.toolCallId)
+            const resultPart = outcome.message?.content.find(
+              (part) => part.type === 'tool-result',
+            )
+            const safeOutput = resultPart?.output ?? { status: event.status }
+            if (guarded) detector.recordResult(guarded.record, safeOutput)
+            if (resultPart) {
+              messages.push(outcome.message!)
+              notify(() => observer.onToolResult?.({
+                toolCallId: event.toolCallId,
+                toolName: event.toolName,
+                output: resultPart.output,
+              }))
+            }
+          },
+        },
+      )
 
     notify(() => observer.onBudget?.({ used: budget.used, limit: budget.limit }))
 
     if (criticalLoopDetected) {
       return stop({ steps: step, stopReason: 'loop_detected' })
     }
+    if (batch?.hasUncertain) {
+      return stop({ steps: step, stopReason: 'uncertain' })
+    }
     if (budget.used >= budget.limit) {
       return stop({ steps: step, stopReason: 'budget' })
     }
-    if (!hasToolCall) {
+    if (toolCalls.length === 0) {
       return stop({ steps: step, stopReason: 'completed' })
     }
 

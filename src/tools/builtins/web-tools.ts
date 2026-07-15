@@ -1,5 +1,6 @@
 import { lookup as dnsLookup } from 'node:dns/promises'
 import { isIP } from 'node:net'
+import type { ToolExecutionContext } from '../../core/tool-registry.js'
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 const MAX_REDIRECTS = 3
 
@@ -176,14 +177,20 @@ export function createWebTools(dependencies: WebToolDependencies = {}) {
       isConcurrencySafe: true,
       isReadOnly: true,
       maxResultChars: 1_500,
-      execute: async ({ url }: { url: string }) => {
+      execute: async ({ url }: { url: string }, context: ToolExecutionContext) => {
         try {
           let current = await validatePublicUrl(url, lookup)
           for (let redirects = 0; ; redirects++) {
+            const remaining = context.deadline - Date.now()
+            if (remaining <= 0) throw new DOMException('Web request deadline exceeded', 'TimeoutError')
+            const requestSignal = AbortSignal.any([
+              context.signal,
+              AbortSignal.timeout(Math.min(10_000, remaining)),
+            ])
             const response = await fetchImpl(current, {
               headers: { 'User-Agent': 'Mozilla/5.0 SuperAgent' },
               redirect: 'manual',
-              signal: AbortSignal.timeout(10_000),
+              signal: requestSignal,
             })
 
             if (response.status >= 300 && response.status < 400 && response.headers.get('location')) {
@@ -202,6 +209,11 @@ export function createWebTools(dependencies: WebToolDependencies = {}) {
               .trim() || '页面无文本内容'
           }
         } catch (error) {
+          if (context.signal.aborted) {
+            throw context.signal.reason instanceof Error
+              ? context.signal.reason
+              : new DOMException('Web request aborted', 'AbortError')
+          }
           return `抓取失败：${error instanceof Error ? error.message : error}`
         }
       },

@@ -74,9 +74,47 @@ describe('web tool SSRF guard', () => {
         })
       },
     })
+    const context = {
+      signal: new AbortController().signal,
+      deadline: Date.now() + 60_000,
+    }
 
-    assert.match(String(await fetchTool.execute({ url: 'https://public.example' })), /禁止访问非公网地址/)
+    assert.match(
+      String(await fetchTool.execute({ url: 'https://public.example' }, context)),
+      /禁止访问非公网地址/,
+    )
     assert.equal(fetches, 1)
-    assert.match(String(await fetchTool.execute({ url: 'not a url' })), /抓取失败：Invalid URL|抓取失败：无效 URL/)
+    assert.match(
+      String(await fetchTool.execute({ url: 'not a url' }, context)),
+      /抓取失败：Invalid URL|抓取失败：无效 URL/,
+    )
+  })
+
+  it('propagates the root abort signal through fetch', async () => {
+    let fetchSignal: AbortSignal | undefined
+    const [fetchTool] = createWebTools({
+      lookup: async () => [{ address: '93.184.216.34', family: 4 }],
+      fetch: async (_input, init) => {
+        fetchSignal = init?.signal as AbortSignal
+        return new Promise<Response>((_resolve, reject) => {
+          fetchSignal!.addEventListener('abort', () => reject(fetchSignal!.reason), { once: true })
+        })
+      },
+    })
+    const controller = new AbortController()
+    const execution = fetchTool.execute({ url: 'https://public.example' }, {
+      signal: controller.signal,
+      deadline: Date.now() + 60_000,
+    })
+
+    const waitDeadline = Date.now() + 2_000
+    while (!fetchSignal) {
+      if (Date.now() >= waitDeadline) throw new Error('fetch did not start')
+      await new Promise((resolve) => setTimeout(resolve, 1))
+    }
+    controller.abort(new DOMException('cancel fetch', 'AbortError'))
+
+    await assert.rejects(execution, { name: 'AbortError' })
+    assert.equal(fetchSignal.aborted, true)
   })
 })

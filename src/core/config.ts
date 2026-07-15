@@ -52,6 +52,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       budgetLimit: positiveInteger(env, 'TOKEN_BUDGET', 1_000_000),
       maxSteps: positiveInteger(env, 'AGENT_MAX_STEPS', 15),
       maxRetries: nonNegativeInteger(env, 'AGENT_MAX_RETRIES', 10),
+      turnTimeoutMs: positiveInteger(env, 'AGENT_TURN_TIMEOUT_MS', 120_000),
+      modelRequestTimeoutMs: positiveInteger(env, 'MODEL_REQUEST_TIMEOUT_MS', 60_000),
     },
     compaction: {
       tokenThreshold: positiveInteger(env, 'CONTEXT_TOKEN_THRESHOLD', 12_000),

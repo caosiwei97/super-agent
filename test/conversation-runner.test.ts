@@ -34,8 +34,12 @@ function olderTurns() {
 
 async function createStore(context: TestContext) {
   const directory = await mkdtemp(join(tmpdir(), 'super-agent-runner-'))
-  context.after(() => rm(directory, { recursive: true, force: true }))
-  return { directory, store: new SessionStore('runner', { directory }) }
+  const store = new SessionStore('runner', { directory })
+  context.after(async () => {
+    await store.close()
+    await rm(directory, { recursive: true, force: true })
+  })
+  return { directory, store }
 }
 
 async function commitAssistant(options: AgentLoopOptions, content: string, tokenCost: number) {
@@ -46,6 +50,89 @@ async function commitAssistant(options: AgentLoopOptions, content: string, token
 }
 
 describe('ConversationRunner', () => {
+  it('rejects an already-aborted turn before persisting the user message', async (context) => {
+    const { store } = await createStore(context)
+    const state: ConversationState = {
+      messages: [],
+      summary: '',
+      budget: { used: 0, limit: 1_000 },
+    }
+    const runner = new ConversationRunner({
+      model: summaryModel('unused'),
+      registry: new ToolRegistry(),
+      store,
+      state,
+      compaction: { ...COMPACTION, tokenThreshold: 10_000 },
+      runAgentLoop: async () => {
+        throw new Error('must not run')
+      },
+    })
+    const controller = new AbortController()
+    controller.abort(new DOMException('cancel before turn', 'AbortError'))
+
+    await assert.rejects(runner.runTurn('must not persist', {
+      signal: controller.signal,
+    }), { name: 'AbortError' })
+    assert.deepEqual(state.messages, [])
+    assert.deepEqual(await store.replayEvents(), [])
+  })
+
+  it('propagates the turn deadline signal into the agent loop', async (context) => {
+    const { store } = await createStore(context)
+    const state: ConversationState = {
+      messages: [],
+      summary: '',
+      budget: { used: 0, limit: 1_000 },
+    }
+    let observedDeadline = 0
+    const runner = new ConversationRunner({
+      model: summaryModel('unused'),
+      registry: new ToolRegistry(),
+      store,
+      state,
+      compaction: { ...COMPACTION, tokenThreshold: 10_000 },
+      turnTimeoutMs: 30,
+      runAgentLoop: async (options) => {
+        observedDeadline = options.deadline
+        return new Promise((_resolve, reject) => {
+          options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true })
+        })
+      },
+    })
+
+    await assert.rejects(runner.runTurn('deadline'), { name: 'TimeoutError' })
+    assert.ok(observedDeadline > 0)
+    assert.equal((await store.loadState()).messages[0]?.role, 'user')
+  })
+
+  it('checks the recovery gate before persisting a new user turn', async (context) => {
+    const { store } = await createStore(context)
+    const state: ConversationState = {
+      messages: [],
+      summary: '',
+      budget: { used: 0, limit: 1_000 },
+    }
+    const runner = new ConversationRunner({
+      model: summaryModel('unused'),
+      registry: new ToolRegistry(),
+      store,
+      state,
+      compaction: { ...COMPACTION, tokenThreshold: 10_000 },
+      recovery: {
+        assertCanStartNewTurn: async () => {
+          throw new Error('injected unresolved operation')
+        },
+      },
+      runAgentLoop: async () => {
+        throw new Error('must not run')
+      },
+    })
+
+    await assert.rejects(runner.runTurn('must stay uncommitted'), /unresolved operation/)
+    assert.deepEqual(state.messages, [])
+    assert.deepEqual(await store.replayEvents(), [])
+  })
+
   it('rejects overlapping turns that would race shared state', async (context) => {
     const { store } = await createStore(context)
     const state: ConversationState = {
