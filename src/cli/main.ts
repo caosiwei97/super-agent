@@ -11,6 +11,10 @@ import { RecoveryCoordinator } from '../execution/recovery-coordinator.js'
 import type { Executor } from '../execution/executor.js'
 import { LocalExecutor } from '../execution/local-executor.js'
 import {
+  FilesystemBroker,
+  FilesystemBrokerUnavailableError,
+} from '../execution/filesystem-broker.js'
+import {
   SandboxExecutor,
   SandboxUnavailableError,
 } from '../execution/sandbox-executor.js'
@@ -75,23 +79,35 @@ export async function runCli(args: string[]) {
   const executor: Executor = config.execution.profile === 'production'
     ? new SandboxExecutor(config.execution.sandbox)
     : new LocalExecutor()
-  const executorProbe = await executor.probe()
-  if (config.execution.profile === 'production' && !executorProbe.available) {
-    await executor.close()
-    throw new SandboxUnavailableError(executorProbe.reasonCode || 'sandbox_probe_failed')
-  }
-  const workspace = new Workspace(config.workspaceRoot)
-  const registry = new ToolRegistry({
-    onLegacyWarning: (warning) => console.warn(`[Security] ${warning}`),
-    executionRouter: new ExecutionRouter({
-      profile: config.execution.profile,
-      processExecutor: executor,
-    }),
-  })
+  let registry: ToolRegistry | undefined
   let store: SessionStore | undefined
+  let filesystem: FilesystemBroker | undefined
 
   try {
-    registry.register(...createBuiltinTools({ workspace }))
+    const executorProbe = await executor.probe()
+    if (config.execution.profile === 'production' && !executorProbe.available) {
+      throw new SandboxUnavailableError(executorProbe.reasonCode || 'sandbox_probe_failed')
+    }
+    const workspace = new Workspace(config.workspaceRoot)
+    filesystem = new FilesystemBroker(workspace.root, {
+      requireDescriptorAnchoring: config.execution.profile === 'production',
+    })
+    if (config.execution.profile === 'production') {
+      const filesystemProbe = await filesystem.probe()
+      if (!filesystemProbe.available) {
+        throw new FilesystemBrokerUnavailableError(
+          `production filesystem broker 不可用: ${filesystemProbe.reasonCode}`,
+        )
+      }
+    }
+    registry = new ToolRegistry({
+      onLegacyWarning: (warning) => console.warn(`[Security] ${warning}`),
+      executionRouter: new ExecutionRouter({
+        profile: config.execution.profile,
+        processExecutor: executor,
+      }),
+    })
+    registry.register(...createBuiltinTools({ workspace, filesystem }))
     registry.register(createToolSearch(registry))
     await connectGitHubMCP(registry, config.githubMcp)
 
@@ -151,7 +167,8 @@ export async function runCli(args: string[]) {
 
     startRepl(runtime)
   } catch (error) {
-    await Promise.allSettled([registry.close(), store?.close()])
+    filesystem?.close()
+    await Promise.allSettled([registry?.close() ?? executor.close(), store?.close()])
     throw error
   }
 }

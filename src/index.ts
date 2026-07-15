@@ -127,6 +127,35 @@ export type {
   ModelToolCall,
 } from './model/model-gateway.js'
 export { executeProcess } from './execution/process-executor.js'
+export {
+  FilesystemBroker,
+  FilesystemBrokerUnavailableError,
+} from './execution/filesystem-broker.js'
+export type {
+  FilesystemBrokerControl,
+  FilesystemEntry,
+  FilesystemBrokerOptions,
+  FilesystemWalkOptions,
+} from './execution/filesystem-broker.js'
+export {
+  NetworkBroker,
+  assertUrlWithinConstraints,
+  dialPinnedAddress,
+  isPublicAddress,
+  networkPort,
+  parseNetworkUrl,
+  resolvePublicAddresses,
+  validatePublicUrl,
+} from './execution/network-broker.js'
+export type {
+  DnsLookup,
+  NetworkBrokerOptions,
+  NetworkBrokerRequest,
+  NetworkDialer,
+  NetworkDialRequest,
+  NetworkDialResponse,
+  ResolvedNetworkAddress,
+} from './execution/network-broker.js'
 export type {
   ProcessExecutionOptions,
   ProcessExecutionResult,
