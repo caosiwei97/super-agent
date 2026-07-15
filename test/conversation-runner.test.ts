@@ -91,7 +91,10 @@ describe('ConversationRunner', () => {
       store,
       state,
       compaction: { ...COMPACTION, tokenThreshold: 10_000 },
-      turnTimeoutMs: 30,
+      // Leave enough headroom for full-suite parallel process tests to delay
+      // this worker before runAgentLoop starts; the assertion is about signal
+      // propagation, not scheduler precision.
+      turnTimeoutMs: 500,
       runAgentLoop: async (options) => {
         observedDeadline = options.deadline
         return new Promise((_resolve, reject) => {
