@@ -6,11 +6,11 @@
 >
 > 最后更新：2026-07-15
 >
-> 实施状态：M0、M1A、M1B、M1C 已完成；下一阶段为 M2 Capability Policy
+> 实施状态：M0、M1A、M1B、M1C、M2 已完成；下一阶段为 M3（Execution Isolation）
 
 ## 1. 背景与结论
 
-Super-Agent 当前已经具备多步 Agent Loop、工具审批、并发控制、循环检测、上下文压缩、会话恢复、MCP 延迟发现和基础安全检查。它已经超过一次性 Demo，但还没有达到可以放心执行真实外部操作的生产标准。
+Super-Agent 当前已经具备多步 Agent Loop、能力策略、耐久操作账本、并发控制、统一取消、上下文压缩、会话恢复、MCP 延迟发现和 fail-closed 执行约束。它已经超过一次性 Demo，但 M3 执行隔离与 M4 运维闭环完成前，仍不宣称达到 production-ready。
 
 下一阶段不继续横向增加工具、多 Agent 编排或 UI 功能，而是把现有骨架收敛为一个小型、完整、可验证的生产 Agent 内核：
 
@@ -56,10 +56,10 @@ Super-Agent 当前已经具备多步 Agent Loop、工具审批、并发控制、
 - Microcompact 与 LLM Summary 双层上下文压缩。
 - MCP 工具延迟发现。
 
-### 4.2 P0 差距
+### 4.2 剩余 P0 差距
 
-1. `isReadOnly` 仍承担过多策略含义；读取敏感文件、向外发送数据等操作需要 M2 的能力模型判断。
-2. `--yes` 可让 Shell 以宿主机当前用户权限执行，缺少真正的进程、文件系统、网络和资源隔离。
+- M2 已移除内置与 MCP 工具对 `isReadOnly` 权限语义的依赖，并让 `--yes` 只能批准 `ask`。
+- 当前尚无真正的进程、文件系统、网络和资源隔离。为避免静默降级，要求 `requireSandbox` 的调用一律在 dispatch 前拒绝；`bash` 因此在 M3 前不可用。
 
 ### 4.3 P1 差距
 
@@ -186,8 +186,8 @@ flowchart TB
 | `ConversationRunner` | 单轮串行、上下文阶段、消息与 checkpoint 提交 | 权限判断、工具执行 |
 | `AgentLoop` | step、预算、循环检测、模型与工具结果编排 | 直接调用工具实现 |
 | `ModelGateway` | Provider、稳定 requestId、deadline、取消和流式重试门槛 | 工具审批和副作用恢复 |
-| `ToolRegistry` | 只读工具目录、schema、能力元数据和 adapter 描述 | 审批、并发锁和执行 |
-| `ToolExecutionPipeline` | 工具调用的唯一入口和固定治理顺序 | Provider 会话管理 |
+| `ToolRegistry` | 公开只读工具目录、schema、能力元数据和 resolved snapshot | 审批和公开 dispatch |
+| `ToolExecutionPipeline` | 工具调用的唯一公开运行时入口、固定治理顺序与包内 dispatch | Provider 会话管理 |
 | `PolicyEngine` | 返回纯 `allow/ask/deny + constraints` 决策 | UI 交互和执行工具 |
 | `OperationLedger` | 校验操作状态迁移和 durable-start | 保存自然语言摘要 |
 | `ExecutionRouter` | 执行已经批准的约束，分流 pure/broker/process/MCP | 扩大权限 |
@@ -201,10 +201,13 @@ flowchart TB
 ```text
 validate
 → evaluate policy
-→ approve or deny
-→ persist proposed/approved
+→ preflight supported/tightened execution constraints for non-deny decisions
+→ persist proposed
+→ deny, allow, or request human approval
+→ persist approved for allow or an approved ask
+→ defensively revalidate execution constraints
 → persist started durably
-→ dispatch through execution router
+→ dispatch through package-internal dispatcher
 → persist succeeded/failed/cancelled/uncertain
 → append tool result message
 ```
@@ -326,9 +329,9 @@ type ToolCapability =
 
 ```ts
 type PolicyDecision =
-  | { behavior: 'allow'; constraints: ExecutionConstraints; reason: string }
-  | { behavior: 'ask'; constraints: ExecutionConstraints; reason: string }
-  | { behavior: 'deny'; reason: string }
+  | { behavior: 'allow'; constraints: ExecutionConstraints; reasonCode: string }
+  | { behavior: 'ask'; constraints: ExecutionConstraints; reasonCode: string }
+  | { behavior: 'deny'; reasonCode: string }
 ```
 
 决策优先级：
@@ -344,7 +347,7 @@ type PolicyDecision =
 
 - `.env`、SSH、云凭据、系统 keychain、包管理器 token 等路径归类为 `secret.read`。
 - 同时具备 `secret.read` 与 `network.egress` 的执行计划默认拒绝。
-- MCP 工具在缺少可信能力元数据时按 `external.write`、串行、需审批处理。
+- MCP 工具在缺少可信能力元数据时按 `network.egress + external.write`、串行、需审批处理，并以 endpoint 的 scheme/host/port 和结构化 server identity 约束调用。
 - `--yes` 只能跳过人工确认，不能跳过 deny、安全规则、账本和沙箱约束。
 
 ### 6.3 Tool Execution Pipeline
@@ -742,7 +745,7 @@ M1 总退出条件：
 
 ### 7.6 M2：能力权限模型
 
-#### PR 7：能力与策略接口
+#### PR 7：能力与策略接口（已完成）
 
 新增：
 
@@ -752,29 +755,87 @@ M1 总退出条件：
 
 实现：
 
-- `ToolCapability`、动态 `getCapabilities(input)`、`isConcurrencySafe(input)`。
+- `ToolCapability`、动态 `getCapabilities(input)`、`getConstraints(input)`、`supportedConstraintKeys` 与 `isConcurrencySafe(input)`。
 - `PolicyContext`、`PolicyDecision` 和 `ExecutionConstraints`。
-- 固定顺序：strict schema → dynamic capability → hard deny → Hook 收紧 → rule → human ask。
-- 为旧 `isReadOnly/requiresApproval` 提供一轮兼容适配和告警；内置工具迁完后删除。
+- 固定顺序：strict schema → resolved invocation → hard deny → Hook 收紧 → rule → human ask。
+- 为旧 `isReadOnly/requiresApproval` 提供一轮兼容适配和告警；M2 内置与 MCP 工具已不再依赖这两个字段做权限决策。
 
-#### PR 8：内置和 MCP 能力迁移
+完成情况：
+
+- 新增严格 `ToolCapability` 集合；纯工具可以显式声明空能力集 `[]`，未知或重复能力 fail closed。
+- `ToolRegistry.resolveInvocation()` 在 strict schema 后只解析一次规范化输入、动态能力、可执行约束、约束支持键、并发属性与结构化 tool provenance；Pipeline、Ledger、锁和执行共用同一冻结快照。
+- `ExecutionConstraints` 仅覆盖当前可落实的文件根、网络 scheme/host/port、loopback 监听端口、sandbox 要求和结果上限；Hook 与 rule 只能通过求交收紧。
+- `ToolRegistry` 的公开 API 只提供 Catalog、schema 校验和 resolution，不暴露 dispatch；Pipeline 在人工审批前完成约束预检，不可执行约束落 `proposed → denied`。Package 内部 dispatch 边界只接受 Registry 产生的 invocation，防御性复核后写入 durable `started`，获得 ack 才调用私有执行 closure。
+- Constraint Gate 在 dispatch 前验证有效约束只会收紧 resolved 约束，并拒绝工具未声明支持的约束键；`requireSandbox` 在 M3 后端可用前一律拒绝，不向宿主执行静默降级。
+- `PolicyEngine` 固定执行 hard deny → async tightening Hook → typed rule/default。Hook/rule 不能把 `deny` 或 `ask` 放宽，异常、非法决策和空约束交集均拒绝。
+- 同一调用或 batch 出现 `secret.read + network.egress` 时 hard deny；Ledger 中已成功的 `secret.read` 会形成可恢复的 session capability history，之后的 egress 默认拒绝。
+- `--yes` 不进入 PolicyContext，只能作为 `ask` 分支的 approval handler；`allow` 不调用人工审批，`deny` 永不调用审批或工具 closure。
+- M1 旧会话中的 `legacy.read` 明确升级为 `secret.read`，`legacy.write` 与其他未知历史能力保守映射为 `external.write`，避免升级后把潜在敏感读取或写入静默放行。
+- 未知 MCP 已使用结构化 `{ kind: 'mcp', serverName }` provenance，并默认解析为 `network.egress + external.write`；不从工具名称反向猜测身份。
+
+PR7 验收：
+
+- 全量 `pnpm check` 通过，156/156 测试通过；覆盖能力/约束严格解析、方向性外传 hard deny、Hook 单向收紧、动态解析失败、ask-only approval、legacy history 和 resolved dispatch。
+- 本地手工真实 Key E2E（2026-07-15，OpenAI-compatible Provider，非 CI）通过：Provider 生成一次 `filesystem.write` ask probe；审批一次、closure 一次，Operation 为 `proposed → approved → started → succeeded`，Policy、执行上下文与 Ledger 使用同一能力/约束快照。验证只读取 `.env`，不记录凭据。
+
+#### PR 8：内置和 MCP 能力迁移（已完成）
 
 | 工具 | 默认能力 |
 | --- | --- |
 | read/list/glob/grep | `filesystem.read`；敏感真实路径追加 `secret.read` |
-| write/edit | `filesystem.write` |
+| write | `filesystem.write` |
+| edit | `filesystem.read + filesystem.write`；敏感真实路径追加 `secret.read` |
 | fetch | `network.egress + external.read` |
-| bash | 按最坏情况声明 process、filesystem、network 和 secret 能力 |
+| bash | 按最坏情况声明 process、filesystem、network 和 secret 能力，并设置 `requireSandbox` |
 | preview | `filesystem.read + process.execute`，监听端口需要额外约束 |
-| 未知 MCP | `external.write`、串行、ask |
+| 未知 MCP | `network.egress + external.write`、串行、ask |
 
-`--yes` 只自动确认 ask，不能越过 hard deny、执行约束、Ledger 或沙箱要求。
+完成情况：
+
+- File、Web、Preview、Shell、utility、`tool_search` 和 MCP definition 已迁移到显式 capability、constraints、supported keys 与动态并发属性；权限决策不再依赖 descriptor 的 `isReadOnly/requiresApproval`。
+- 文件能力和约束基于 canonical realpath。`.env/.env.*`、SSH key、AWS/GCloud/Azure/Kube 凭据、macOS Keychain、常见包管理器 token、`*.pem/*.key` 与 credentials/service-account JSON 统一归类为敏感路径，symlink 别名不能隐藏该分类。
+- 普通目录 glob/grep 在执行阶段过滤敏感候选；只有显式请求敏感文件或敏感 pattern 并携带 `secret.read` 时才允许读取。`edit_file` 因读后写而声明 `filesystem.read + filesystem.write`，敏感目标再追加 `secret.read`。
+- Preview 只绑定策略批准的 `127.0.0.1:port` 和 `app/` 读取根；每个 HTTP 请求都重新解析 realpath，读取前对敏感目标、敏感 symlink 与越界路径返回 `403`。
+- Fetch 把初始 URL 固化为 scheme/host/port 约束，在 DNS/fetch 前验证，并对每一跳 redirect 重新执行 URL 约束和公网地址检查；M2 仍不把该检查扩大解释为已经消除 DNS rebinding。
+- 未知 MCP 使用结构化 `{ kind: 'mcp', serverName }` provenance，声明 `network.egress + external.write`，绑定 transport endpoint 的 scheme、host、port，并强制 manual redirect 后拒绝全部 HTTP 3xx；server rule 不依赖工具名前缀反向猜测身份。
+- `bash` 按自由命令最坏情况声明 `process.execute + filesystem.read + filesystem.write + network.egress + secret.read`。它既触发外传 hard deny，又要求 `requireSandbox`；M3 前一律拒绝，`--yes` 不能绕过。
+- `--yes` 只自动确认 `ask`，不能越过 hard deny、约束支持检查、约束子集检查、Operation Ledger 或 sandbox 要求。
+- 任意 `secret.read` 结果在物化到模型上下文、终端 observer 和 durable journal 前整体替换为 `[REDACTED]`；通用结果守卫同时识别带供应商或环境前缀的常见 secret 字段。
+
+当前 M2 运行架构：
+
+```mermaid
+flowchart LR
+    Loop["Agent Loop<br/>完整 Tool Call 已持久化"] --> Pipeline["ToolExecutionPipeline<br/>唯一公开运行时入口"]
+    Pipeline --> Catalog["ToolRegistry Catalog<br/>Strict Schema + Definition"]
+    Catalog --> Snapshot["Frozen Resolved Invocation<br/>Capabilities / Constraints<br/>Supported Keys / Concurrency / Tool Source"]
+    Snapshot --> Policy["PolicyEngine<br/>Hard Deny → Tightening Hook → Typed Rule"]
+    Policy -->|"deny"| Ledger["Operation Ledger<br/>proposed → terminal"]
+    Policy -->|"allow / ask"| Gate["Constraint Preflight<br/>Supported + Tightening Subset<br/>requireSandbox Fail Closed"]
+    Gate -->|"reject"| Ledger
+    Gate -->|"validated"| Ledger
+    Ledger -->|"ask"| Approval["Approval Port<br/>interactive / --yes"]
+    Approval -->|"approve / deny"| Ledger
+    Ledger -->|"approved"| Start["Durable Start Gate<br/>Constraint Recheck + append started + fsync"]
+    Start -->|"durable ack"| Dispatcher["Internal Dispatcher<br/>Package-internal + Dynamic Lock"]
+    Dispatcher --> Local["Explicit Local Tools<br/>File / Web / Preview / Pure"]
+    Dispatcher --> MCP["Remote MCP<br/>Endpoint-bound + Structured Source"]
+    Local --> Result["Result Guard + Terminal Event"]
+    MCP --> Result
+    Result --> Ledger
+```
+
+该图只描述 M2 已实现路径。M3 的 Sandbox Backend、Filesystem/Network Broker 与生产 Execution Router 尚未实现；M2 通过拒绝 `requireSandbox` 保持 fail closed，而不是假设这些边界已经存在。
 
 M2 退出条件：
 
-- 权限决策不再依赖 `isReadOnly`。
-- 所有工具有显式能力和动态约束。
-- `.env/SSH/cloud credentials` 敏感读取、`read_file + fetch_url` 数据外传、未知 MCP 和 `--yes` 绕过测试全部通过。
+- 权限决策不再依赖 `isReadOnly`；Registry 的公开 surface 没有 dispatch，仓内运行路径统一进入 Pipeline。
+- 所有内置和 MCP 工具均有显式能力、动态约束、约束支持键和并发属性；不支持或放宽约束时在执行开始前 fail closed。
+- `.env/SSH/cloud credentials` 敏感 realpath/symlink、glob/grep 过滤、Preview 请求级 `403`、Fetch redirect 逐跳校验、未知 MCP、`bash/--yes` 绕过与持久化外传 history 测试全部通过。
+- 全量 `pnpm check` 通过，173/173 测试通过；`pnpm typecheck`、`pnpm build` 与 `git diff --check` 通过。
+- 本地手工真实 Key E2E（2026-07-15，OpenAI-compatible Provider，非 CI）通过：Provider 分两个 step 先调用 `read_file` 读取仅含合成测试值的 `.env.synthetic`，Operation 以 `filesystem.read + secret.read` 完成 `succeeded`，模型、终端与 journal 结果均为 `[REDACTED]`；随后调用 `fetch_url`，其 `network.egress + external.read` Operation 只到 `proposed → denied(policy_denied)`，没有 `approved/started`、没有进入工具 closure。验证不记录真实 Key，临时 fixture 与 session 均已清理。
+
+M2 已完成，下一阶段进入 M3 Execution Isolation。
 
 ### 7.7 M3：执行隔离
 
