@@ -40,6 +40,7 @@ export type ConstraintGateErrorCode =
   | 'constraint_unsupported'
   | 'constraint_relaxation'
   | 'sandbox_unavailable'
+  | 'process_boundary_mismatch'
   | 'legacy_execution_kind'
 
 export class ConstraintGateError extends Error {

@@ -7,11 +7,19 @@ import {
   type Executor,
   type ToolExecutionKind,
 } from './executor.js'
-import { parseExecutionConstraints, type ExecutionConstraints } from '../security/capabilities.js'
+import {
+  parseExecutionConstraints,
+  parseToolCapabilities,
+  type ExecutionConstraints,
+  type ToolCapability,
+} from '../security/capabilities.js'
 
 export type ExecutionKindSource = 'explicit' | 'legacy'
 export type ExecutionBackendKind = 'host' | 'local' | 'sandbox'
-export type ExecutionRoutingErrorCode = 'legacy_execution_kind' | 'sandbox_unavailable'
+export type ExecutionRoutingErrorCode =
+  | 'legacy_execution_kind'
+  | 'process_boundary_mismatch'
+  | 'sandbox_unavailable'
 
 export class ExecutionRoutingError extends Error {
   override readonly name = 'ExecutionRoutingError'
@@ -24,12 +32,14 @@ export class ExecutionRoutingError extends Error {
 export interface ExecutionPreflightInput {
   readonly executionKind: ToolExecutionKind
   readonly executionKindSource: ExecutionKindSource
+  readonly capabilities: readonly ToolCapability[]
   readonly constraints: ExecutionConstraints
 }
 
 export interface ExecutionPlan {
   readonly executionKind: ToolExecutionKind
   readonly executionKindSource: ExecutionKindSource
+  readonly capabilities: readonly ToolCapability[]
   readonly backend: ExecutionBackendKind
   readonly constraints: ExecutionConstraints
 }
@@ -51,13 +61,32 @@ export class ExecutionRouter {
   }
 
   preflight(input: ExecutionPreflightInput): ExecutionPlan {
-    const constraints = Object.isFrozen(input.constraints)
+    const parsedConstraints = parseExecutionConstraints(input.constraints)
+    const parsedCapabilities = parseToolCapabilities(input.capabilities)
+    // Resolved invocation snapshots are already deeply frozen. Validate them
+    // again at the boundary, while preserving the exact approved references.
+    const constraintsDeeplyFrozen = Object.isFrozen(input.constraints)
+      && Object.values(input.constraints).every(
+        (value) => !Array.isArray(value) || Object.isFrozen(value),
+      )
+    const constraints = constraintsDeeplyFrozen
       ? input.constraints
-      : parseExecutionConstraints(input.constraints)
+      : parsedConstraints
+    const capabilities = Object.isFrozen(input.capabilities)
+      ? input.capabilities
+      : parsedCapabilities
     if (this.profile === 'production' && input.executionKindSource === 'legacy') {
       throw new ExecutionRoutingError(
         'legacy_execution_kind',
         'production profile 拒绝未显式声明 executionKind 的工具',
+      )
+    }
+    if (this.profile === 'production'
+      && capabilities.includes('process.execute')
+      && input.executionKind !== 'process') {
+      throw new ExecutionRoutingError(
+        'process_boundary_mismatch',
+        'production profile 拒绝从非 process lane 执行 process.execute',
       )
     }
 
@@ -67,7 +96,7 @@ export class ExecutionRouter {
       const productionBackendInvalid = this.profile === 'production' && executor?.kind !== 'sandbox'
       let supported = false
       try {
-        supported = executor?.supports(input.executionKind, constraints) === true
+        supported = executor?.supports(input.executionKind, constraints, capabilities) === true
       } catch {
         // Backend capability discovery is a security boundary and fails closed.
       }
@@ -79,6 +108,7 @@ export class ExecutionRouter {
       }
       return Object.freeze({
         ...input,
+        capabilities,
         constraints,
         backend: executor.kind,
       })
@@ -86,6 +116,7 @@ export class ExecutionRouter {
 
     return Object.freeze({
       ...input,
+      capabilities,
       constraints,
       backend: 'host' as const,
     })
@@ -112,9 +143,11 @@ export class ExecutionRouter {
     const defensivePlan = this.preflight({
       executionKind: request.executionKind,
       executionKindSource: plan.executionKindSource,
+      capabilities: request.capabilities,
       constraints: request.constraints,
     })
     if (defensivePlan.backend !== plan.backend
+      || JSON.stringify(defensivePlan.capabilities) !== JSON.stringify(plan.capabilities)
       || JSON.stringify(defensivePlan.constraints) !== JSON.stringify(plan.constraints)) {
       throw new Error('ExecutionRequest 约束与已批准 execution plan 不匹配')
     }
@@ -123,7 +156,11 @@ export class ExecutionRouter {
       let supported = false
       try {
         supported = this.processExecutor?.kind === plan.backend
-          && this.processExecutor.supports(plan.executionKind, plan.constraints)
+          && this.processExecutor.supports(
+            plan.executionKind,
+            plan.constraints,
+            plan.capabilities,
+          )
       } catch {
         // A backend that cannot revalidate its contract is no longer usable.
       }

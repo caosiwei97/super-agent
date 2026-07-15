@@ -246,6 +246,7 @@ export class ToolRegistry {
       this.executionRouter.preflight({
         executionKind: invocation.executionKind,
         executionKindSource: invocation.executionKindSource,
+        capabilities: invocation.capabilities,
         constraints,
       }))
   }

@@ -35,6 +35,7 @@ describe('ExecutionRouter', () => {
     assert.throws(() => router.preflight({
       executionKind: 'pure',
       executionKindSource: 'legacy',
+      capabilities: [],
       constraints: {},
     }), /production profile 拒绝/)
   })
@@ -44,6 +45,7 @@ describe('ExecutionRouter', () => {
     assert.throws(() => router.preflight({
       executionKind: 'process',
       executionKindSource: 'explicit',
+      capabilities: ['process.execute'],
       constraints: {},
     }), /尚无可用执行后端/)
   })
@@ -60,11 +62,13 @@ describe('ExecutionRouter', () => {
     assert.equal(development.preflight({
       executionKind: 'process',
       executionKindSource: 'explicit',
+      capabilities: ['process.execute'],
       constraints: {},
     }).backend, 'local')
     assert.throws(() => development.preflight({
       executionKind: 'process',
       executionKindSource: 'explicit',
+      capabilities: ['process.execute'],
       constraints: { requireSandbox: true },
     }), /尚无可用执行后端/)
 
@@ -72,8 +76,33 @@ describe('ExecutionRouter', () => {
     assert.throws(() => production.preflight({
       executionKind: 'process',
       executionKindSource: 'explicit',
+      capabilities: ['process.execute'],
       constraints: {},
     }), /尚无可用执行后端/)
+  })
+
+  it('rejects process capability hidden behind a host lane in production', () => {
+    const router = new ExecutionRouter({ profile: 'production' })
+    assert.throws(() => router.preflight({
+      executionKind: 'preview',
+      executionKindSource: 'explicit',
+      capabilities: ['filesystem.read', 'process.execute'],
+      constraints: {},
+    }), /非 process lane/)
+  })
+
+  it('copies shallow-frozen constraints so nested arrays cannot drift after preflight', () => {
+    const roots = ['/safe']
+    const input = Object.freeze({ filesystemReadRoots: roots })
+    const plan = new ExecutionRouter().preflight({
+      executionKind: 'filesystem',
+      executionKindSource: 'explicit',
+      capabilities: Object.freeze(['filesystem.read'] as const),
+      constraints: input,
+    })
+    roots.push('/later')
+    assert.deepEqual(plan.constraints.filesystemReadRoots, ['/safe'])
+    assert.notEqual(plan.constraints, input)
   })
 
   it('dispatches the approved request and out-of-band signal through the sandbox port', async () => {
@@ -94,12 +123,14 @@ describe('ExecutionRouter', () => {
     const plan = router.preflight({
       executionKind: 'process',
       executionKindSource: 'explicit',
+      capabilities: ['process.execute'],
       constraints: { requireSandbox: true },
     })
     const controller = new AbortController()
     const value = {
       ...request(),
       executionKind: 'process' as const,
+      capabilities: Object.freeze(['process.execute'] as const),
       constraints: Object.freeze({ requireSandbox: true }),
     }
     const result = await router.dispatch(plan, value, { signal: controller.signal }, async () => {

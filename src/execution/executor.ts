@@ -1,4 +1,9 @@
-import type { ExecutionConstraints, ToolCapability } from '../security/capabilities.js'
+import {
+  parseExecutionConstraints,
+  parseToolCapabilities,
+  type ExecutionConstraints,
+  type ToolCapability,
+} from '../security/capabilities.js'
 
 export const TOOL_EXECUTION_KINDS = [
   'pure',
@@ -50,7 +55,11 @@ export interface ExecutorProbeResult {
 export interface Executor {
   readonly kind: ExecutorKind
   probe(): Promise<ExecutorProbeResult>
-  supports(kind: ToolExecutionKind, constraints: ExecutionConstraints): boolean
+  supports(
+    kind: ToolExecutionKind,
+    constraints: ExecutionConstraints,
+    capabilities?: readonly ToolCapability[],
+  ): boolean
   execute(request: ExecutionRequest, control: ExecutionControl): Promise<ExecutionResult>
   close(): Promise<void>
 }
@@ -76,6 +85,8 @@ export function assertSerializableExecutionRequest(request: ExecutionRequest) {
   if (!Number.isFinite(request.deadline) || request.deadline <= 0) {
     throw new TypeError('ExecutionRequest.deadline 必须是有限正数')
   }
+  parseToolCapabilities(request.capabilities, 'ExecutionRequest.capabilities')
+  parseExecutionConstraints(request.constraints)
   let serialized: string | undefined
   try {
     serialized = JSON.stringify(request)
