@@ -209,6 +209,9 @@ describe('Operation ledger reducer', () => {
 
   it('strictly parses untrusted operation journal payloads', () => {
     assert.equal(parseOperationEvent(operationEvent('proposed', 1)).status, 'proposed')
+    assert.deepEqual(parseOperationEvent(operationEvent('proposed', 1, {
+      capabilitySet: [],
+    })).capabilitySet, [])
     assert.throws(
       () => parseOperationEvent(operationEvent('proposed', 1, {
         capabilitySet: ['filesystem.write', 1 as unknown as string],
@@ -398,5 +401,20 @@ describe('Operation ledger reducer', () => {
       hmacKey: 'local-test-key-at-least-32-bytes',
     }).protect(input)
     assert.equal('redactedInput' in defaultProtected, false)
+  })
+
+  it('redacts prefixed environment-style secret field names', () => {
+    assert.deepEqual(redactSensitiveInput({
+      OPENAI_API_KEY: 'provider-secret',
+      M2_SYNTHETIC_TOKEN: 'synthetic-secret',
+      DATABASE_PASSWORD: 'database-secret',
+      ordinary_value: 'visible',
+    }), {
+      ordinary_value: 'visible',
+    })
+    assert.equal(
+      redactSensitiveInput('OPENAI_API_KEY=provider-secret'),
+      '[REDACTED]',
+    )
   })
 })

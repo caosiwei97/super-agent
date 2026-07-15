@@ -1,12 +1,29 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type { ToolModelMessage } from 'ai'
 import type {
+  ResolvedToolInvocation,
   ToolDescriptor,
   ToolDispatchResult,
-  ToolInvocation,
   ToolRegistry,
 } from '../core/tool-registry.js'
 import { truncateResult } from '../core/tool-registry.js'
+import {
+  ConstraintGateError,
+  dispatchResolvedInvocation,
+  preflightResolvedInvocation,
+  type ConstraintGateErrorCode,
+} from './internal-tool-dispatch.js'
+import {
+  TOOL_CAPABILITIES,
+  type ExecutionConstraints,
+  type ToolCapability,
+} from '../security/capabilities.js'
+import {
+  PolicyEngine,
+  type PolicyDecision,
+  type PolicyEngineOptions,
+  type PolicySource,
+} from '../security/policy-engine.js'
 import type { EventDurability, SessionEventInput } from '../session/store.js'
 import {
   applyOperationEvent,
@@ -51,6 +68,9 @@ export interface PipelineApprovalRequest {
   readonly operationId: string
   readonly signal: AbortSignal
   readonly deadline: number
+  readonly capabilities: readonly ToolCapability[]
+  readonly constraints: ExecutionConstraints
+  readonly policyReasonCode: string
 }
 
 export interface PipelineOutcome {
@@ -68,15 +88,23 @@ export interface PipelineBatchOptions {
   readonly denyReason?: (request: PipelineApprovalRequest) => string | undefined
   readonly budgetUsed?: number
   readonly onOutcome?: (outcome: PipelineOutcome) => Promise<void> | void
+  readonly policySource?: PolicySource
+}
+
+export interface ToolExecutionPipelineOptions {
+  readonly hooks?: PolicyEngineOptions['hooks']
+  readonly rules?: PolicyEngineOptions['rules']
+  readonly policySource?: PolicySource
 }
 
 interface PreparedCall {
   readonly call: CompleteToolCall
   readonly operationId: string
-  readonly descriptor?: ToolDescriptor
+  readonly invocation?: ResolvedToolInvocation
   readonly input: unknown
   readonly invalidReason?: string
   readonly invalidCode?: DenialCode
+  decision?: PolicyDecision
   projection: OperationProjection
 }
 
@@ -84,6 +112,8 @@ type DenialCode =
   | 'invalid_input'
   | 'input_not_persistable'
   | 'unknown_tool'
+  | 'capability_resolution_failed'
+  | ConstraintGateErrorCode
   | 'policy_denied'
   | 'approval_denied'
   | 'approval_error'
@@ -153,15 +183,33 @@ function modelOutput(rawOutput: unknown, maxChars: number) {
   return truncateResult(serialized, maxChars)
 }
 
+const knownCapabilities = new Set<string>(TOOL_CAPABILITIES)
+
+function normalizePersistedCapability(capability: string): ToolCapability {
+  if (knownCapabilities.has(capability)) return capability as ToolCapability
+  if (capability === 'legacy.read') return 'secret.read'
+  // Historical write metadata and any unknown legacy value are conservatively
+  // treated as external writes instead of making an upgraded session permissive.
+  return 'external.write'
+}
+
 /** The only boundary allowed to turn a complete model tool call into a side effect. */
 export class ToolExecutionPipeline {
   private readonly recovery: RecoveryCoordinator
+  private readonly policyEngine: PolicyEngine
+  private readonly policySource: PolicySource
 
   constructor(
     private readonly registry: ToolRegistry,
     private readonly journal: RecoveryJournal,
+    options: ToolExecutionPipelineOptions = {},
   ) {
     this.recovery = new RecoveryCoordinator(journal)
+    this.policyEngine = new PolicyEngine({ hooks: options.hooks, rules: options.rules })
+    this.policySource = options.policySource ?? Object.freeze({
+      type: 'internal',
+      nonInteractive: false,
+    })
   }
 
   async executeBatch(
@@ -179,25 +227,65 @@ export class ToolExecutionPipeline {
 
     const prepared: PreparedCall[] = []
     try {
-      const existing = new Set((await this.recovery.listOperations()).map((item) => item.operationId))
-      for (const call of calls) {
+      const operations = await this.recovery.listOperations()
+      const existing = new Set(operations.map((item) => item.operationId))
+      const priorCapabilities = Object.freeze([...new Set(operations
+        .filter((item) => item.status === 'succeeded' || item.status === 'reconciled_succeeded')
+        .flatMap((item) => item.latestEvent.capabilitySet.map(normalizePersistedCapability)))])
+      const resolvedCalls = calls.map((call) => {
         assertContext(context)
         const operationId = stableOperationId(context, call)
         if (existing.has(operationId)) {
           throw new Error(`operation 已存在，拒绝重复执行: ${operationId}`)
         }
-        const descriptor = this.registry.getDescriptor(call.toolName)
-        const validation = this.registry.validateToolInput(call.toolName, call.input)
-        const safeInput = validation.ok ? validation.input : call.input
+        existing.add(operationId)
+        const resolution = this.registry.resolveInvocation(call.toolName, call.input, call.toolCallId)
+        return { call, operationId, resolution }
+      })
+      const batchCapabilities = Object.freeze([...new Set(resolvedCalls.flatMap(({ resolution }) =>
+        resolution.ok ? [...resolution.invocation.capabilities] : [],
+      ))])
+
+      for (const { call, operationId, resolution } of resolvedCalls) {
+        assertContext(context)
+        const safeInput = resolution.ok ? resolution.invocation.input : resolution.input
         const protection = safeProtectedInput(safeInput)
-        const invalidReason = validation.ok ? protection.error : validation.error
-        const invalidCode: DenialCode | undefined = descriptor === undefined
-          ? 'unknown_tool'
-          : !validation.ok
-            ? 'invalid_input'
-            : protection.error === undefined
-              ? undefined
-              : 'input_not_persistable'
+        let invalidReason = resolution.ok ? protection.error : resolution.error
+        let invalidCode: DenialCode | undefined = !resolution.ok
+          ? resolution.code
+          : protection.error === undefined ? undefined : 'input_not_persistable'
+        let decision: PolicyDecision | undefined
+        if (resolution.ok && invalidReason === undefined) {
+          decision = await this.policyEngine.evaluate({
+            toolName: resolution.invocation.tool.name,
+            input: resolution.invocation.input,
+            capabilities: resolution.invocation.capabilities,
+            constraints: resolution.invocation.constraints,
+            batchCapabilities,
+            priorCapabilities,
+            toolSource: resolution.invocation.toolSource,
+            source: options.policySource ?? this.policySource,
+            signal: context.signal,
+            deadline: context.deadline,
+          })
+          if (decision.behavior === 'allow' && resolution.invocation.legacyRequiresApproval) {
+            decision = Object.freeze({
+              behavior: 'ask',
+              constraints: decision.constraints,
+              reasonCode: 'policy.default.approval_required',
+            })
+          }
+          if (decision.behavior !== 'deny') {
+            try {
+              preflightResolvedInvocation(resolution.invocation, decision.constraints)
+            } catch (error) {
+              if (!(error instanceof ConstraintGateError)) throw error
+              invalidReason = error.message
+              invalidCode = error.code
+              decision = undefined
+            }
+          }
+        }
         const draft = proposeOperation({
           operationId,
           sessionId: context.sessionId,
@@ -206,21 +294,21 @@ export class ToolExecutionPipeline {
           requestId: context.requestId,
           toolCallId: call.toolCallId,
           toolName: call.toolName,
-          capabilitySet: descriptor?.capabilitySet ?? ['tool.unknown'],
+          capabilitySet: resolution.ok ? resolution.invocation.capabilities : [],
           protectedInput: protection.protectedInput,
         }) as OperationEventDraft
         const projection = applyOperationEvent(
           undefined,
           await this.appendDraft(draft, 'buffered'),
         )
-        existing.add(operationId)
         prepared.push({
           call,
           operationId,
-          descriptor,
+          ...(resolution.ok ? { invocation: resolution.invocation } : {}),
           input: safeInput,
           ...(invalidReason === undefined ? {} : { invalidReason }),
           ...(invalidCode === undefined ? {} : { invalidCode }),
+          ...(decision === undefined ? {} : { decision }),
           projection,
         })
       }
@@ -231,23 +319,27 @@ export class ToolExecutionPipeline {
         assertContext(context)
         let denial = item.invalidReason
         let denialCode = item.invalidCode
-        const request = item.descriptor === undefined ? undefined : {
-          tool: item.descriptor,
+        if (!denial && item.decision?.behavior === 'deny') {
+          denial = item.decision.reasonCode
+          denialCode = 'policy_denied'
+        }
+        const request = item.invocation === undefined || item.decision === undefined ||
+          item.decision.behavior === 'deny' ? undefined : {
+          tool: item.invocation.tool,
           input: item.input,
           toolCallId: item.call.toolCallId,
           operationId: item.operationId,
           signal: context.signal,
           deadline: context.deadline,
-        }
-        if (!denial && request === undefined) {
-          denial = `工具不存在: ${item.call.toolName}`
-          denialCode = 'unknown_tool'
+          capabilities: item.invocation.capabilities,
+          constraints: item.decision.constraints,
+          policyReasonCode: item.decision.reasonCode,
         }
         if (!denial && request) {
           denial = options.denyReason?.(request)
           if (denial) denialCode = 'policy_denied'
         }
-        if (!denial && request && request.tool.requiresApproval) {
+        if (!denial && request && item.decision?.behavior === 'ask') {
           try {
             const approvedByPolicy = await (options.approve?.(request) ?? Promise.resolve(false))
             assertContext(context)
@@ -310,15 +402,18 @@ export class ToolExecutionPipeline {
     budgetUsed?: number,
   ): Promise<PipelineOutcome> {
     assertContext(context)
+    if (!item.invocation || !item.decision || item.decision.behavior === 'deny') {
+      throw new Error(`operation ${item.operationId} 缺少已授权的 resolved invocation`)
+    }
     let started: OperationProjection | undefined
-    const result: ToolDispatchResult = await this.registry.dispatchTool(
-      item.call.toolName,
-      item.input,
-      item.call.toolCallId,
+    const result: ToolDispatchResult = await dispatchResolvedInvocation(
+      this.registry,
+      item.invocation,
       {
         signal: context.signal,
         deadline: context.deadline,
-        beforeDispatch: async (_invocation: ToolInvocation) => {
+        constraints: item.decision.constraints,
+        beforeDispatch: async () => {
           assertContext(context)
           started = await this.transition(item.projection, {
             kind: 'start',
@@ -343,9 +438,17 @@ export class ToolExecutionPipeline {
       // Redact while field names are still available. Serializing first would
       // turn `{ apiKey: "..." }` into an opaque string and defeat field-based
       // secret removal before it reaches the durable journal.
-      const redactedOutput = redactSensitiveInput(result.rawOutput)
+      // A sensitive-path read may contain arbitrary variable names that no
+      // field-name heuristic can classify reliably. Never materialize such a
+      // result into the model context, observer output, or durable journal.
+      const redactedOutput = item.invocation.capabilities.includes('secret.read')
+        ? '[REDACTED]'
+        : redactSensitiveInput(result.rawOutput)
       protectedResult = resultPort.protect(
-        modelOutput(redactedOutput, result.descriptor.maxResultChars),
+        modelOutput(redactedOutput, Math.min(
+          result.descriptor.maxResultChars,
+          item.decision.constraints.maxResultChars ?? Number.POSITIVE_INFINITY,
+        )),
       )
     } catch {
       // The closure already resolved successfully. Persist success even when its

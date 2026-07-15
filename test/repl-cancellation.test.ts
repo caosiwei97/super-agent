@@ -15,10 +15,6 @@ function approvalRequest(signal: AbortSignal): PipelineApprovalRequest {
       name: 'write_demo',
       description: 'write',
       parameters: { type: 'object', properties: {} },
-      capabilitySet: ['filesystem.write'],
-      isConcurrencySafe: false,
-      isReadOnly: false,
-      requiresApproval: true,
       maxResultChars: 1_000,
       shouldDefer: false,
     },
@@ -27,6 +23,9 @@ function approvalRequest(signal: AbortSignal): PipelineApprovalRequest {
     operationId: 'operation-1',
     signal,
     deadline: Date.now() + 10_000,
+    capabilities: ['filesystem.write'],
+    constraints: {},
+    policyReasonCode: 'policy.default.approval_required',
   }
 }
 

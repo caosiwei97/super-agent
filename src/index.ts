@@ -32,13 +32,16 @@ export { ToolRegistry, truncateResult } from './core/tool-registry.js'
 export type {
   MCPToolClient,
   MCPToolDescriptor,
+  ResolvedToolInvocation,
   ToolDescriptor,
   ToolDefinition,
-  ToolDispatchOptions,
-  ToolDispatchResult,
   ToolExecutionContext,
   ToolInputValidationResult,
+  ToolInvocationResolution,
   ToolInvocation,
+  ToolRegistryOptions,
+  ToolRuntimeContext,
+  ToolSource,
 } from './core/tool-registry.js'
 export { Workspace, WorkspaceBoundaryError } from './core/workspace.js'
 export { loadConfig } from './core/config.js'
@@ -80,7 +83,37 @@ export type {
   PipelineBatchResult,
   PipelineOutcome,
   RunContext,
+  ToolExecutionPipelineOptions,
 } from './execution/tool-execution-pipeline.js'
+export {
+  intersectExecutionConstraints,
+  parseExecutionConstraints,
+  parseToolCapabilities,
+  resolveToolInvocation,
+  TOOL_CAPABILITIES,
+} from './security/capabilities.js'
+export type {
+  ExecutionConstraints,
+  ResolvedToolInvocation as ResolvedToolSecurity,
+  ToolCapability,
+  ToolSecurityDefinition,
+} from './security/capabilities.js'
+export { createPolicyContext, PolicyEngine } from './security/policy-engine.js'
+export type {
+  PolicyBehavior,
+  PolicyContext,
+  PolicyContextInput,
+  PolicyDecision,
+  PolicyEngineOptions,
+  PolicyReasonCode,
+  PolicyRule,
+  PolicySource,
+  PolicySourceType,
+  PolicyTighteningHook,
+  PolicyToolSource,
+} from './security/policy-engine.js'
+export { createCapabilityRule, evaluateDefaultPolicy } from './security/rules.js'
+export type { CapabilityRuleOptions } from './security/rules.js'
 export {
   DeadlineExceededError,
   ModelAuditWriteError,

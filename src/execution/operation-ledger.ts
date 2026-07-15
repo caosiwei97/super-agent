@@ -60,7 +60,7 @@ const TERMINAL_RESULT_STATUSES = new Set<OperationStatus>([
 ])
 
 const DEFAULT_SENSITIVE_FIELD_PATTERN =
-  /^(?:authorization|proxy[-_]?authorization|cookie|set-cookie|password|passwd|secret|token|access[-_]?token|refresh[-_]?token|id[-_]?token|credentials?|x[-_]?api[-_]?key|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret|session[-_]?id)$/i
+  /^(?:(?:[a-z0-9]+)[-_])*(?:authorization|proxy[-_]?authorization|cookie|set-cookie|password|passwd|secret|token|access[-_]?token|refresh[-_]?token|id[-_]?token|credentials?|x[-_]?api[-_]?key|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret|session[-_]?id)$/i
 
 const stableFields = [
   'operationId',
@@ -193,7 +193,7 @@ export function parseOperationEvent(value: unknown): OperationEvent {
   if (!Array.isArray(event.capabilitySet) || event.capabilitySet.some(
     (item) => typeof item !== 'string' || item.trim().length === 0,
   )) {
-    throw new Error('OperationEvent.capabilitySet 必须为非空字符串数组')
+    throw new Error('OperationEvent.capabilitySet 必须为字符串数组，成员不能为空')
   }
   if (event.capabilitySet.length > 64) throw new Error('OperationEvent.capabilitySet 过大')
   if (new Set(event.capabilitySet).size !== event.capabilitySet.length) {

@@ -4,8 +4,20 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it, type TestContext } from 'node:test'
 import { ToolRegistry, type ToolDefinition } from '../src/core/tool-registry.js'
-import { parseOperationEvent } from '../src/execution/operation-ledger.js'
-import { ToolExecutionPipeline } from '../src/execution/tool-execution-pipeline.js'
+import {
+  applyOperationEvent,
+  createOperationInputDigestPort,
+  parseOperationEvent,
+  proposeOperation,
+  redactSensitiveInput,
+  transitionOperation,
+} from '../src/execution/operation-ledger.js'
+import {
+  ToolExecutionPipeline,
+  type ToolExecutionPipelineOptions,
+} from '../src/execution/tool-execution-pipeline.js'
+import { dispatchResolvedInvocation } from '../src/execution/internal-tool-dispatch.js'
+import type { OperationEventDraft, OperationProjection } from '../src/execution/operation-types.js'
 import {
   SessionStore,
   nodeSessionJournalIo,
@@ -36,7 +48,11 @@ function definition(
   }
 }
 
-async function setup(context: TestContext, io?: SessionJournalIo) {
+async function setup(
+  context: TestContext,
+  io?: SessionJournalIo,
+  pipelineOptions?: ToolExecutionPipelineOptions,
+) {
   const root = await mkdtemp(join(tmpdir(), 'super-agent-pipeline-'))
   const store = await SessionStore.open('pipeline-test', { directory: root, io })
   const registry = new ToolRegistry()
@@ -45,7 +61,7 @@ async function setup(context: TestContext, io?: SessionJournalIo) {
     await store.close().catch(() => undefined)
     await rm(root, { recursive: true, force: true })
   })
-  return { store, registry, pipeline: new ToolExecutionPipeline(registry, store) }
+  return { store, registry, pipeline: new ToolExecutionPipeline(registry, store, pipelineOptions) }
 }
 
 function runContext() {
@@ -59,7 +75,224 @@ function runContext() {
   }
 }
 
+async function seedSucceededOperation(
+  store: SessionStore,
+  capabilitySet: readonly string[],
+): Promise<OperationProjection> {
+  const append = async (draft: OperationEventDraft) => parseOperationEvent(
+    await store.appendEvent({ ...draft }, 'durable'),
+  )
+  let projection = applyOperationEvent(undefined, await append(proposeOperation({
+    operationId: `seed-${capabilitySet.join('-')}`,
+    sessionId: 'pipeline-test',
+    turnId: 'seed-turn',
+    stepId: 'seed-step',
+    requestId: 'seed-request',
+    toolCallId: 'seed-call',
+    toolName: 'seed-tool',
+    capabilitySet,
+    protectedInput: createOperationInputDigestPort({ redact: redactSensitiveInput }).protect({}),
+  }) as OperationEventDraft))
+  projection = applyOperationEvent(projection, await append(
+    transitionOperation(projection, { kind: 'approve' }) as OperationEventDraft,
+  ))
+  projection = applyOperationEvent(projection, await append(
+    transitionOperation(projection, { kind: 'start', attemptId: 'seed-attempt' }) as OperationEventDraft,
+  ))
+  return applyOperationEvent(projection, await append(
+    transitionOperation(projection, { kind: 'succeed' }) as OperationEventDraft,
+  ))
+}
+
 describe('ToolExecutionPipeline', () => {
+  it('persists dynamic resolution failures as denied without approval or dispatch', async (context) => {
+    const { store, registry, pipeline } = await setup(context)
+    let approvals = 0
+    let executions = 0
+    registry.register(definition('broken_security', async () => { executions++; return 'never' }, {
+      getCapabilities: () => { throw new Error('resolver exploded') },
+      isConcurrencySafe: () => true,
+    }))
+
+    const result = await pipeline.executeBatch(runContext(), [{
+      toolCallId: 'call-broken-security',
+      toolName: 'broken_security',
+      input: { value: 'safe' },
+    }], { approve: async () => { approvals++; return true } })
+
+    assert.equal(executions, 0)
+    assert.equal(approvals, 0)
+    assert.equal(result.outcomes[0]?.operation.status, 'denied')
+    assert.equal(result.outcomes[0]?.operation.latestEvent.errorCode, 'capability_resolution_failed')
+    assert.deepEqual(result.outcomes[0]?.operation.latestEvent.capabilitySet, [])
+    assert.deepEqual((await store.replayEvents()).filter((event) => event.type === 'operation')
+      .map((event) => parseOperationEvent(event).status), ['proposed', 'denied'])
+  })
+
+  it('calls approval only for ask while explicit low-risk capabilities allow directly', async (context) => {
+    const { registry, pipeline } = await setup(context)
+    let approvals = 0
+    registry.register(
+      definition('pure', async () => 'pure', {
+        getCapabilities: () => [],
+        isConcurrencySafe: () => true,
+      }),
+      definition('egress', async () => 'egress', {
+        getCapabilities: () => ['network.egress'],
+        isConcurrencySafe: () => true,
+      }),
+    )
+
+    const allowed = await pipeline.executeBatch(runContext(), [{
+      toolCallId: 'call-pure', toolName: 'pure', input: { value: 'safe' },
+    }], { approve: async () => { approvals++; return true } })
+    assert.equal(allowed.outcomes[0]?.operation.status, 'succeeded')
+    assert.equal(approvals, 0)
+
+    const asked = await pipeline.executeBatch({ ...runContext(), stepId: 'step-2' }, [{
+      toolCallId: 'call-egress', toolName: 'egress', input: { value: 'safe' },
+    }], { approve: async () => { approvals++; return true } })
+    assert.equal(asked.outcomes[0]?.operation.status, 'succeeded')
+    assert.equal(approvals, 1)
+  })
+
+  it('fails requireSandbox closed before durable started while M3 has no sandbox backend', async (context) => {
+    const { store, registry, pipeline } = await setup(context)
+    let executions = 0
+    let approvals = 0
+    registry.register(definition('sandbox_required', async () => { executions++; return 'never' }, {
+      getCapabilities: () => ['process.execute'],
+      getConstraints: () => ({ requireSandbox: true }),
+      supportedConstraintKeys: ['requireSandbox'],
+      isConcurrencySafe: () => false,
+    }))
+
+    const result = await pipeline.executeBatch(runContext(), [{
+      toolCallId: 'call-sandbox',
+      toolName: 'sandbox_required',
+      input: { value: 'safe' },
+    }], { approve: async () => { approvals++; return true } })
+    assert.equal(executions, 0)
+    assert.equal(approvals, 0)
+    assert.equal(result.outcomes[0]?.operation.status, 'denied')
+    assert.equal(result.outcomes[0]?.operation.latestEvent.errorCode, 'sandbox_unavailable')
+    const events = (await store.replayEvents()).filter((event) => event.type === 'operation')
+      .map((event) => parseOperationEvent(event).status)
+    assert.deepEqual(events, ['proposed', 'denied'])
+  })
+
+  it('persists unsupported policy constraints as denied without approval or dispatch', async (context) => {
+    let approvals = 0
+    let executions = 0
+    const { store, registry, pipeline } = await setup(context, undefined, {
+      hooks: [() => ({
+        behavior: 'ask',
+        constraints: { networkHosts: ['api.example'] },
+        reasonCode: 'hook.unsupported_constraint_probe',
+      })],
+    })
+    registry.register(definition('no_network_constraint', async () => {
+      executions++
+      return 'never'
+    }, {
+      getCapabilities: () => [],
+      isConcurrencySafe: () => true,
+    }))
+
+    const result = await pipeline.executeBatch(runContext(), [{
+      toolCallId: 'call-unsupported-constraint',
+      toolName: 'no_network_constraint',
+      input: { value: 'safe' },
+    }], { approve: async () => { approvals++; return true } })
+    assert.equal(result.outcomes[0]?.operation.status, 'denied')
+    assert.equal(result.outcomes[0]?.operation.latestEvent.errorCode, 'constraint_unsupported')
+    assert.equal(approvals, 0)
+    assert.equal(executions, 0)
+    assert.deepEqual((await store.replayEvents()).filter((event) => event.type === 'operation')
+      .map((event) => parseOperationEvent(event).status), ['proposed', 'denied'])
+  })
+
+  it('hard-denies batch and durable prior secret-to-egress plans before approval', async (context) => {
+    const { registry, pipeline } = await setup(context)
+    let approvals = 0
+    let executions = 0
+    registry.register(
+      definition('secret', async () => { executions++; return 'secret-read' }, {
+        getCapabilities: () => ['secret.read'],
+        isConcurrencySafe: () => true,
+      }),
+      definition('network', async () => { executions++; return 'sent' }, {
+        getCapabilities: () => ['network.egress'],
+        isConcurrencySafe: () => true,
+      }),
+    )
+
+    const batch = await pipeline.executeBatch(runContext(), [
+      { toolCallId: 'call-secret-batch', toolName: 'secret', input: { value: 'safe' } },
+      { toolCallId: 'call-network-batch', toolName: 'network', input: { value: 'safe' } },
+    ], { approve: async () => { approvals++; return true } })
+    assert.deepEqual(batch.outcomes.map((outcome) => outcome.operation.status), ['denied', 'denied'])
+    assert.equal(approvals, 0)
+    assert.equal(executions, 0)
+
+    const secret = await pipeline.executeBatch({ ...runContext(), stepId: 'step-prior-secret' }, [{
+      toolCallId: 'call-secret-prior', toolName: 'secret', input: { value: 'safe' },
+    }], { approve: async () => { approvals++; return true } })
+    assert.equal(secret.outcomes[0]?.operation.status, 'succeeded')
+    assert.equal(approvals, 1)
+
+    const network = await pipeline.executeBatch({ ...runContext(), stepId: 'step-after-secret' }, [{
+      toolCallId: 'call-network-after', toolName: 'network', input: { value: 'safe' },
+    }], { approve: async () => { approvals++; return true } })
+    assert.equal(network.outcomes[0]?.operation.status, 'denied')
+    assert.equal(network.outcomes[0]?.operation.latestEvent.errorCode, 'policy_denied')
+    assert.equal(approvals, 1, 'hard deny must not be routed through approval')
+  })
+
+  it('normalizes legacy and unknown successful ledger capabilities conservatively', async (context) => {
+    let observedPrior: readonly string[] = []
+    const { store, registry, pipeline } = await setup(context, undefined, {
+      hooks: [(policyContext) => {
+        observedPrior = policyContext.priorCapabilities
+        return undefined
+      }],
+    })
+    await seedSucceededOperation(store, ['legacy.read'])
+    await seedSucceededOperation(store, ['vendor.future.write'])
+    registry.register(definition('after_upgrade', async () => 'ok', {
+      getCapabilities: () => [],
+      isConcurrencySafe: () => true,
+    }))
+
+    const result = await pipeline.executeBatch(runContext(), [{
+      toolCallId: 'call-after-upgrade',
+      toolName: 'after_upgrade',
+      input: { value: 'safe' },
+    }])
+    assert.equal(result.outcomes[0]?.operation.status, 'succeeded')
+    assert.deepEqual(observedPrior, ['secret.read', 'external.write'])
+  })
+
+  it('keeps denyReason as a tighten-only compatibility gate', async (context) => {
+    const { registry, pipeline } = await setup(context)
+    let executions = 0
+    let approvals = 0
+    registry.register(definition('tightened', async () => { executions++; return 'never' }, {
+      getCapabilities: () => [],
+      isConcurrencySafe: () => true,
+    }))
+
+    const result = await pipeline.executeBatch(runContext(), [{
+      toolCallId: 'call-tightened', toolName: 'tightened', input: { value: 'safe' },
+    }], {
+      denyReason: () => 'loop guard denied',
+      approve: async () => { approvals++; return true },
+    })
+    assert.equal(result.outcomes[0]?.operation.status, 'denied')
+    assert.equal(executions, 0)
+    assert.equal(approvals, 0)
+  })
+
   it('persists proposed, durable start, terminal and materialized result in order', async (context) => {
     const { store, registry, pipeline } = await setup(context)
     let executions = 0
@@ -423,9 +656,15 @@ describe('ToolExecutionPipeline', () => {
       definition('lock_target', async () => 'must not run', { isConcurrencySafe: false }),
     )
     const blockerContext = runContext()
-    const blocker = registry.dispatchTool(
-      'lock_blocker', { value: 'hold' }, 'blocker-call', blockerContext,
+    const blockerResolution = registry.resolveInvocation(
+      'lock_blocker', { value: 'hold' }, 'blocker-call',
     )
+    assert.equal(blockerResolution.ok, true)
+    if (!blockerResolution.ok) return
+    const blocker = dispatchResolvedInvocation(registry, blockerResolution.invocation, {
+      ...blockerContext,
+      constraints: blockerResolution.invocation.constraints,
+    })
     await blockerReady
 
     const controller = new AbortController()

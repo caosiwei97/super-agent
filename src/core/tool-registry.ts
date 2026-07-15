@@ -1,5 +1,15 @@
 import { jsonSchema, type ToolSet } from 'ai'
 import Ajv, { type ErrorObject, type ValidateFunction } from 'ajv'
+import {
+  parseToolCapabilities,
+  resolveToolInvocation as resolveToolSecurity,
+  type ExecutionConstraints,
+  type ToolCapability,
+} from '../security/capabilities.js'
+import {
+  installInternalToolDispatcher,
+  type InternalToolDispatchOptions,
+} from '../execution/internal-tool-dispatch.js'
 import { AsyncReadWriteLock } from './async-rw-lock.js'
 
 export interface MCPToolDescriptor {
@@ -10,6 +20,7 @@ export interface MCPToolDescriptor {
 
 /** Narrow port keeps the registry independent from the MCP transport implementation. */
 export interface MCPToolClient {
+  readonly endpointOrigin: string
   connect(): Promise<void>
   listTools(): Promise<MCPToolDescriptor[]>
   callTool(name: string, args: Record<string, unknown>, context: ToolExecutionContext): Promise<unknown>
@@ -20,10 +31,6 @@ export interface ToolDescriptor {
   name: string
   description: string
   parameters: Record<string, unknown>
-  capabilitySet: readonly string[]
-  isConcurrencySafe: boolean
-  isReadOnly: boolean
-  requiresApproval: boolean
   maxResultChars: number
   shouldDefer: boolean
   searchHint?: string
@@ -31,15 +38,15 @@ export interface ToolDescriptor {
 
 export interface ToolDefinition extends Omit<
   ToolDescriptor,
-  | 'capabilitySet'
-  | 'isConcurrencySafe'
-  | 'isReadOnly'
-  | 'requiresApproval'
   | 'maxResultChars'
   | 'shouldDefer'
 > {
-  capabilitySet?: readonly string[]
-  isConcurrencySafe?: boolean
+  getCapabilities?: (input: unknown) => readonly ToolCapability[]
+  getConstraints?: (input: unknown) => ExecutionConstraints
+  /** Constraint fields actively enforced by the execution closure. */
+  supportedConstraintKeys?: readonly (keyof ExecutionConstraints)[]
+  capabilitySet?: readonly ToolCapability[]
+  isConcurrencySafe?: boolean | ((input: unknown) => boolean)
   isReadOnly?: boolean
   requiresApproval?: boolean
   maxResultChars?: number
@@ -47,6 +54,8 @@ export interface ToolDefinition extends Omit<
   execute: (input: any, context: ToolExecutionContext) => Promise<unknown>
   dispose?: () => Promise<void> | void
   shouldDefer?: boolean
+  /** Registry provenance; MCP registration sets this structurally. */
+  toolSource?: ToolSource
 }
 
 export interface ToolInvocation {
@@ -55,17 +64,46 @@ export interface ToolInvocation {
   toolCallId: string
 }
 
-export interface ToolExecutionContext {
+export type ToolSource =
+  | { readonly kind: 'local' }
+  | { readonly kind: 'mcp'; readonly serverName: string }
+
+export interface ResolvedToolInvocation extends ToolInvocation {
+  readonly capabilities: readonly ToolCapability[]
+  readonly constraints: ExecutionConstraints
+  readonly supportedConstraintKeys: readonly (keyof ExecutionConstraints)[]
+  readonly isConcurrencySafe: boolean
+  readonly securitySource: 'explicit' | 'legacy'
+  readonly legacyRequiresApproval: boolean
+  readonly toolSource: ToolSource
+}
+
+export type ToolInvocationResolution =
+  | { readonly ok: true; readonly invocation: ResolvedToolInvocation }
+  | {
+      readonly ok: false
+      readonly code: 'unknown_tool' | 'invalid_input' | 'capability_resolution_failed'
+      readonly error: string
+      readonly input: unknown
+      readonly tool?: ToolDescriptor
+    }
+
+export interface ToolRuntimeContext {
   readonly signal: AbortSignal
   readonly deadline: number
+}
+
+export interface ToolExecutionContext extends ToolRuntimeContext {
+  readonly capabilities: readonly ToolCapability[]
+  readonly constraints: ExecutionConstraints
 }
 
 export type ToolInputValidationResult =
   | { readonly ok: true; readonly input: unknown }
   | { readonly ok: false; readonly error: string }
 
-export interface ToolDispatchOptions extends ToolExecutionContext {
-  beforeDispatch?: (invocation: ToolInvocation) => void | Promise<void>
+export interface ToolRegistryOptions {
+  readonly onLegacyWarning?: (message: string) => void
 }
 
 export type ToolDispatchResult =
@@ -82,12 +120,30 @@ export type ToolDispatchResult =
 
 const DEFAULT_MAX_RESULT_CHARS = 3_000
 const TOOL_EXECUTION_ERROR = 'tool_execution_error'
+const EXECUTION_CONSTRAINT_KEYS = new Set<keyof ExecutionConstraints>([
+  'filesystemReadRoots',
+  'filesystemWriteRoots',
+  'networkSchemes',
+  'networkHosts',
+  'networkPorts',
+  'allowLoopbackListen',
+  'loopbackListenPorts',
+  'requireSandbox',
+  'maxResultChars',
+])
 
 interface RegisteredTool {
   readonly descriptor: ToolDescriptor
   readonly validate: ValidateFunction
   readonly execute: ToolDefinition['execute']
   readonly dispose?: ToolDefinition['dispose']
+  readonly getCapabilities: (input: unknown) => readonly ToolCapability[]
+  readonly getConstraints: (input: unknown) => ExecutionConstraints
+  readonly supportedConstraintKeys: readonly (keyof ExecutionConstraints)[]
+  readonly isConcurrencySafe: (input: unknown) => boolean
+  readonly securitySource: 'explicit' | 'legacy'
+  readonly legacyRequiresApproval: boolean
+  readonly toolSource: ToolSource
 }
 
 function deepFreeze<T>(value: T): T {
@@ -122,6 +178,8 @@ export class ToolRegistry {
   private readonly mcpClients: MCPToolClient[] = []
   private readonly discoveredTools = new Set<string>()
   private readonly executionLock = new AsyncReadWriteLock()
+  private readonly resolvedInvocations = new WeakSet<object>()
+  private readonly legacyWarnings = new Set<string>()
   private readonly ajv = new Ajv({
     allErrors: true,
     coerceTypes: false,
@@ -132,6 +190,11 @@ export class ToolRegistry {
   })
   private closePromise: Promise<void> | undefined
   private closed = false
+
+  constructor(private readonly options: ToolRegistryOptions = {}) {
+    installInternalToolDispatcher(this, (invocation, dispatchOptions) =>
+      this.dispatchInternal(invocation, dispatchOptions))
+  }
 
   register(...tools: ToolDefinition[]) {
     if (this.closed) throw new Error('ToolRegistry 已关闭，不能继续注册工具')
@@ -146,16 +209,36 @@ export class ToolRegistry {
       const parameters = deepFreeze(
         cloneJsonValue(tool.parameters, `工具 ${tool.name} parameters`) as Record<string, unknown>,
       )
+      const explicitSecurity = tool.getCapabilities !== undefined
+      const legacyCapabilities = explicitSecurity
+        ? Object.freeze([]) as readonly ToolCapability[]
+        : parseToolCapabilities(tool.capabilitySet ?? (
+            tool.isReadOnly === true ? ['external.read'] : ['external.write']
+          ), `工具 ${tool.name} capabilitySet`)
+      const getCapabilities = explicitSecurity
+        ? tool.getCapabilities!
+        : () => legacyCapabilities
+      const getConstraints = explicitSecurity
+        ? (tool.getConstraints ?? (() => Object.freeze({})))
+        : () => Object.freeze({})
+      const supportedConstraintKeys = this.parseSupportedConstraintKeys(
+        tool.name,
+        tool.supportedConstraintKeys,
+        explicitSecurity,
+      )
+      const concurrencyResolver = typeof tool.isConcurrencySafe === 'function'
+        ? tool.isConcurrencySafe
+        : () => tool.isConcurrencySafe === true
+      const legacyRequiresApproval = !explicitSecurity && (
+        tool.requiresApproval === true || tool.isReadOnly !== true
+      )
+      const toolSource = this.parseToolSource(tool.toolSource)
+      if (!explicitSecurity) this.warnLegacyOnce(tool.name)
+
       const descriptor = deepFreeze({
         name: tool.name,
         description: tool.description,
         parameters,
-        capabilitySet: [...(tool.capabilitySet ?? (
-          tool.isReadOnly === true ? ['legacy.read'] : ['legacy.write']
-        ))],
-        isConcurrencySafe: tool.isConcurrencySafe === true,
-        isReadOnly: tool.isReadOnly === true,
-        requiresApproval: tool.requiresApproval === true || tool.isReadOnly !== true,
         maxResultChars: tool.maxResultChars ?? DEFAULT_MAX_RESULT_CHARS,
         shouldDefer: tool.shouldDefer === true,
         ...(tool.searchHint === undefined ? {} : { searchHint: tool.searchHint }),
@@ -164,6 +247,13 @@ export class ToolRegistry {
         descriptor,
         validate: this.ajv.compile(parameters),
         execute: tool.execute,
+        getCapabilities,
+        getConstraints,
+        supportedConstraintKeys,
+        isConcurrencySafe: concurrencyResolver,
+        securitySource: explicitSecurity ? 'explicit' : 'legacy',
+        legacyRequiresApproval,
+        toolSource,
         ...(tool.dispose === undefined ? {} : { dispose: tool.dispose }),
       })
     }
@@ -176,6 +266,7 @@ export class ToolRegistry {
     if (this.closed) throw new Error('ToolRegistry 已关闭，不能连接 MCP Server')
 
     try {
+      const endpoint = this.parseMCPEndpoint(client.endpointOrigin, serverName)
       await client.connect()
       const tools = await client.listTools()
       const definitions: ToolDefinition[] = []
@@ -191,13 +282,21 @@ export class ToolRegistry {
           parameters: tool.inputSchema,
           // MCP schemas do not expose trustworthy read/write metadata. Default to
           // serialized execution with explicit approval.
-          isConcurrencySafe: false,
-          isReadOnly: false,
-          requiresApproval: true,
-          capabilitySet: ['external.write'],
+          getCapabilities: () => ['network.egress', 'external.write'],
+          getConstraints: () => ({
+            networkSchemes: [endpoint.protocol.slice(0, -1)],
+            networkHosts: [endpoint.hostname.replace(/^\[|\]$/g, '').toLowerCase()],
+            networkPorts: [endpoint.port === ''
+              ? endpoint.protocol === 'https:' ? 443 : 80
+              : Number(endpoint.port)],
+            maxResultChars: 3_000,
+          }),
+          supportedConstraintKeys: ['networkSchemes', 'networkHosts', 'networkPorts'],
+          isConcurrencySafe: () => false,
           maxResultChars: 3_000,
           shouldDefer: true,
           searchHint: `${serverName} ${tool.name} ${tool.description}`,
+          toolSource: { kind: 'mcp', serverName },
           execute: (input, context) => client.callTool(originalName, input, context),
         })
       }
@@ -304,27 +403,66 @@ export class ToolRegistry {
     return { ok: false, error: formatValidationErrors(tool.validate.errors) }
   }
 
-  /** @internal ToolExecutionPipeline is the only supported caller. */
-  async dispatchTool(
-    toolName: string,
-    input: unknown,
-    toolCallId: string,
-    options: ToolDispatchOptions,
+  resolveInvocation(toolName: string, input: unknown, toolCallId: string): ToolInvocationResolution {
+    const tool = this.tools.get(toolName)
+    if (!tool) return { ok: false, code: 'unknown_tool', error: `工具不存在: ${toolName}`, input }
+    const validation = this.validateToolInput(toolName, input)
+    if (!validation.ok) {
+      return {
+        ok: false,
+        code: 'invalid_input',
+        error: validation.error,
+        input,
+        tool: tool.descriptor,
+      }
+    }
+
+    try {
+      const security = resolveToolSecurity({
+        getCapabilities: tool.getCapabilities,
+        getConstraints: tool.getConstraints,
+        isConcurrencySafe: tool.isConcurrencySafe,
+      }, validation.input)
+      const unsupported = (Object.keys(security.constraints) as (keyof ExecutionConstraints)[])
+        .find((key) => key !== 'maxResultChars' && !tool.supportedConstraintKeys.includes(key))
+      if (unsupported) throw new Error(`工具 ${toolName} 未声明可执行约束: ${unsupported}`)
+      const invocation = Object.freeze({
+        tool: tool.descriptor,
+        input: validation.input,
+        toolCallId,
+        capabilities: security.capabilities,
+        constraints: security.constraints,
+        supportedConstraintKeys: tool.supportedConstraintKeys,
+        isConcurrencySafe: security.isConcurrencySafe,
+        securitySource: tool.securitySource,
+        legacyRequiresApproval: tool.legacyRequiresApproval,
+        toolSource: tool.toolSource,
+      } satisfies ResolvedToolInvocation)
+      this.resolvedInvocations.add(invocation)
+      return { ok: true, invocation }
+    } catch (error) {
+      return {
+        ok: false,
+        code: 'capability_resolution_failed',
+        error: error instanceof Error ? error.message : String(error),
+        input: validation.input,
+        tool: tool.descriptor,
+      }
+    }
+  }
+
+  private async dispatchInternal(
+    invocation: ResolvedToolInvocation,
+    options: InternalToolDispatchOptions,
   ): Promise<ToolDispatchResult> {
     if (this.closed) throw new Error('ToolRegistry 已关闭')
-    const tool = this.tools.get(toolName)
-    if (!tool) throw new Error(`工具不存在: ${toolName}`)
-    const validation = this.validateToolInput(toolName, input)
-    if (!validation.ok) throw new Error(`工具 ${toolName} 输入无效: ${validation.error}`)
+    if (!this.resolvedInvocations.has(invocation)) throw new Error('拒绝未由 ToolRegistry 解析的 invocation')
+    const tool = this.tools.get(invocation.tool.name)
+    if (!tool || tool.descriptor !== invocation.tool) throw new Error('resolved invocation 已失效')
 
-    const release = tool.descriptor.isConcurrencySafe
+    const release = invocation.isConcurrencySafe
       ? await this.executionLock.acquireRead(options.signal)
       : await this.executionLock.acquireWrite(options.signal)
-    const invocation = {
-      tool: tool.descriptor,
-      input: validation.input,
-      toolCallId,
-    }
 
     try {
       // Deliberately outside the tool error boundary. A durable-start failure
@@ -335,9 +473,11 @@ export class ToolRegistry {
       try {
         return {
           outcome: 'succeeded',
-          rawOutput: await tool.execute(validation.input, {
+          rawOutput: await tool.execute(invocation.input, {
             signal: options.signal,
             deadline: options.deadline,
+            capabilities: invocation.capabilities,
+            constraints: options.constraints,
           }),
           descriptor: tool.descriptor,
         }
@@ -387,7 +527,53 @@ export class ToolRegistry {
     return tool.shouldDefer === true && !this.discoveredTools.has(tool.name)
   }
 
-  private assertExecutionContext(context: ToolExecutionContext) {
+  private warnLegacyOnce(toolName: string) {
+    if (this.legacyWarnings.has(toolName)) return
+    this.legacyWarnings.add(toolName)
+    this.options.onLegacyWarning?.(
+      `工具 ${toolName} 使用 legacy capabilitySet/isReadOnly/requiresApproval；请迁移到 getCapabilities`,
+    )
+  }
+
+  private parseToolSource(source: ToolSource | undefined): ToolSource {
+    if (source === undefined || source.kind === 'local') return Object.freeze({ kind: 'local' })
+    if (source.kind !== 'mcp' || typeof source.serverName !== 'string' || source.serverName.trim() === '') {
+      throw new TypeError('toolSource MCP serverName 必须为非空字符串')
+    }
+    return Object.freeze({ kind: 'mcp', serverName: source.serverName })
+  }
+
+  private parseSupportedConstraintKeys(
+    toolName: string,
+    value: readonly (keyof ExecutionConstraints)[] | undefined,
+    explicitSecurity: boolean,
+  ) {
+    if (!explicitSecurity && value !== undefined) {
+      throw new TypeError(`legacy 工具 ${toolName} 不能声明 supportedConstraintKeys`)
+    }
+    const keys = value ?? []
+    const unknown = keys.find((key) => !EXECUTION_CONSTRAINT_KEYS.has(key))
+    if (unknown) throw new TypeError(`工具 ${toolName} supportedConstraintKeys 非法: ${String(unknown)}`)
+    if (new Set(keys).size !== keys.length) {
+      throw new TypeError(`工具 ${toolName} supportedConstraintKeys 不能重复`)
+    }
+    return Object.freeze([...keys])
+  }
+
+  private parseMCPEndpoint(endpointOrigin: string, serverName: string) {
+    let endpoint: URL
+    try {
+      endpoint = new URL(endpointOrigin)
+    } catch (error) {
+      throw new TypeError(`MCP Server ${serverName} endpointOrigin 非法`, { cause: error })
+    }
+    if (!['http:', 'https:'].includes(endpoint.protocol) || endpoint.origin !== endpointOrigin) {
+      throw new TypeError(`MCP Server ${serverName} endpointOrigin 必须是规范 HTTP(S) origin`)
+    }
+    return endpoint
+  }
+
+  private assertExecutionContext(context: ToolRuntimeContext) {
     if (context.signal.aborted) {
       throw context.signal.reason instanceof Error
         ? context.signal.reason
