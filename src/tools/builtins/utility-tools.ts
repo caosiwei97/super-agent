@@ -11,8 +11,8 @@ export const weatherTool: ToolDefinition = {
     required: ['city'],
     additionalProperties: false,
   },
-  isConcurrencySafe: true,
-  isReadOnly: true,
+  getCapabilities: () => [],
+  isConcurrencySafe: () => true,
   execute: async ({ city }: { city: string }) => {
     const data: Record<string, string> = {
       北京: '晴，15-25°C，东南风 2 级',
@@ -37,8 +37,8 @@ export const calculatorTool: ToolDefinition = {
     required: ['expression'],
     additionalProperties: false,
   },
-  isConcurrencySafe: true,
-  isReadOnly: true,
+  getCapabilities: () => [],
+  isConcurrencySafe: () => true,
   execute: async ({ expression }: { expression: string }) => {
     // 白名单校验：只允许数字、基本运算符和括号，杜绝代码注入
     if (!/^[\d+\-*/%().\s]+$/.test(expression)) {

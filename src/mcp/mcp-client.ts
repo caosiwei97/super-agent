@@ -1,10 +1,13 @@
 import { Client } from '@modelcontextprotocol/sdk/client'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import type { ToolExecutionContext } from '../core/tool-registry.js'
+import type { ExecutionConstraints } from '../security/capabilities.js'
 
 export interface MCPClientOptions {
   url: string
   headers?: Record<string, string>
+  /** Test/integration injection; every implementation is still wrapped by the redirect guard. */
+  fetch?: typeof globalThis.fetch
 }
 
 interface MCPCallResult {
@@ -12,15 +15,60 @@ interface MCPCallResult {
   isError?: boolean
 }
 
+/** Fail closed unless the immutable policy snapshot authorizes this MCP origin exactly. */
+export function assertMcpEndpointConstraints(
+  endpointOrigin: string,
+  constraints: ExecutionConstraints | undefined,
+) {
+  const endpoint = new URL(endpointOrigin)
+  const scheme = endpoint.protocol.slice(0, -1)
+  const host = endpoint.hostname.replace(/^\[|\]$/g, '').toLowerCase()
+  const port = endpoint.port ? Number(endpoint.port) : scheme === 'https' ? 443 : 80
+  if (!constraints?.networkSchemes
+    || !constraints.networkHosts
+    || !constraints.networkPorts
+    || !constraints.networkSchemes.includes(scheme)
+    || !constraints.networkHosts.includes(host)
+    || !constraints.networkPorts.includes(port)) {
+    throw new Error(`MCP endpoint 超出已授权网络约束: ${scheme}://${host}:${port}`)
+  }
+}
+
+/**
+ * The MCP SDK uses this fetch for connect, SSE, listTools and callTool traffic.
+ * Manual mode plus rejecting every 3xx keeps the configured endpoint origin as
+ * the only network authority; callers cannot override redirect behavior.
+ */
+export function createMCPGuardedFetch(
+  fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+): typeof globalThis.fetch {
+  return async (input, init) => {
+    const response = await fetchImpl(input, { ...init, redirect: 'manual' })
+    if (response.status >= 300 && response.status < 400) {
+      try {
+        await response.body?.cancel()
+      } catch {
+        // The redirect denial is authoritative even if response cleanup fails.
+      }
+      throw new Error(`MCP transport 拒绝 HTTP redirect: ${response.status}`)
+    }
+    return response
+  }
+}
+
 /** Hosted Streamable HTTP MCP client backed by the official SDK. */
 export class MCPClient {
   private client: Client | null = null
+  readonly endpointOrigin: string
 
-  constructor(private readonly options: MCPClientOptions) {}
+  constructor(private readonly options: MCPClientOptions) {
+    this.endpointOrigin = new URL(options.url).origin
+  }
 
   async connect() {
     const transport = new StreamableHTTPClientTransport(new URL(this.options.url), {
-      requestInit: { headers: this.options.headers },
+      requestInit: { headers: this.options.headers, redirect: 'manual' },
+      fetch: createMCPGuardedFetch(this.options.fetch),
     })
 
     // 先用临时变量持有 client，connect 成功后再赋给 this.client。
@@ -57,6 +105,7 @@ export class MCPClient {
   }
 
   async callTool(name: string, args: Record<string, unknown>, context: ToolExecutionContext) {
+    assertMcpEndpointConstraints(this.endpointOrigin, context.constraints)
     if (!this.client) throw new Error('MCP client 未连接')
     // SDK 返回类型里的 content 是更严格的联合类型，这里统一按文本块抽取，做一次结构断言即可。
     const result = (await this.client.callTool(

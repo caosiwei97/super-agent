@@ -1,9 +1,9 @@
 import { canSpawnProcess } from '../../core/env.js'
-import type { ToolExecutionContext } from '../../core/tool-registry.js'
+import type { ToolDefinition, ToolExecutionContext } from '../../core/tool-registry.js'
 import type { Workspace } from '../../core/workspace.js'
 import { executeProcess } from '../../execution/process-executor.js'
 
-export function createShellTools(workspace: Workspace) {
+export function createShellTools(workspace: Workspace): ToolDefinition[] {
   return [
     {
       name: 'bash',
@@ -14,9 +14,31 @@ export function createShellTools(workspace: Workspace) {
         required: ['command'],
         additionalProperties: false,
       },
-      isConcurrencySafe: false,
-      isReadOnly: false,
-      requiresApproval: true,
+      // A free-form shell command can exercise every host capability. Until M3
+      // provides a sandbox backend, secret.read + network.egress makes this a
+      // PolicyEngine hard deny (including when CLI --yes is set).
+      getCapabilities: () => [
+        'process.execute',
+        'filesystem.read',
+        'filesystem.write',
+        'network.egress',
+        'secret.read',
+      ] as const,
+      getConstraints: () => ({
+        filesystemReadRoots: [workspace.root],
+        filesystemWriteRoots: [workspace.root],
+        requireSandbox: true,
+        maxResultChars: 3_000,
+      }),
+      // Root bounds are carried for the future sandbox backend. In M2 the
+      // kernel consumes requireSandbox and rejects before this host closure;
+      // cwd alone is deliberately not treated as a filesystem boundary.
+      supportedConstraintKeys: [
+        'filesystemReadRoots',
+        'filesystemWriteRoots',
+        'requireSandbox',
+      ],
+      isConcurrencySafe: () => false,
       maxResultChars: 3_000,
       execute: async ({ command }: { command: string }, context: ToolExecutionContext) => {
         if (!canSpawnProcess()) return '[bash 不可用] 当前环境不支持子进程'

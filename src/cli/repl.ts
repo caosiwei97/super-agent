@@ -34,9 +34,7 @@ export function printStartupStats(registry: ToolRegistry) {
 
   console.log(`已注册 ${allTools.length} 个工具：`)
   for (const tool of allTools) {
-    const flags = [tool.isConcurrencySafe ? '可并发' : '串行', tool.isReadOnly ? '只读' : '读写']
-    if (tool.requiresApproval || !tool.isReadOnly) flags.push('需审批')
-    console.log(`  - ${tool.name}（${flags.join(', ')}）`)
+    console.log(`  - ${tool.name}（能力、约束、并发与审批按调用动态判定）`)
   }
 
   console.log('\n=== 工具统计 ===')
@@ -44,6 +42,7 @@ export function printStartupStats(registry: ToolRegistry) {
   console.log(`  活跃工具: ${activeTools.length} 个`)
   console.log(`  延迟工具: ${allTools.length - activeTools.length} 个`)
   console.log(`  Token 估算: ~${estimate.active} (活跃) + ~${estimate.deferred} (延迟)`)
+  console.log('  权限策略: 每次调用由 Capability Resolver + Policy Engine 判定')
 }
 
 function printCompaction(phase: CompactionPhase, result: ContextCompactionResult) {

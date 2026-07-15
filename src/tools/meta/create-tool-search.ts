@@ -24,8 +24,8 @@ export function createToolSearch(registry: ToolRegistry) {
       required: ['query'],
       additionalProperties: false,
     },
-    isConcurrencySafe: true,
-    isReadOnly: true,
+    getCapabilities: () => [],
+    isConcurrencySafe: () => true,
     execute: async ({ query }: { query: string }) => {
       const results = registry.searchTools(query)
       if (results.length === 0) {

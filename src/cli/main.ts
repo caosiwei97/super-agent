@@ -66,7 +66,9 @@ export async function runCli(args: string[]) {
 
   const config = loadConfig()
   const workspace = new Workspace(config.workspaceRoot)
-  const registry = new ToolRegistry()
+  const registry = new ToolRegistry({
+    onLegacyWarning: (warning) => console.warn(`[Security] ${warning}`),
+  })
   let store: SessionStore | undefined
 
   try {

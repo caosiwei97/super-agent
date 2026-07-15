@@ -1,8 +1,10 @@
 import { lookup as dnsLookup } from 'node:dns/promises'
 import { isIP } from 'node:net'
-import type { ToolExecutionContext } from '../../core/tool-registry.js'
+import type { ToolDefinition, ToolExecutionContext } from '../../core/tool-registry.js'
+import type { ExecutionConstraints } from '../../security/capabilities.js'
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 const MAX_REDIRECTS = 3
+const MAX_RESULT_CHARS = 1_500
 
 export type DnsLookup = (hostname: string) => Promise<Array<{ address: string; family: number }>>
 
@@ -112,7 +114,7 @@ async function defaultLookup(hostname: string) {
   return dnsLookup(hostname, { all: true, verbatim: true })
 }
 
-export async function validatePublicUrl(rawUrl: string, lookup: DnsLookup = defaultLookup) {
+function parseNetworkUrl(rawUrl: string) {
   let url: URL
   try {
     url = new URL(rawUrl)
@@ -123,6 +125,44 @@ export async function validatePublicUrl(rawUrl: string, lookup: DnsLookup = defa
   if (!['http:', 'https:'].includes(url.protocol)) throw new Error('只允许 http:// 或 https:// URL')
   if (url.username || url.password) throw new Error('URL 不允许包含用户名或密码')
   if (url.port && !['80', '443'].includes(url.port)) throw new Error(`不允许访问端口 ${url.port}`)
+
+  return url
+}
+
+function networkPort(url: URL) {
+  return url.port ? Number(url.port) : url.protocol === 'https:' ? 443 : 80
+}
+
+/** Resolve the invocation boundary before policy evaluation; DNS remains an execution-time check. */
+export function getUrlConstraints(rawUrl: string): ExecutionConstraints {
+  const url = parseNetworkUrl(rawUrl)
+  return {
+    networkSchemes: [url.protocol.slice(0, -1)],
+    networkHosts: [url.hostname.replace(/^\[|\]$/g, '').toLowerCase()],
+    networkPorts: [networkPort(url)],
+    maxResultChars: MAX_RESULT_CHARS,
+  }
+}
+
+function assertUrlWithinConstraints(url: URL, constraints: ExecutionConstraints | undefined) {
+  if (!constraints?.networkSchemes
+    || !constraints.networkHosts
+    || !constraints.networkPorts
+    || constraints.maxResultChars === undefined) {
+    throw new Error('fetch_url 缺少已授权的网络执行约束')
+  }
+  const scheme = url.protocol.slice(0, -1)
+  const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase()
+  const port = networkPort(url)
+  if (!constraints.networkSchemes.includes(scheme)
+    || !constraints.networkHosts.includes(host)
+    || !constraints.networkPorts.includes(port)) {
+    throw new Error(`URL 超出已授权网络约束: ${scheme}://${host}:${port}`)
+  }
+}
+
+export async function validatePublicUrl(rawUrl: string, lookup: DnsLookup = defaultLookup) {
+  const url = parseNetworkUrl(rawUrl)
 
   const hostname = url.hostname.replace(/^\[|\]$/g, '').toLowerCase()
   if (hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local')) {
@@ -158,7 +198,7 @@ async function readLimitedText(response: Response, maxBytes: number) {
   return text + decoder.decode()
 }
 
-export function createWebTools(dependencies: WebToolDependencies = {}) {
+export function createWebTools(dependencies: WebToolDependencies = {}): ToolDefinition[] {
   const fetchImpl = dependencies.fetch || globalThis.fetch
   const lookup = dependencies.lookup || defaultLookup
   const maxBytes = dependencies.maxResponseBytes || MAX_RESPONSE_BYTES
@@ -174,13 +214,20 @@ export function createWebTools(dependencies: WebToolDependencies = {}) {
         required: ['url'],
         additionalProperties: false,
       },
-      isConcurrencySafe: true,
-      isReadOnly: true,
-      maxResultChars: 1_500,
+      getCapabilities: () => ['network.egress', 'external.read'] as const,
+      getConstraints: (input: unknown) => getUrlConstraints((input as { url: string }).url),
+      supportedConstraintKeys: ['networkSchemes', 'networkHosts', 'networkPorts'],
+      isConcurrencySafe: () => true,
+      maxResultChars: MAX_RESULT_CHARS,
       execute: async ({ url }: { url: string }, context: ToolExecutionContext) => {
         try {
-          let current = await validatePublicUrl(url, lookup)
+          let current = parseNetworkUrl(url)
+          assertUrlWithinConstraints(current, context.constraints)
+          current = await validatePublicUrl(current.href, lookup)
           for (let redirects = 0; ; redirects++) {
+            // The policy snapshot is immutable. Re-check every hop so a server
+            // cannot redirect an approved origin to an unapproved destination.
+            assertUrlWithinConstraints(current, context.constraints)
             const remaining = context.deadline - Date.now()
             if (remaining <= 0) throw new DOMException('Web request deadline exceeded', 'TimeoutError')
             const requestSignal = AbortSignal.any([
@@ -195,18 +242,21 @@ export function createWebTools(dependencies: WebToolDependencies = {}) {
 
             if (response.status >= 300 && response.status < 400 && response.headers.get('location')) {
               if (redirects >= maxRedirects) throw new Error(`重定向超过 ${maxRedirects} 次`)
-              current = await validatePublicUrl(new URL(response.headers.get('location')!, current).href, lookup)
+              const redirect = parseNetworkUrl(new URL(response.headers.get('location')!, current).href)
+              assertUrlWithinConstraints(redirect, context.constraints)
+              current = await validatePublicUrl(redirect.href, lookup)
               continue
             }
             if (!response.ok) return `请求失败：HTTP ${response.status}`
 
             const html = await readLimitedText(response, maxBytes)
-            return html
+            const text = html
               .replace(/<script[\s\S]*?<\/script>/gi, '')
               .replace(/<style[\s\S]*?<\/style>/gi, '')
               .replace(/<[^>]+>/g, ' ')
               .replace(/\s+/g, ' ')
               .trim() || '页面无文本内容'
+            return text.slice(0, context.constraints!.maxResultChars)
           }
         } catch (error) {
           if (context.signal.aborted) {

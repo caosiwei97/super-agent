@@ -6,6 +6,7 @@ import { describe, it } from 'node:test'
 import { Workspace, WorkspaceBoundaryError } from '../src/core/workspace.js'
 import {
   createWebTools,
+  getUrlConstraints,
   isPublicAddress,
   validatePublicUrl,
 } from '../src/tools/builtins/web-tools.js'
@@ -77,11 +78,13 @@ describe('web tool SSRF guard', () => {
     const context = {
       signal: new AbortController().signal,
       deadline: Date.now() + 60_000,
+      capabilities: ['network.egress', 'external.read'] as const,
+      constraints: getUrlConstraints('https://public.example'),
     }
 
     assert.match(
       String(await fetchTool.execute({ url: 'https://public.example' }, context)),
-      /禁止访问非公网地址/,
+      /超出已授权网络约束/,
     )
     assert.equal(fetches, 1)
     assert.match(
@@ -105,6 +108,8 @@ describe('web tool SSRF guard', () => {
     const execution = fetchTool.execute({ url: 'https://public.example' }, {
       signal: controller.signal,
       deadline: Date.now() + 60_000,
+      capabilities: ['network.egress', 'external.read'],
+      constraints: getUrlConstraints('https://public.example'),
     })
 
     const waitDeadline = Date.now() + 2_000

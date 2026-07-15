@@ -59,6 +59,14 @@ describe('bash tool cancellation', () => {
     const execution = bash.execute({ command }, {
       signal: controller.signal,
       deadline: Date.now() + 10_000,
+      capabilities: [
+        'filesystem.read',
+        'filesystem.write',
+        'network.egress',
+        'secret.read',
+        'process.execute',
+      ],
+      constraints: { requireSandbox: true },
     })
 
     childPid = await waitForPid(pidFile)
