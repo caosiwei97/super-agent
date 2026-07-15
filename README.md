@@ -1,6 +1,6 @@
 # Super-Agent
 
-一个刻意保持小体量、但逐步补齐生产边界的 TypeScript Agent 内核。当前已完成 M2 能力权限模型；它不是平台化框架，也尚未宣称 production-ready，但已经包含多步 Agent Loop、能力策略、耐久操作账本、统一取消、上下文双层压缩、可恢复会话和 MCP 延迟加载。
+一个刻意保持小体量、但逐步补齐生产边界的 TypeScript Agent 内核。当前已完成 M3 PR9 执行端口与生产启动门禁；它不是平台化框架，也尚未宣称 production-ready，但已经包含多步 Agent Loop、能力策略、耐久操作账本、Execution Router、统一取消、上下文双层压缩、可恢复会话和 MCP 延迟加载。
 
 ## 快速开始
 
@@ -80,6 +80,8 @@ pnpm build
 
 M2 完成时全量 `pnpm check` 为 173/173，`typecheck`、`build` 与 diff check 均通过。2026-07-15 的非 CI 真实 Key E2E 使用合成 `.env.synthetic`：敏感读取的模型、终端与 journal 结果均为 `[REDACTED]`；下一 step 的 `fetch_url` 在 `proposed` 后由 Policy 拒绝，未进入 `approved/started` 或工具 closure。真实 Key 未记录，临时 fixture 与 session 已清理。
 
+M3 PR9 完成时全量 `pnpm check` 为 185/185。production profile 在当前 macOS 上通过 `pnpm start` 实测为 `sandbox_platform_unsupported`、退出码 1，且在 MCP、Session 和 Provider 初始化前停止，没有创建 session；development profile 使用 `.env` 中真实 Key 完成 Provider → `calculator` → Router → durable operation → Provider 的两 step CLI 链路。GitHub 托管 MCP 的 44 个真实 schema 也完成 strict 编译验证；验证不打印 Key，临时 session 已清理。
+
 ## 运行链路
 
 ```mermaid
@@ -104,22 +106,28 @@ flowchart TD
     Catalog --> Resolve["Resolved Invocation\nCapabilities + Constraints\nSupported Keys + Concurrency + Source"]
     Resolve --> Policy["PolicyEngine\nHard Deny → Hook → Rule"]
     Policy -->|"deny"| Ledger
-    Policy -->|"allow / ask"| Gate["Constraint Preflight\nSupported Keys + Tightening Subset\nrequireSandbox Fail Closed"]
-    Gate -->|"reject"| Ledger
-    Gate -->|"validated"| Ledger
+    Policy -->|"allow / ask"| Gate["Constraint + Router Preflight\nSupported Keys + Tightening Subset\nLane Availability"]
+    Gate -->|"reject before approval"| Ledger
+    Gate -->|"frozen execution plan"| Ledger
     Ledger -->|"ask"| Approval["Approval Port\ninteractive / --yes"]
     Approval -->|"approve / deny"| Ledger
     Pipeline --> Ledger["Operation Ledger\nproposed → started → terminal"]
     Ledger --> Store
-    Ledger -->|"approved"| Start["Durable Start Gate\nConstraint Recheck + append started + fsync"]
-    Start -->|"durable ack"| Dispatcher["Internal Dispatcher\nPackage-internal + Frozen Snapshot\nDynamic Lock"]
-    Dispatcher --> Builtin["Builtin Tools\nFile / Web / Preview\nBash 当前禁用"]
-    Dispatcher --> MCP["MCP Tools\n运行时注册 + 延迟发现"]
-    Builtin --> Process["ProcessExecutor\nOutput Bound + Process Group Reaping"]
+    Ledger -->|"approved"| Start["Durable Start Gate\nSame attemptId + append started + fsync"]
+    Start -->|"durable ack"| Router["Execution Router\nSerializable Request + Out-of-band Control\nDefensive Plan Recheck"]
+    Router --> Host["Governed Host Lanes\nPure / Filesystem / Network / Preview / MCP"]
+    Router --> ProcessLane["Process Lane"]
+    ProcessLane --> Local["LocalExecutor\nDevelopment + no requireSandbox"]
+    ProcessLane --> Sandbox["SandboxExecutor Probe\nProduction, PR10 backend pending"]
+    Host --> Builtin["Builtin Tools\nFile / Web / Preview"]
+    Host --> MCP["MCP Tools\n运行时注册 + 延迟发现"]
+    Local --> Controller["ProcessController"]
+    Sandbox -.->|"PR10"| Controller
+    Controller --> Process["ProcessExecutor\nOutput Bound + Process Group Reaping"]
     Cancel -.-> Compact
     Cancel -.-> Model
     Cancel -.-> Pipeline
-    Cancel -.-> Dispatcher
+    Cancel -.-> Router
     Cancel -.-> MCP
     Cancel -.-> Process
     Pipeline --> Guard["Result Guard\n截断 + 结构化/文本嵌套脱敏"]
@@ -135,11 +143,12 @@ flowchart TD
 5. 完整 assistant response 先写入 journal；持久化失败时不创建 operation、不执行工具。
 6. Pipeline 严格校验输入，并只解析一次冻结的 resolved snapshot：capabilities、constraints、supported constraint keys、并发属性与结构化 tool source；Policy、Ledger、锁和执行共用该快照。
 7. Policy 按 hard deny → Hook → typed rule 固定顺序执行，约束只能求交收紧；只有 `ask` 进入人工审批，`--yes` 也不能批准 `deny`。
-8. Policy 的非 `deny` 决策先经过 Constraint Preflight；随后统一写入 `proposed`。Policy deny 或约束拒绝直接进入 `denied`，`allow` 或获批的 `ask` 才写入 `approved`；dispatch 边界再次校验约束后写入 durable `started`，只有获得 fsync ack 才调用工具 closure。不可执行约束不会触发人工审批。
-9. 只有 resolved 动态并发属性为安全的工具才可并行；写工具、bash 和未知 MCP 默认串行。
-10. terminal event 立即持久化并物化恰好一条 tool-result；未知结果进入 `uncertain`，不会伪造失败结果或继续模型 step。
-11. root signal 和 absolute deadline 贯穿模型、摘要、审批、锁、Pipeline、Web、MCP 与子进程；dispatch 前取消落 `cancelled`，durable `started` 后未知结果落 `uncertain`。
-12. 下一 step 前再次压缩；Agent Loop 结束后执行最后一次压缩并写恢复 checkpoint。
+8. Policy 的非 `deny` 决策先经过 Constraint 与 Router Preflight，冻结 execution kind、约束和后端计划；随后统一写入 `proposed`。Policy deny 或预检拒绝直接进入 `denied`，不会触发人工审批；`allow` 或获批的 `ask` 才写入 `approved`。
+9. Pipeline 在执行前生成唯一 `attemptId`；同一个值进入 durable `started`、可序列化 `ExecutionRequest` 和 `ToolExecutionContext`。只有获得 fsync ack 才允许 Router dispatch，dispatch 前再次防御性复核冻结计划；`AbortSignal` 通过独立 `ExecutionControl` 传递，不混入 JSON 请求。
+10. 只有 resolved 动态并发属性为安全的工具才可并行；写工具、bash 和未知 MCP 默认串行。
+11. terminal event 立即持久化并物化恰好一条 tool-result；未知结果进入 `uncertain`，不会伪造失败结果或继续模型 step。
+12. root signal 和 absolute deadline 贯穿模型、摘要、审批、锁、Pipeline、Router、Web、MCP 与子进程；dispatch 前取消落 `cancelled`，durable `started` 后未知结果落 `uncertain`。
+13. 下一 step 前再次压缩；Agent Loop 结束后执行最后一次压缩并写恢复 checkpoint。
 
 因此，会话文件同时保留两种视图：原始 `messages` 事件用于审计，最新 checkpoint 用于恢复压缩后的工作上下文。旧版分离的 `message`/`budget` JSONL 仍可继续读取。
 
@@ -164,7 +173,7 @@ flowchart TD
 | `src/agent/loop-detection.ts` | 每次 Agent Loop 独立的重复、乒乓和无进展检测 |
 | `src/context/` | Prompt 组装与上下文压缩 |
 | `src/core/tool-registry.ts` | 公开只读工具 Catalog、严格 schema 校验、resolved snapshot 与资源生命周期；不公开 dispatch |
-| `src/execution/` | Operation Ledger、Tool Execution Pipeline、恢复 gate、结果物化与显式对账 |
+| `src/execution/` | Operation Ledger、Tool Execution Pipeline、Execution Router、Local/Sandbox Executor、恢复 gate、结果物化与显式对账 |
 | `src/security/` | 动态能力、可执行约束、typed policy rules 与 hard-deny 外传门禁 |
 | `src/core/workspace.ts` | 文件工具的工作区路径与 symlink 边界 |
 | `src/session/store.ts` | 版本化 append-only JSONL、单写者锁、durable append 和 checkpoint 恢复 |
@@ -192,6 +201,11 @@ flowchart TD
 | `CONTEXT_MAX_SUMMARY_CHARS` | `1200` | 摘要最大字符数 |
 | `SUPER_AGENT_WORKSPACE` | 当前目录 | 文件、Shell 和预览工具的工作区 |
 | `SUPER_AGENT_AUTO_APPROVE` | `false` | 自动批准 Policy 的 `ask`；不能越过 hard deny 与执行约束 |
+| `SUPER_AGENT_EXECUTION_PROFILE` | `development` | `development` 使用 Local process backend；`production` 只接受 Sandbox backend |
+| `SUPER_AGENT_BWRAP_PATH` | `/usr/bin/bwrap` | production Linux 的 bwrap 绝对路径；PR10 前探针仍返回 unavailable |
+| `SUPER_AGENT_SANDBOX_ROOTFS` | 无 | production sandbox rootfs 绝对路径 |
+| `SUPER_AGENT_SANDBOX_SECCOMP_PROFILE` | 无 | production seccomp profile 绝对路径 |
+| `SUPER_AGENT_SANDBOX_CGROUP_ROOT` | 无 | production cgroup 根目录绝对路径 |
 | `GITHUB_PERSONAL_ACCESS_TOKEN` | 无 | GitHub MCP 的 PAT；未配置时不接入 |
 
 配置 PAT 后直接连接 GitHub 官方托管的远程 MCP，不启动本地 MCP 进程，也不需要安装任何 binary。缺少可信能力元数据的 MCP 工具按 `network.egress + external.write`、串行、需审批处理，并绑定 endpoint 的 scheme、host 和 port；Policy 使用结构化 server identity，不从工具名称猜测来源。
@@ -206,14 +220,14 @@ flowchart TD
 - 同一调用或 batch 的 `secret.read + network.egress` 会 hard deny；会话中已经成功的敏感读取也会阻止后续网络外传。旧 journal 的 `legacy.read` 保守映射为 `secret.read`。
 - `secret.read` 的工具结果按能力整体替换为 `[REDACTED]`，不进入模型上下文、终端 observer 或 durable journal；带供应商/环境前缀的常见 secret 字段也会被通用结果守卫识别。
 - Constraint Gate 在开始执行前检查约束支持范围与收紧关系；缺少可执行支持、约束交集为空或 `requireSandbox` 无后端时均 fail closed。
-- Shell 按最坏情况声明 filesystem、process、network 和 secret 能力，并要求 sandbox；M3 前没有 sandbox backend，因此 `bash` 当前禁用，`--yes` 不能绕过。
+- Shell 按最坏情况声明 filesystem、process、network 和 secret 能力，并要求 sandbox；PR9 只实现 production probe，PR10 前没有可用 sandbox backend，因此 `bash` 当前仍禁用，`--yes` 不能绕过。
 - 未知 MCP 默认声明 `network.egress + external.write`，绑定 endpoint origin、拒绝 HTTP redirect、串行执行并要求审批。
 - GitHub token 只发送到代码中固定的官方 HTTPS MCP 地址。
 - 工具结果长度、文件大小、搜索文件数和匹配数均有上限。
 - Session journal 使用固定 lock inode 上的内核单写者锁、单调事件序号、`0700/0600` 权限和显式 durable append；旧版无版本 JSONL 仍可恢复。
 - 每轮取消与 deadline 贯穿模型、摘要、审批、锁、Web、MCP 和工具；POSIX Shell 取消/超时会回收独立进程组，Windows 当前仅保证直接子进程终止。
 
-当前实现仍不宣称提供 OS 级沙箱、Filesystem/Network Broker 或生产 Execution Router。要求 sandbox 的调用会直接拒绝，不会降级到宿主执行；DNS 校验与实际连接之间仍存在 DNS rebinding 的理论窗口。Pipeline/Recovery 已提供 capability policy、durable-start、unknown-outcome fail-closed、流式 Commit Guard、统一取消、Crash Matrix 和人工对账，但不宣称下游通用 exactly-once。生产沙箱与 Broker、RE2/worker 隔离、模型 tokenizer、JSONL 归档/轮转和指标系统仍属于后续里程碑。
+当前实现已经提供生产 profile、Execution Router、可序列化请求/控制分离和 Local/Sandbox 执行端口，但仍不宣称具备 OS 级沙箱或 Filesystem/Network Broker。production 在 PR10 完成前会启动失败；要求 sandbox 的调用会直接拒绝，不会降级到宿主执行。DNS 校验与实际连接之间仍存在 DNS rebinding 的理论窗口。Pipeline/Recovery 已提供 capability policy、durable-start、unknown-outcome fail-closed、流式 Commit Guard、统一取消、Crash Matrix 和人工对账，但不宣称下游通用 exactly-once。Linux bwrap/seccomp/cgroup、Broker、RE2/worker 隔离、模型 tokenizer、JSONL 归档/轮转和指标系统仍属于后续里程碑。
 
 循环检测的细节见 [`src/agent/loop-detection.md`](src/agent/loop-detection.md)。
 

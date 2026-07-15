@@ -6,7 +6,7 @@
 >
 > 最后更新：2026-07-15
 >
-> 实施状态：M0、M1A、M1B、M1C、M2 已完成；下一阶段为 M3（Execution Isolation）
+> 实施状态：M0、M1A、M1B、M1C、M2、M3 PR9 已完成；下一阶段为 M3 PR10（Linux Sandbox 与 Broker）
 
 ## 1. 背景与结论
 
@@ -59,7 +59,7 @@ Super-Agent 当前已经具备多步 Agent Loop、能力策略、耐久操作账
 ### 4.2 剩余 P0 差距
 
 - M2 已移除内置与 MCP 工具对 `isReadOnly` 权限语义的依赖，并让 `--yes` 只能批准 `ask`。
-- 当前尚无真正的进程、文件系统、网络和资源隔离。为避免静默降级，要求 `requireSandbox` 的调用一律在 dispatch 前拒绝；`bash` 因此在 M3 前不可用。
+- M3 PR9 已建立 Execution Router、Local/Sandbox 执行端口和 production 启动探针；当前仍无真正的进程、文件系统、网络和资源隔离。为避免静默降级，production 在 PR10 前启动失败，`requireSandbox` 调用在 dispatch 前拒绝，`bash` 仍不可用。
 
 ### 4.3 P1 差距
 
@@ -374,7 +374,11 @@ Hook 必须具备超时和取消信号。Hook 异常默认不能扩大权限。
 
 ```ts
 interface ExecutionRouter {
-  dispatch(request: ExecutionRequest): Promise<ExecutionResult>
+  dispatch(request: ExecutionRequest, control: ExecutionControl): Promise<ExecutionResult>
+}
+
+interface ExecutionControl {
+  signal: AbortSignal
 }
 ```
 
@@ -798,34 +802,39 @@ PR7 验收：
 - Preview 只绑定策略批准的 `127.0.0.1:port` 和 `app/` 读取根；每个 HTTP 请求都重新解析 realpath，读取前对敏感目标、敏感 symlink 与越界路径返回 `403`。
 - Fetch 把初始 URL 固化为 scheme/host/port 约束，在 DNS/fetch 前验证，并对每一跳 redirect 重新执行 URL 约束和公网地址检查；M2 仍不把该检查扩大解释为已经消除 DNS rebinding。
 - 未知 MCP 使用结构化 `{ kind: 'mcp', serverName }` provenance，声明 `network.egress + external.write`，绑定 transport endpoint 的 scheme、host、port，并强制 manual redirect 后拒绝全部 HTTP 3xx；server rule 不依赖工具名前缀反向猜测身份。
-- `bash` 按自由命令最坏情况声明 `process.execute + filesystem.read + filesystem.write + network.egress + secret.read`。它既触发外传 hard deny，又要求 `requireSandbox`；M3 前一律拒绝，`--yes` 不能绕过。
+- `bash` 按自由命令最坏情况声明 `process.execute + filesystem.read + filesystem.write + network.egress + secret.read`。它既触发外传 hard deny，又要求 `requireSandbox`；PR10 前一律拒绝，`--yes` 不能绕过。
 - `--yes` 只自动确认 `ask`，不能越过 hard deny、约束支持检查、约束子集检查、Operation Ledger 或 sandbox 要求。
 - 任意 `secret.read` 结果在物化到模型上下文、终端 observer 和 durable journal 前整体替换为 `[REDACTED]`；通用结果守卫同时识别带供应商或环境前缀的常见 secret 字段。
 
-当前 M2 运行架构：
+当前 M3 PR9 运行架构：
 
 ```mermaid
 flowchart LR
     Loop["Agent Loop<br/>完整 Tool Call 已持久化"] --> Pipeline["ToolExecutionPipeline<br/>唯一公开运行时入口"]
     Pipeline --> Catalog["ToolRegistry Catalog<br/>Strict Schema + Definition"]
-    Catalog --> Snapshot["Frozen Resolved Invocation<br/>Capabilities / Constraints<br/>Supported Keys / Concurrency / Tool Source"]
+    Catalog --> Snapshot["Frozen Resolved Invocation<br/>Capabilities / Constraints / Execution Kind<br/>Supported Keys / Concurrency / Tool Source"]
     Snapshot --> Policy["PolicyEngine<br/>Hard Deny → Tightening Hook → Typed Rule"]
     Policy -->|"deny"| Ledger["Operation Ledger<br/>proposed → terminal"]
-    Policy -->|"allow / ask"| Gate["Constraint Preflight<br/>Supported + Tightening Subset<br/>requireSandbox Fail Closed"]
+    Policy -->|"allow / ask"| Gate["Constraint + Router Preflight<br/>Supported + Tightening Subset<br/>Backend Availability"]
     Gate -->|"reject"| Ledger
-    Gate -->|"validated"| Ledger
+    Gate -->|"frozen plan"| Ledger
     Ledger -->|"ask"| Approval["Approval Port<br/>interactive / --yes"]
     Approval -->|"approve / deny"| Ledger
-    Ledger -->|"approved"| Start["Durable Start Gate<br/>Constraint Recheck + append started + fsync"]
-    Start -->|"durable ack"| Dispatcher["Internal Dispatcher<br/>Package-internal + Dynamic Lock"]
-    Dispatcher --> Local["Explicit Local Tools<br/>File / Web / Preview / Pure"]
-    Dispatcher --> MCP["Remote MCP<br/>Endpoint-bound + Structured Source"]
-    Local --> Result["Result Guard + Terminal Event"]
+    Ledger -->|"approved"| Start["Durable Start Gate<br/>Same attemptId + append started + fsync"]
+    Start -->|"durable ack"| Router["Execution Router<br/>JSON Request + Out-of-band Control<br/>Defensive Plan Recheck"]
+    Router --> Host["Governed Host Lanes<br/>Pure / Filesystem / Network / Preview / MCP"]
+    Router --> Process["Process Lane"]
+    Process --> Local["LocalExecutor<br/>Development only"]
+    Process --> Sandbox["SandboxExecutor Probe<br/>Production, unavailable until PR10"]
+    Host --> MCP["Remote MCP<br/>Endpoint-bound + Structured Source"]
+    Host --> Result["Result Guard + Terminal Event"]
+    Local --> Result
+    Sandbox --> Result
     MCP --> Result
     Result --> Ledger
 ```
 
-该图只描述 M2 已实现路径。M3 的 Sandbox Backend、Filesystem/Network Broker 与生产 Execution Router 尚未实现；M2 通过拒绝 `requireSandbox` 保持 fail closed，而不是假设这些边界已经存在。
+该图描述 PR9 已实现边界。Host lanes 仍是受治理的 Node closure，并不等同于 Broker；`SandboxExecutor` 也只实现严格配置和启动探针，始终报告 unavailable。Linux bwrap/seccomp/cgroup、Filesystem/Network Broker、DNS pinned connection 与安全写入属于 PR10，当前不会用 Local backend 冒充 production 隔离。
 
 M2 退出条件：
 
@@ -835,7 +844,7 @@ M2 退出条件：
 - 全量 `pnpm check` 通过，173/173 测试通过；`pnpm typecheck`、`pnpm build` 与 `git diff --check` 通过。
 - 本地手工真实 Key E2E（2026-07-15，OpenAI-compatible Provider，非 CI）通过：Provider 分两个 step 先调用 `read_file` 读取仅含合成测试值的 `.env.synthetic`，Operation 以 `filesystem.read + secret.read` 完成 `succeeded`，模型、终端与 journal 结果均为 `[REDACTED]`；随后调用 `fetch_url`，其 `network.egress + external.read` Operation 只到 `proposed → denied(policy_denied)`，没有 `approved/started`、没有进入工具 closure。验证不记录真实 Key，临时 fixture 与 session 均已清理。
 
-M2 已完成，下一阶段进入 M3 Execution Isolation。
+M3 PR9 已完成，下一阶段进入 PR10 Linux Sandbox 与 Broker 加固。
 
 ### 7.7 M3：执行隔离
 
@@ -848,9 +857,12 @@ M2 已完成，下一阶段进入 M3 Execution Isolation。
 
 #### PR 9：执行端口与进程控制
 
-- 新增 `src/execution/executor.ts`、`local-executor.ts`、`sandbox-executor.ts`、`process-controller.ts`。
-- ExecutionRequest 必须可序列化，并携带 signal、deadline、idempotencyKey、filesystem/network/resource constraints。
-- 生产 profile 不支持沙箱时启动失败，不允许静默回退 Local Backend。
+- 已新增 `src/execution/executor.ts`、`execution-router.ts`、`local-executor.ts`、`sandbox-executor.ts`、`process-controller.ts`。
+- `ExecutionRequest` 是 JSON-only envelope，携带 operation/attempt identity、deadline、idempotencyKey、capabilities 与执行约束；不可序列化的 `AbortSignal` 通过独立 `ExecutionControl` 传递。
+- execution kind 固定为 `pure/filesystem/network/preview/process/mcp`；内置与 MCP 全部显式声明。兼容期 development 可推断 legacy kind，production 直接拒绝。
+- Router preflight 在人工审批前冻结后端计划；同一 `attemptId` 贯穿 durable `started`、`ExecutionRequest` 与 `ToolExecutionContext`，dispatch 前再次复核计划。
+- development 只在约束允许时使用 Local Backend；production 只接受 Sandbox Backend。平台或探针不支持时在 MCP、Session、Provider 初始化前启动失败，不允许静默回退。
+- PR9 已完成：全量 `pnpm check` 185/185、`pnpm build` 与 diff check 通过；production macOS `pnpm start` 实测退出码 1、未创建 session。development 使用真实 Key 完成 Provider → calculator → Router → durable operation → Provider 两 step；GitHub MCP 44 个真实 schema 通过独立 strict JSON Schema 2020-12 编译。Key 未打印，临时 session 已清理。
 
 #### PR 10：Linux Sandbox 与 Broker 加固
 
