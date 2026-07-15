@@ -1,4 +1,5 @@
 import type { Workspace } from '../../core/workspace.js'
+import type { FilesystemBroker } from '../../execution/filesystem-broker.js'
 import { utilityTools } from './utility-tools.js'
 import { createFileTools } from './file-tools.js'
 import { createShellTools } from './shell-tools.js'
@@ -7,13 +8,14 @@ import { createPreviewTools } from './preview-tools.js'
 
 export interface BuiltinToolOptions {
   workspace: Workspace
+  filesystem?: FilesystemBroker
   web?: WebToolDependencies
 }
 
 export function createBuiltinTools(options: BuiltinToolOptions) {
   return [
     ...utilityTools,
-    ...createFileTools(options.workspace),
+    ...createFileTools(options.workspace, { filesystem: options.filesystem }),
     ...createShellTools(options.workspace),
     ...createWebTools(options.web),
     ...createPreviewTools(options.workspace),

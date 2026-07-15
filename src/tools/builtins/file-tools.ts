@@ -1,8 +1,11 @@
-import { readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve } from 'node:path'
-import fg from 'fast-glob'
 import type { ToolDefinition, ToolExecutionContext } from '../../core/tool-registry.js'
 import type { Workspace } from '../../core/workspace.js'
+import { FilesystemBroker } from '../../execution/filesystem-broker.js'
+import {
+  InvalidRegexPatternError,
+  RegexWorkerMatcher,
+} from '../../execution/regex-worker.js'
 import {
   isPathWithin,
   isSensitivePath,
@@ -16,6 +19,62 @@ const MAX_MATCHES = 50
 const MAX_GLOB_RESULTS = 500
 const MAX_DIRECTORY_ENTRIES = 500
 const MAX_MATCH_LINE_CHARS = 500
+const MAX_SEARCH_ENTRIES = 20_000
+const MAX_GLOB_PATTERN_CHARS = 500
+const GLOB_HARD_TIMEOUT_MS = 1_000
+
+function matchGlobSegment(pattern: string, value: string, deadline: number) {
+  let patternIndex = 0
+  let valueIndex = 0
+  let lastStar = -1
+  let retryValueIndex = -1
+  let steps = 0
+  while (valueIndex < value.length) {
+    if ((steps++ & 0xff) === 0 && Date.now() >= deadline) {
+      throw new DOMException('glob 硬超时', 'TimeoutError')
+    }
+    const token = pattern[patternIndex]
+    if (token === '?' || token === value[valueIndex]) {
+      patternIndex++
+      valueIndex++
+    } else if (token === '*') {
+      lastStar = patternIndex++
+      retryValueIndex = valueIndex
+    } else if (lastStar >= 0) {
+      patternIndex = lastStar + 1
+      valueIndex = ++retryValueIndex
+    } else {
+      return false
+    }
+  }
+  while (pattern[patternIndex] === '*') patternIndex++
+  return patternIndex === pattern.length
+}
+
+/** Linear-state glob matcher for the deliberately small *, ** and ? grammar. */
+function matchesGlob(pattern: string, candidate: string, deadline: number) {
+  const patterns = pattern.replaceAll('\\', '/').split('/').filter((part) => part !== '')
+  const values = candidate.replaceAll('\\', '/').split('/').filter((part) => part !== '')
+  const memo = new Map<string, boolean>()
+  const visit = (patternIndex: number, valueIndex: number): boolean => {
+    const key = `${patternIndex}:${valueIndex}`
+    const cached = memo.get(key)
+    if (cached !== undefined) return cached
+    let result: boolean
+    if (patternIndex === patterns.length) result = valueIndex === values.length
+    else if (patterns[patternIndex] === '**') {
+      result = visit(patternIndex + 1, valueIndex)
+        || (valueIndex < values.length && visit(patternIndex, valueIndex + 1))
+    } else {
+      result = valueIndex < values.length
+        && matchGlobSegment(patterns[patternIndex]!, values[valueIndex]!, deadline)
+        && visit(patternIndex + 1, valueIndex + 1)
+    }
+    memo.set(key, result)
+    return result
+  }
+  return visit(0, 0)
+}
 
 function readCapabilities(target: string, workspace: Workspace) {
   return isSensitivePath(target, workspace.root)
@@ -40,7 +99,13 @@ function assertSensitiveRead(context: ToolExecutionContext, target: string, work
   }
 }
 
-export function createFileTools(workspace: Workspace) {
+export interface FileToolDependencies {
+  readonly filesystem?: FilesystemBroker
+  readonly regexTimeoutMs?: number
+}
+
+export function createFileTools(workspace: Workspace, dependencies: FileToolDependencies = {}) {
+  const filesystem = dependencies.filesystem ?? new FilesystemBroker(workspace.root)
   const readFileTool: ToolDefinition = {
     name: 'read_file',
     executionKind: 'filesystem',
@@ -65,11 +130,9 @@ export function createFileTools(workspace: Workspace) {
       const resolved = workspace.resolveExisting(path)
       assertConstrainedPath(context, 'filesystemReadRoots', resolved)
       assertSensitiveRead(context, resolved, workspace)
-      if ((await stat(resolved)).size > MAX_EDIT_FILE_BYTES) {
-        return `文件超过 ${MAX_EDIT_FILE_BYTES} 字节读取限制`
-      }
-      return readFile(resolved, 'utf-8')
+      return filesystem.readText(resolved, MAX_EDIT_FILE_BYTES, context)
     },
+    dispose: () => filesystem.close(),
   }
 
   const writeFileTool: ToolDefinition = {
@@ -97,7 +160,7 @@ export function createFileTools(workspace: Workspace) {
       }
       const resolved = workspace.resolveForWrite(path)
       assertConstrainedPath(context, 'filesystemWriteRoots', resolved)
-      await writeFile(resolved, content, 'utf-8')
+      await filesystem.writeTextAtomic(resolved, content, MAX_EDIT_FILE_BYTES, context)
       return `已写入 ${content.length} 字符到 ${path}`
     },
   }
@@ -125,11 +188,14 @@ export function createFileTools(workspace: Workspace) {
       const directory = workspace.resolveExisting(path)
       assertConstrainedPath(context, 'filesystemReadRoots', directory)
       assertSensitiveRead(context, directory, workspace)
-      const entries = await readdir(directory, { withFileTypes: true })
-      const rendered = entries
+      const entries = await filesystem.listDirectory(directory, MAX_DIRECTORY_ENTRIES, context)
+      const canReadSecrets = context.capabilities?.includes('secret.read') === true
+      const visible = entries.filter((entry) => canReadSecrets
+        || !isSensitivePath(join(directory, entry.name), workspace.root))
+      const rendered = [...visible]
         .sort((left, right) => left.name.localeCompare(right.name))
         .slice(0, MAX_DIRECTORY_ENTRIES)
-        .map((entry) => `${entry.isDirectory() ? '[DIR]' : '[FILE]'} ${entry.name}`)
+        .map((entry) => `${entry.kind === 'directory' ? '[DIR]' : '[FILE]'} ${entry.name}`)
         .join('\n')
       return entries.length > MAX_DIRECTORY_ENTRIES ? `${rendered}\n... (结果已截断)` : rendered
     },
@@ -173,10 +239,7 @@ export function createFileTools(workspace: Workspace) {
       assertConstrainedPath(context, 'filesystemReadRoots', resolved)
       assertConstrainedPath(context, 'filesystemWriteRoots', resolved)
       assertSensitiveRead(context, resolved, workspace)
-      if ((await stat(resolved)).size > MAX_EDIT_FILE_BYTES) {
-        return `文件超过 ${MAX_EDIT_FILE_BYTES} 字节编辑限制`
-      }
-      const content = await readFile(resolved, 'utf-8')
+      const content = await filesystem.readText(resolved, MAX_EDIT_FILE_BYTES, context)
       const count = content.split(old_string).length - 1
       if (count === 0) return '未找到匹配内容，请检查空格和换行'
       if (count > 1) return `找到 ${count} 处匹配，请提供更多上下文使 old_string 唯一`
@@ -185,7 +248,7 @@ export function createFileTools(workspace: Workspace) {
       if (Buffer.byteLength(updated, 'utf-8') > MAX_EDIT_FILE_BYTES) {
         return `替换后的文件超过 ${MAX_EDIT_FILE_BYTES} 字节限制`
       }
-      await writeFile(resolved, updated, 'utf-8')
+      await filesystem.writeTextAtomic(resolved, updated, MAX_EDIT_FILE_BYTES, context)
       return `已替换 ${path} 中的内容（${old_string.length} → ${new_string.length} 字符）`
     },
   }
@@ -219,25 +282,35 @@ export function createFileTools(workspace: Workspace) {
     isConcurrencySafe: () => true,
     maxResultChars: 3_000,
     execute: async ({ pattern, path = '.' }: { pattern: string; path?: string }, context) => {
+      if (pattern.length === 0 || pattern.length > MAX_GLOB_PATTERN_CHARS) {
+        return `glob pattern 长度必须为 1..${MAX_GLOB_PATTERN_CHARS}`
+      }
       if (isAbsolute(pattern) || pattern.split(/[\\/]/).includes('..')) {
         return 'glob pattern 不允许使用绝对路径或 .. 跳出搜索目录'
+      }
+      if (/[\[\]{}()!+@]/.test(pattern)) {
+        return 'glob pattern 当前只支持字面路径、*、** 和 ?'
       }
       const base = workspace.resolveExisting(path)
       assertConstrainedPath(context, 'filesystemReadRoots', base)
       assertSensitiveRead(context, base, workspace)
-      const results = await fg(pattern, {
-        cwd: base,
-        ignore: ['node_modules/**', '.git/**'],
-        dot: true,
-        onlyFiles: true,
-        followSymbolicLinks: false,
-        unique: true,
+      const globDeadline = Math.min(context.deadline, Date.now() + GLOB_HARD_TIMEOUT_MS)
+      const globControl = { signal: context.signal, deadline: globDeadline }
+      const files = await filesystem.walkFiles(base, {
+        maxFiles: MAX_SEARCH_ENTRIES,
+        maxEntries: MAX_SEARCH_ENTRIES,
+        excludeDirectoryNames: ['node_modules', '.git'],
+      }, globControl)
+      const results = files.map((file) => relative(base, file)).filter((file) => {
+        context.signal.throwIfAborted()
+        if (Date.now() >= globDeadline) {
+          throw new DOMException('glob 硬超时', 'TimeoutError')
+        }
+        return matchesGlob(pattern, file, globDeadline)
       })
       const canReadSecrets = context.capabilities?.includes('secret.read') === true
-      const visible = results.filter((item) => {
-        const target = workspace.resolveExisting(join(base, item))
-        return canReadSecrets || !isSensitivePath(target, workspace.root)
-      })
+      const visible = results.filter((item) => canReadSecrets
+        || !isSensitivePath(join(base, item), workspace.root))
       if (visible.length === 0) return `没有找到匹配 "${pattern}" 的文件`
       const sorted = visible.sort()
       const suffix = sorted.length > MAX_GLOB_RESULTS ? '\n... (结果已截断)' : ''
@@ -248,7 +321,7 @@ export function createFileTools(workspace: Workspace) {
   const grepTool: ToolDefinition = {
     name: 'grep',
     executionKind: 'filesystem',
-    description: '在工作区文件中按正则表达式搜索，返回最多 50 条匹配',
+    description: '在隔离 worker 中按正则表达式搜索工作区文件，硬超时并返回最多 50 条匹配',
     parameters: {
       type: 'object',
       properties: {
@@ -271,57 +344,64 @@ export function createFileTools(workspace: Workspace) {
     execute: async ({ pattern, path = '.' }: { pattern: string; path?: string }, context) => {
       if (pattern.length > 200) return '正则表达式过长（最大 200 字符）'
 
-      let regex: RegExp
+      let matcher: RegexWorkerMatcher
       try {
-        regex = new RegExp(pattern, 'i')
-      } catch {
-        return `无效的正则表达式: "${pattern}"`
+        matcher = await RegexWorkerMatcher.create(pattern, {
+          signal: context.signal,
+          deadline: context.deadline,
+          timeoutMs: dependencies.regexTimeoutMs,
+        })
+      } catch (error) {
+        if (error instanceof InvalidRegexPatternError) return `无效的正则表达式: "${pattern}"`
+        throw error
       }
 
-      const base = workspace.resolveExisting(path)
-      assertConstrainedPath(context, 'filesystemReadRoots', base)
-      assertSensitiveRead(context, base, workspace)
-      const baseStat = await stat(base)
-      const files = baseStat.isFile()
-        ? [base]
-        : (await fg('**/*', {
-            cwd: base,
-            absolute: true,
-            onlyFiles: true,
-            followSymbolicLinks: false,
-            ignore: ['node_modules/**', '.git/**', 'dist/**'],
-          })).slice(0, MAX_SEARCH_FILES)
-      const matches: string[] = []
+      try {
+        const base = workspace.resolveExisting(path)
+        assertConstrainedPath(context, 'filesystemReadRoots', base)
+        assertSensitiveRead(context, base, workspace)
+        const files = await filesystem.walkFiles(base, {
+          maxFiles: MAX_SEARCH_FILES,
+          maxEntries: MAX_SEARCH_ENTRIES,
+          excludeDirectoryNames: ['node_modules', '.git', 'dist'],
+        }, context)
+        const matches: string[] = []
 
-      for (const file of files) {
-        if (matches.length >= MAX_MATCHES) break
-        if (!context.capabilities?.includes('secret.read') && isSensitivePath(file, workspace.root)) continue
-        const fileStat = await stat(file)
-        if (fileStat.size > MAX_SEARCH_FILE_BYTES) continue
-
-        let content: string
-        try {
-          content = await readFile(file, 'utf-8')
-        } catch {
-          continue
-        }
-
-        const lines = content.split('\n')
-        for (let index = 0; index < lines.length; index++) {
-          // Bound regex work per line; matching output is truncated separately.
-          if (!regex.test(lines[index].slice(0, 10_000))) continue
-          const line = lines[index].trimEnd()
-          const preview = line.length > MAX_MATCH_LINE_CHARS
-            ? `${line.slice(0, MAX_MATCH_LINE_CHARS)}…`
-            : line
-          matches.push(`${relative(baseStat.isFile() ? workspace.root : base, file)}:${index + 1}: ${preview}`)
+        for (const file of files) {
           if (matches.length >= MAX_MATCHES) break
-        }
-      }
+          context.signal.throwIfAborted()
+          if (Date.now() >= context.deadline) {
+            throw new DOMException('grep deadline 已到期', 'TimeoutError')
+          }
+          if (!context.capabilities?.includes('secret.read') && isSensitivePath(file, workspace.root)) continue
 
-      if (matches.length === 0) return `没有找到匹配 "${pattern}" 的内容`
-      const suffix = matches.length >= MAX_MATCHES ? '\n... (结果已截断)' : ''
-      return matches.join('\n') + suffix
+          let content: string
+          try {
+            content = await filesystem.readText(file, MAX_SEARCH_FILE_BYTES, context)
+          } catch (error) {
+            if (context.signal.aborted || Date.now() >= context.deadline) throw error
+            continue
+          }
+
+          const remaining = MAX_MATCHES - matches.length
+          const matchedLines = await matcher.match(content, remaining)
+          const lines = content.split('\n')
+          for (const index of matchedLines) {
+            if (index >= lines.length) throw new Error('Regex worker 返回越界行号')
+            const line = lines[index].trimEnd()
+            const preview = line.length > MAX_MATCH_LINE_CHARS
+              ? `${line.slice(0, MAX_MATCH_LINE_CHARS)}…`
+              : line
+            matches.push(`${relative(files.length === 1 && files[0] === base ? workspace.root : base, file)}:${index + 1}: ${preview}`)
+          }
+        }
+
+        if (matches.length === 0) return `没有找到匹配 "${pattern}" 的内容`
+        const suffix = matches.length >= MAX_MATCHES ? '\n... (结果已截断)' : ''
+        return matches.join('\n') + suffix
+      } finally {
+        await matcher.close()
+      }
     },
   }
 
