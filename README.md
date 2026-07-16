@@ -1,6 +1,6 @@
 # Super-Agent
 
-一个刻意保持小体量、但逐步补齐生产边界的 TypeScript Agent 内核。当前 M3 PR10 已实现 Linux Sandbox、Filesystem/Network Broker 与正则 worker 的代码边界，但目标 Linux 真实集成尚未验收；它不是平台化框架，也尚未宣称 production-ready。
+一个刻意保持小体量、但逐步补齐生产边界的 TypeScript Agent 内核。M3 PR10B 已把首个 production process lane 收敛为固定 `workspace_inspect`、verified staging、per-operation cgroup 与 crash-safe bwrap 握手，并在 arm64 Linux 上完成公开执行矩阵和真实 Key E2E。x86_64 目标内核与真实 systemd crash attestation 仍待发布环境验收；它不是平台化框架，也尚未宣称 production-ready。
 
 ## 快速开始
 
@@ -13,7 +13,7 @@ super-agent --help
 
 Session 单写者使用原生内核文件锁。源码安装需要 Python 与 C/C++ 编译工具链；锁语义面向本机文件系统，不支持把 session 目录放在 NFS 等远程文件系统上。
 
-首次运行前从 `.env-example` 创建 `.env`：macOS/Linux 使用 `cp .env-example .env`，PowerShell 使用 `Copy-Item .env-example .env`。
+首次运行前从 `.env-example` 创建 `.env`：macOS/Linux 使用 `cp .env-example .env`，PowerShell 使用 `Copy-Item .env-example .env`。这适合 development；production 必须把 Provider Key/EnvironmentFile 放在 workspace 外，并令 `SUPER_AGENT_WORKSPACE` 指向不含 `.env`、凭据、symlink、hardlink 或特殊文件的独立目录。
 
 包提供两套互不混淆的入口：
 
@@ -82,9 +82,11 @@ M2 完成时全量 `pnpm check` 为 173/173，`typecheck`、`build` 与 diff che
 
 M3 PR9 完成时全量 `pnpm check` 为 185/185。production profile 在当前 macOS 上通过 `pnpm start` 实测为 `sandbox_platform_unsupported`、退出码 1，且在 MCP、Session 和 Provider 初始化前停止，没有创建 session；development profile 使用 `.env` 中真实 Key 完成 Provider → `calculator` → Router → durable operation → Provider 的两 step CLI 链路。GitHub 托管 MCP 的 44 个真实 schema 也完成 strict 编译验证；验证不打印 Key，临时 session 已清理。
 
-M3 PR10 当前全量检查为 226 tests、221 pass、5 skip、0 fail，typecheck 通过；5 项均为本机 macOS 无法执行的 Linux-only `/proc/self/fd`、bwrap、seccomp、cgroup 真实集成。因此 PR10 代码边界已实现，但不能据此把 M3 标记完成，仍需在目标 Linux 环境运行真实 integration gate。
+M3 PR10 的历史基线为 226 tests、221 pass、5 个 macOS 上的 Linux-only skip；该 shared-cgroup/no-staging 边界已由 PR10B 取代。
 
-2026-07-15 的非 CI 真实 Key E2E 使用 development profile 和 `.env` Provider，真实注册 GitHub MCP 44 个工具；模型先调用 `fetch_url(https://example.com/)`，自动批准后经 pinned NetworkBroker 返回 Example Domain，再在第二 step 输出标题，Operation journal 为 `succeeded`。production profile 在同一台 macOS 上复验为退出码 1、`sandbox_platform_unsupported`，且未创建 session。全过程未打印 Key，临时 session 与 lock 已清理。
+2026-07-16 的 PR10B 非 CI 验收结果：宿主普通套件为 281 tests、271 pass、10 个平台 skip、0 fail；aarch64（OCI 平台名 linux/arm64）的 non-skippable `pnpm test:linux-release` 为 1/1 pass，另有 46 项 Linux 专项测试为 45 pass、1 个 Darwin-only 预期 skip。2026-07-15 的同阶段真实 Key production E2E 通过 `pnpm start` 完成 Provider → Policy/Approval → durable Ledger → Router → Sandbox → 固定 `workspace_inspect` helper，两 step 后 Operation 为 `succeeded`，cgroup/staging 无残留。Key 未输出，未进入 workspace、rootfs 或 journal，临时 session 已清理。
+
+上述证据只认证当前 arm64 容器内核和 Provider 装配链。仓库中的 x86_64 BPF 仍是 candidate；`SUPER_AGENT_SANDBOX_CRASH_SUPERVISOR` 只是部署声明，尚需在真实 systemd delegated unit 中注入 launcher/Agent `SIGKILL` 与 OOM，证明 `KillMode=control-group` 回收整个 service subtree。M4 运维闭环也尚未完成。
 
 ## 运行链路
 
@@ -127,7 +129,7 @@ flowchart TD
     Router --> MCP["Host MCP Lane\nEndpoint-bound"]
     Router --> ProcessLane["Process Lane"]
     ProcessLane --> Local["LocalExecutor\nDevelopment + no requireSandbox"]
-    ProcessLane --> Sandbox["Linux SandboxExecutor\nProduction, offline + read-only\n真实集成待验收"]
+    ProcessLane --> Sandbox["Linux SandboxExecutor\nProduction, offline + read-only\n固定 workspace_inspect"]
     FileLane --> FS["FilesystemBroker\nPersistent Root FD + /proc/self/fd Walk\nAtomic temp + fsync + rename"]
     NetworkLane --> NetPolicy["NetworkBroker\nPolicy URL"]
     NetPolicy --> DNS["Resolve All DNS\nReject Any Special IP"]
@@ -135,8 +137,14 @@ flowchart TD
     Pin --> Redirect["Redirect Loop\nPolicy + DNS + Pin Again"]
     FS -.->|"grep only"| Regex["Regex Worker\nHard Timeout + Terminate"]
     Redirect -->|"3xx"| NetPolicy
-    Local --> Controller["ProcessController"]
-    Sandbox --> Controller
+    Local --> Controller["ProcessController\nDevelopment process"]
+    Sandbox --> Stage["Verified Workspace Staging\nFD anchor + bounded full-tree reverify"]
+    Stage --> Cgroup["Random Per-Operation cgroup\nmemory / swap / pids / cpu"]
+    Cgroup --> BwrapGate["bwrap 0.11.2+\nself-held FIFO + info-fd/block-fd"]
+    BwrapGate --> Identity["PID lifetime proof\nexe dev:ino + starttime\nexact cgroup.procs"]
+    Identity --> Release["write exactly one release byte"]
+    Release --> Helper["Fixed rootfs helper\nseccomp + no network + read-only"]
+    Helper --> Cleanup["Bounded output\ncgroup.kill + staging cleanup"]
     Controller --> Process["ProcessExecutor\nOutput Bound + Process Group Reaping"]
     Cancel -.-> Compact
     Cancel -.-> Model
@@ -144,6 +152,7 @@ flowchart TD
     Cancel -.-> Router
     Cancel -.-> MCP
     Cancel -.-> Process
+    Cancel -.-> BwrapGate
     Pipeline --> Guard["Result Guard\n截断 + 结构化/文本嵌套脱敏"]
     Pure --> Guard
     FS --> Guard
@@ -152,6 +161,7 @@ flowchart TD
     PreviewLane --> Guard
     MCP --> Guard
     Process --> Guard
+    Cleanup --> Guard
     Guard --> Store
 ```
 
@@ -224,13 +234,23 @@ flowchart TD
 | `SUPER_AGENT_AUTO_APPROVE` | `false` | 自动批准 Policy 的 `ask`；不能越过 hard deny 与执行约束 |
 | `SUPER_AGENT_EXECUTION_PROFILE` | `development` | `development` 使用 Local process backend；`production` 只接受 Sandbox backend |
 | `SUPER_AGENT_BWRAP_PATH` | `/usr/bin/bwrap` | production Linux 的可信 bwrap 绝对路径 |
+| `SUPER_AGENT_MKFIFO_PATH` | `/usr/bin/mkfifo` | 创建 self-held block FIFO 的可信 root-owned executable |
 | `SUPER_AGENT_SANDBOX_ROOTFS` | 无 | root-owned、不可写的 sandbox rootfs 绝对路径 |
 | `SUPER_AGENT_SANDBOX_SECCOMP_PROFILE` | 无 | seccomp BPF profile 绝对路径 |
 | `SUPER_AGENT_SANDBOX_SECCOMP_SHA256` | 无 | seccomp profile 的 64 位小写 SHA-256 |
-| `SUPER_AGENT_SANDBOX_CGROUP_ROOT` | 无 | 当前进程所在有界 cgroup v2 的可信根目录 |
-| `SUPER_AGENT_SANDBOX_MAX_MEMORY_BYTES` | `1073741824` | shared cgroup 允许的最大 `memory.max` |
-| `SUPER_AGENT_SANDBOX_MAX_PIDS` | `64` | shared cgroup 允许的最大 `pids.max` |
-| `SUPER_AGENT_SANDBOX_MAX_CPU_MICROS_PER_SECOND` | `1000000` | shared cgroup 每秒允许的最大 CPU quota |
+| `SUPER_AGENT_SANDBOX_CGROUP_ROOT` | 无 | process-free、已委派 cpu/memory/pids 的专用 cgroup v2 root；Agent 位于 sibling runtime leaf |
+| `SUPER_AGENT_SANDBOX_CRASH_SUPERVISOR` | 无 | `systemd-control-group-v1` 或 `container-control-group-v1` 部署声明；声明本身不等于 crash attestation |
+| `SUPER_AGENT_SANDBOX_MAX_MEMORY_BYTES` | `1073741824` | 每个 operation 的 `memory.max` |
+| `SUPER_AGENT_SANDBOX_MAX_SWAP_BYTES` | `0` | 每个 operation 的 `memory.swap.max`；默认/release gate 为 0，可显式配置有界非零值 |
+| `SUPER_AGENT_SANDBOX_MAX_PIDS` | `64` | 每个 operation 的 `pids.max` |
+| `SUPER_AGENT_SANDBOX_MAX_CPU_MICROS_PER_SECOND` | `1000000` | 每个 operation 按 1 秒 period 归一化的 CPU quota |
+| `SUPER_AGENT_SANDBOX_MAX_OPEN_FILES` | `4096` | 允许的 hard `RLIMIT_NOFILE` 上限；代码验证但不替 launcher 设置 |
+| `SUPER_AGENT_SANDBOX_STAGING_PARENT` | 无 | production 必填；当前 UID 独占且 group/other 不可写的本地 staging 父目录，建议配 project quota |
+| `SUPER_AGENT_SANDBOX_SNAPSHOT_MAX_FILES` | `10000` | 单次 verified staging 最大普通文件数 |
+| `SUPER_AGENT_SANDBOX_SNAPSHOT_MAX_ENTRIES` | `20000` | 单次 staging 最大总 entry 数 |
+| `SUPER_AGENT_SANDBOX_SNAPSHOT_MAX_TOTAL_BYTES` | `268435456` | 单次 staging 最大总字节数 |
+| `SUPER_AGENT_SANDBOX_SNAPSHOT_MAX_FILE_BYTES` | `16777216` | staging 单文件最大字节数 |
+| `SUPER_AGENT_SANDBOX_SNAPSHOT_MAX_DEPTH` | `64` | staging 最大目录深度 |
 | `GITHUB_PERSONAL_ACCESS_TOKEN` | 无 | GitHub MCP 的 PAT；未配置时不接入 |
 
 配置 PAT 后直接连接 GitHub 官方托管的远程 MCP，不启动本地 MCP 进程，也不需要安装任何 binary。缺少可信能力元数据的 MCP 工具按 `network.egress + external.write`、串行、需审批处理，并绑定 endpoint 的 scheme、host 和 port；Policy 使用结构化 server identity，不从工具名称猜测来源。
@@ -246,7 +266,7 @@ flowchart TD
 - 同一调用或 batch 的 `secret.read + network.egress` 会 hard deny；会话中已经成功的敏感读取也会阻止后续网络外传。旧 journal 的 `legacy.read` 保守映射为 `secret.read`。
 - `secret.read` 的工具结果按能力整体替换为 `[REDACTED]`，不进入模型上下文、终端 observer 或 durable journal；带供应商/环境前缀的常见 secret 字段也会被通用结果守卫识别。
 - Constraint Gate 与 Router Preflight 冻结 capabilities、constraints、execution kind 和 backend；审批、durable start 与 dispatch 使用同一 `ExecutionPlan`，dispatch 前再次防御性复核。
-- production process backend 使用 Linux bwrap：rootfs 与 workspace 均只读，workspace 通过 `--ro-bind-fd` 锚定；清空环境、隔离 user/PID/IPC/UTS/network/cgroup namespace、drop capabilities、`no-new-privileges`，并使用有界 tmpfs。seccomp profile 每次打开后校验 digest，启动探针还运行 immutable rootfs 中的固定 helper 验证禁用 syscall。CPU、memory、PID 与 FD 边界来自当前进程已加入的 shared bounded cgroup，并以全局 single-flight 避免并发争用；当前 lane 仅支持 offline、read-only process。
+- production process backend 只接受固定 `workspace_inspect` 语义输入，path/query 同时受字符数和 UTF-8 字节契约约束。活跃 workspace 先在当前 UID 独占的 private parent 下构造 `owner.json + payload/` 有界 verified copy，并做完整 source tree 二次复验；sandbox 只绑定只读 payload FD。请求的有效期限收敛为调用方 deadline 与 sandbox wall limit 的较小值，并贯穿 rootfs/workspace preflight。每个 operation 使用随机 cgroup，先写入并回读 memory/swap/PID/CPU/层级限制，再由自持 `O_RDWR` FIFO 保持 bwrap blocked。只有 host PID 的 bwrap executable identity、`/proc` starttime 与 exact `cgroup.procs` 均复核后才写一个 release byte。rootfs/workspace 只读，环境清空，user/PID/IPC/UTS/network/cgroup namespace 隔离，capability 全部 drop，seccomp 使用 versioned deterministic candidate 并运行完整 must-allow/must-deny startup probe。
 - Shell 按最坏情况声明 filesystem、process、network 和 secret 能力，会触发外传 hard deny；当前 `bash` 仍禁用，`--yes` 不能绕过。Preview 带 `process.execute` 却位于 host preview lane，production 同样在 preflight 拒绝。
 - `glob` 使用受限的字面路径、`*`、`**`、`?` 语法，并以独立 1 秒 hard deadline 同时约束 Broker walk 与同步匹配；`grep` 在独立 worker thread 中编译和执行 ECMAScript RegExp，灾难性回溯由 hard timeout/AbortSignal 直接 terminate，输入、匹配数、行长、worker heap/stack 和结果均有上限，所有路径等待 worker 退出。
 - 未知 MCP 默认声明 `network.egress + external.write`，绑定 endpoint origin、拒绝 HTTP redirect、串行执行并要求审批。
@@ -255,7 +275,7 @@ flowchart TD
 - Session journal 使用固定 lock inode 上的内核单写者锁、单调事件序号、`0700/0600` 权限和显式 durable append；旧版无版本 JSONL 仍可恢复。
 - 每轮取消与 deadline 贯穿模型、摘要、审批、锁、Web、MCP 和工具；POSIX Shell 取消/超时会回收独立进程组，Windows 当前仅保证直接子进程终止。
 
-PR10 尚未完成目标环境验收：当前开发机是 macOS，Linux `/proc/self/fd`、bwrap、seccomp fixed-helper 与 cgroup 的真实 integration 测试均跳过。只读 workspace 的 FD 锚定防止顶层 pathname 被替换，但不会冻结子树内容；同 UID 进程可在检查后修改子项，强快照语义仍需 staging/snapshot。当前 cgroup 是 agent 进程继承的 shared bound，不是 per-operation cgroup，尚未隔离 Agent 自身或校验 `memory.swap.max`。seccomp helper 源码、canonical BPF 制品和项目认可 digest 也尚未纳入仓库；单一禁用 syscall 探针不能证明完整策略。Regex worker 仍使用 ECMAScript RegExp，而非线性时间 RE2。上述边界在目标 Linux 验收前均不能扩大宣称为 M3 完成或 production-ready。
+仍未关闭的发布边界：verified staging 不是原子文件系统 snapshot，也不抵御任意同 UID 恶意宿主进程；staging 发生在 operation cgroup 之前，仍依赖 service envelope、串行 admission 与宿主配额。seccomp manifest 当前状态是 `candidate-linux-release-gate-required`，必须分别在 aarch64/x86_64 目标内核执行并保存 attestation。probe 只能校验 crash supervisor 声明值，不能证明 systemd/OCI 真的回收过崩溃 service；真实部署必须做外部 `SIGKILL/OOM` 测试。memory/swap 的配置和回读已有测试，但当前公开 matrix 没有保存 OOM 的 `memory.events` 证明。Regex worker 仍使用受硬边界保护的 ECMAScript RegExp，而非线性时间 RE2。详见 [`docs/operations/linux-sandbox.md`](docs/operations/linux-sandbox.md)。
 
 循环检测的细节见 [`src/agent/loop-detection.md`](src/agent/loop-detection.md)。
 

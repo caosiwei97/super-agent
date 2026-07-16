@@ -4,13 +4,13 @@
 >
 > 目标版本：2.0
 >
-> 最后更新：2026-07-15
+> 最后更新：2026-07-16
 >
-> 实施状态：M0、M1A、M1B、M1C、M2、M3 PR9 已完成；M3 PR10 代码边界已实现，目标 Linux 真实集成验收未完成
+> 实施状态：M0、M1A、M1B、M1C、M2、M3 PR9 已完成；M3 PR10B 代码实现完成，arm64 Linux release matrix 与真实 Key production E2E 已通过；x86_64 目标内核、OOM/swap 事件证据和真实 systemd crash attestation 待完成
 
 ## 1. 背景与结论
 
-Super-Agent 当前已经具备多步 Agent Loop、能力策略、耐久操作账本、并发控制、统一取消、上下文压缩、会话恢复、MCP 延迟发现和 fail-closed 执行约束。它已经超过一次性 Demo，但 M3 执行隔离与 M4 运维闭环完成前，仍不宣称达到 production-ready。
+Super-Agent 当前已经具备多步 Agent Loop、能力策略、耐久操作账本、并发控制、统一取消、上下文压缩、会话恢复、MCP 延迟发现和 fail-closed 执行约束。首个 production process lane 已实现并在 arm64 Linux 完成真实 Provider 装配验证，因此它明显超过一次性 Demo；但跨架构/外部 supervisor 发布认证与 M4 运维闭环完成前，仍不宣称达到 production-ready。
 
 下一阶段不继续横向增加工具、多 Agent 编排或 UI 功能，而是把现有骨架收敛为一个小型、完整、可验证的生产 Agent 内核：
 
@@ -52,22 +52,22 @@ Super-Agent 当前已经具备多步 Agent Loop、能力策略、耐久操作账
 - 模型请求重试、累计 token 预算和循环检测。
 - 工具 schema 校验、审批回调、读写锁和结果截断。
 - 工作区路径、symlink、Web 私网访问和响应大小检查。
-- 冻结 ExecutionPlan、Filesystem/Network Broker、Linux read-only/offline Sandbox 与正则 worker 硬超时。
+- 冻结 ExecutionPlan、Filesystem/Network Broker、Linux read-only/offline Sandbox、固定 `workspace_inspect`、verified staging、per-operation cgroup、crash-safe release handshake 与正则 worker 硬超时。
 - append-only JSONL 原始消息与 checkpoint 恢复。
 - Microcompact 与 LLM Summary 双层上下文压缩。
 - MCP 工具延迟发现。
 
 ### 4.2 剩余 P0 差距
 
-- PR10 已实现 Linux bwrap/seccomp/cgroup、Filesystem/Network Broker 与正则 worker 的代码边界；但当前 macOS 环境跳过 5 项 Linux-only 真实 integration，尚不能关闭 M3。
-- 当前 `bash` 因最坏能力集合触发 secret-to-egress hard deny，Preview 因 `process.execute` 位于 host preview lane 而被 production preflight 拒绝；现有用户工具尚不能证明 production process lane 的端到端可用性。
+- PR10B 已在 arm64 Linux 通过 non-skippable public `SandboxExecutor` matrix、Linux FD/PID/FIFO/staging 专项与真实 Key `workspace_inspect` E2E；但仓库同时发布 x86_64 candidate，尚无对应目标内核 attestation。
+- `SUPER_AGENT_SANDBOX_CRASH_SUPERVISOR` 目前只是部署声明。必须在真实 systemd delegated unit 或等价 OCI main 生命周期中从外部注入 launcher/Agent `SIGKILL` 与 OOM，证明整个 service/container subtree 被回收；进程内 probe 不能替代该证据。
+- per-operation memory/swap 限制会写入并回读，默认和 release matrix 均为 swap 0；当前公开 matrix 尚未保存真实 OOM 的 `memory.events`/swap 证据。
 
 ### 4.3 P1 差距
 
 - 会话 journal 尚缺轮转、配额、归档和长期保留策略。
 - 缺少统一可插拔审计出口、结构化指标与长期运维告警。
-- read-only workspace FD anchor 不提供子树 snapshot；同 UID 并发修改需要 staging/snapshot 才能获得强一致视图。
-- 当前 sandbox 继承 agent 所在的 shared bounded cgroup，只能以 single-flight 使用；尚无 per-operation cgroup。
+- verified user-space staging 能检测普通并发漂移并提供独立副本，但不是原子文件系统 snapshot，也不抵御任意同 UID 恶意宿主进程；staging 仍需 service envelope、串行 admission 与宿主配额。
 
 ## 5. 目标架构
 
@@ -513,7 +513,7 @@ flowchart LR
     M1A --> M1B["M1B<br/>Operation Pipeline"]
     M1B --> M1C["M1C<br/>Retry + Cancellation"]
     M1C --> M2["M2<br/>Capability Policy"]
-    M2 --> M3["M3<br/>Execution Isolation"]
+    M2 --> M3["M3<br/>Execution Isolation<br/>PR9 → PR10 → PR10B"]
     M3 --> M4["M4<br/>Operations"]
     M4 --> Gate["Production Gate"]
 ```
@@ -810,7 +810,7 @@ PR7 验收：
 - `--yes` 只自动确认 `ask`，不能越过 hard deny、约束支持检查、约束子集检查、Operation Ledger 或 sandbox 要求。
 - 任意 `secret.read` 结果在物化到模型上下文、终端 observer 和 durable journal 前整体替换为 `[REDACTED]`；通用结果守卫同时识别带供应商或环境前缀的常见 secret 字段。
 
-当前 M3 PR10 运行架构：
+M3 PR10 历史运行架构（已由下方 PR10B 架构取代，保留用于审计演进）：
 
 ```mermaid
 flowchart LR
@@ -834,7 +834,7 @@ flowchart LR
     Router --> MCP["Host MCP Lane<br/>Endpoint-bound"]
     Router --> Process["Process Lane"]
     Process --> Local["LocalExecutor<br/>Development only"]
-    Process --> Sandbox["Linux SandboxExecutor<br/>Production offline/read-only<br/>真实集成待验收"]
+    Process --> Sandbox["Linux SandboxExecutor<br/>PR10 historical shared-cgroup baseline"]
     File --> FS["FilesystemBroker<br/>Persistent Root FD + /proc/self/fd<br/>Atomic temp + fsync + rename"]
     FS -.->|"grep only"| Regex["Regex Worker<br/>Hard Timeout + Terminate"]
     Network --> PolicyURL["Policy URL"]
@@ -853,7 +853,7 @@ flowchart LR
     Result --> Ledger
 ```
 
-该图描述 PR10 当前代码边界。pure/filesystem/network/preview/MCP 是显式 host lane，其中 filesystem 与 network 分别进入 Broker；process 才能选择 Local/Sandbox backend。production 禁止 `process.execute` 留在 host lane，因此 Preview 当前 fail closed。Sandbox 只接受 `process.execute + filesystem.read`、单一只读 workspace root、无 network/listener grant 的窄能力集合；这不是对任意工具 closure 的自动容器化。
+该图描述 PR10 的历史代码边界，不是当前 PR10B sandbox 内部拓扑。pure/filesystem/network/preview/MCP 是显式 host lane，其中 filesystem 与 network 分别进入 Broker；process 才能选择 Local/Sandbox backend。production 禁止 `process.execute` 留在 host lane，因此 Preview 当前 fail closed。Sandbox 只接受 `process.execute + filesystem.read`、单一只读 workspace root、无 network/listener grant 的窄能力集合；这不是对任意工具 closure 的自动容器化。
 
 M2 退出条件：
 
@@ -863,7 +863,7 @@ M2 退出条件：
 - 全量 `pnpm check` 通过，173/173 测试通过；`pnpm typecheck`、`pnpm build` 与 `git diff --check` 通过。
 - 本地手工真实 Key E2E（2026-07-15，OpenAI-compatible Provider，非 CI）通过：Provider 分两个 step 先调用 `read_file` 读取仅含合成测试值的 `.env.synthetic`，Operation 以 `filesystem.read + secret.read` 完成 `succeeded`，模型、终端与 journal 结果均为 `[REDACTED]`；随后调用 `fetch_url`，其 `network.egress + external.read` Operation 只到 `proposed → denied(policy_denied)`，没有 `approved/started`、没有进入工具 closure。验证不记录真实 Key，临时 fixture 与 session 均已清理。
 
-M3 PR9 已完成；PR10 代码实现与本机测试已收口，等待目标 Linux 真实集成验收。
+M3 PR9 已完成；PR10 的 review gap 已由 PR10B 代码关闭。当前 M3 release certification 只剩 x86_64、OOM/swap 事件与外部 supervisor crash attestation，不能因 arm64 本地通过就宣称全平台完成。
 
 ### 7.7 M3：执行隔离
 
@@ -883,7 +883,7 @@ M3 PR9 已完成；PR10 代码实现与本机测试已收口，等待目标 Linu
 - development 只在约束允许时使用 Local Backend；production 只接受 Sandbox Backend。平台或探针不支持时在 MCP、Session、Provider 初始化前启动失败，不允许静默回退。
 - PR9 已完成：全量 `pnpm check` 185/185、`pnpm build` 与 diff check 通过；production macOS `pnpm start` 实测退出码 1、未创建 session。development 使用真实 Key 完成 Provider → calculator → Router → durable operation → Provider 两 step；GitHub MCP 44 个真实 schema 通过独立 strict JSON Schema 2020-12 编译。Key 未打印，临时 session 已清理。
 
-#### PR 10：Linux Sandbox 与 Broker 加固（代码实现完成，目标 Linux 验收未完成）
+#### PR 10：Linux Sandbox 与 Broker 加固（历史基线，已由 PR10B 取代）
 
 已实现：
 
@@ -892,28 +892,81 @@ M3 PR9 已完成；PR10 代码实现与本机测试已收口，等待目标 Linu
 - production Linux `FilesystemBroker` 在启动时持有 persistent workspace root FD，逐段通过 `/proc/self/fd/<fd>` 进行 openat-like 目录遍历并使用 `O_NOFOLLOW`；`read_file/list_directory/glob/grep/write_file/edit_file` 全部进入 Broker，读取同时拒绝 hardlink，最终文件使用 `O_NONBLOCK` 并在 I/O 前拒绝 FIFO/device 等特殊类型。
 - 文件写入使用同目录 `O_EXCL` 临时文件、保留目标 mode、完整写入、文件 `fsync`、原子 rename 与父目录 `fsync`，取消/失败时清理临时文件。这保证单次替换的原子性与耐久性，但不是跨进程 compare-and-swap；外部同 UID 写者仍可能产生 last-writer-wins。
 - `NetworkBroker` 对每一跳执行固定循环：验证 policy scheme/host/port → 解析全部 DNS answer → IPv6 仅接受当前 global-unicast `2000::/3`，任一 special/private/loopback/link-local/metadata/transition 地址即拒绝 → 选择已验证 IP 建立 pinned socket，同时保留 HTTP Host 与 TLS SNI → 对 redirect 从头重复。请求不使用 global fetch、shared Agent 或 proxy environment。
-- Linux Sandbox 使用 bwrap argv-only 启动：user/PID/IPC/UTS/network/cgroup namespace、drop all capabilities、`no-new-privileges` 探针、清空环境、只读 rootfs、经 `--ro-bind-fd` 锚定的只读 workspace、受限 tmpfs、完整进程树回收与输出/墙钟限制。首个 process lane 只接受 `process.execute + filesystem.read`，默认且固定 offline/read-only。
+- PR10 当时的 Linux Sandbox 使用 bwrap argv-only 启动：user/PID/IPC/UTS/network/cgroup namespace、drop all capabilities、`no-new-privileges` 探针、清空环境、只读 rootfs、经 `--ro-bind-fd` 锚定的活跃 workspace、受限 tmpfs、进程树回收与输出/墙钟限制。首个 process lane 只接受 `process.execute + filesystem.read`，默认且固定 offline/read-only；PR10B 已把活跃 bind 替换为 verified staging FD。
 - bwrap、rootfs 与 seccomp 要求可信绝对路径和不可写祖先；cgroup 使用 canonical realpath，并验证当前进程 membership 落在配置根内。四者都在运行前复核 identity。seccomp BPF 每次通过 FD 打开并校验配置的 SHA-256；启动探针执行 immutable rootfs 内固定 helper，只有目标禁用 syscall 返回 `EPERM/SIGSYS` 标记才接受 profile，同时检查 `NoNewPrivs` 与空 effective capabilities。
-- 资源边界要求 agent 已位于有界 cgroup v2 subtree，验证 `memory.max`、`pids.max`、`cpu.max` 与 open-files hard limit；probe 与 sandbox process 共用全局 single-flight gate。当前是 shared inherited cgroup，不是 per-operation cgroup。
+- PR10 当时要求 agent 已位于 shared bounded cgroup v2 subtree，并以全局 single-flight 使用；该限制已由 PR10B 的 process-free delegated root 与随机 per-operation cgroup 取代。
 - 启动只清理保留前缀、同 UID 且超过年龄阈值的 probe 临时目录，不扫描或删除任意 `/tmp` 内容。
 - `glob` 缩减为字面路径、`*`、`**`、`?` 的有界语法，并用独立 1 秒 hard deadline 贯穿 Broker walk 和同步匹配；`grep` 的不可信 ECMAScript RegExp 仅在独立 worker thread 编译和执行。每次调用有 absolute deadline、硬超时、AbortSignal、输入/行长/匹配数/heap/stack 上限；timeout、取消、非法消息与异常退出均 terminate worker、丢弃部分结果并 fail closed。
 
-当前验收：
+PR10 历史验收：
 
 - 全量 `pnpm check` 为 226 tests、221 pass、5 skip、0 fail，typecheck 通过。
 - 5 项 skip 均为当前 macOS 环境无法运行的 Linux-only `/proc/self/fd`、真实 bwrap、seccomp fixed-helper 与 bounded cgroup integration；单元测试、argv contract、失败门禁、Network pinned dial、Filesystem Broker 与 Regex worker 已通过。
 - 本地手工真实 Key E2E（2026-07-15，OpenAI-compatible Provider，非 CI）通过：development profile 从 `.env` 启动并真实注册 GitHub MCP 44 个工具；Step 1 模型调用 `fetch_url(https://example.com/)`，自动批准后经 pinned NetworkBroker 返回 Example Domain，Step 2 输出页面标题，对应 Operation journal 为 `succeeded`。production profile 在同一台 macOS 上复验为退出码 1、`sandbox_platform_unsupported`，且没有创建 session。验证未打印 Key，临时 session 与 lock 已清理。
-- 因目标 Linux integration 尚未运行，PR10 与 M3 不标记完成，production-ready 声明保持关闭。
+- 该历史验收当时不足以关闭 M3；后续 arm64 Linux/真实 Key 证据记录在 PR10B 小节。production-ready 声明仍因跨架构、外部 supervisor 与 M4 保持关闭。
 
-未关闭边界：
+PR10 review gap 及 PR10B 处理结果：
 
-- `withReadOnlyWorkspaceFd()` 固定 workspace 顶层 inode，并在 bind 前检查 sensitive path、hardlink 与特殊文件，但同 UID 进程仍可在检查后修改子树内容。需要 immutable staging/snapshot 才能提供强一致 workspace 视图。
-- shared cgroup 只能靠全局 single-flight 避免并发 sandbox 争用，不能隔离 Agent 自身，也尚未验证 `memory.swap.max`；后续需要带 `cgroup.kill` 的 per-operation cgroup。
-- seccomp 当前只校验运维配置 profile 的 digest，并通过外部 immutable rootfs helper 探测一个禁用 syscall；仓库尚未包含可复现 helper 源码、canonical BPF 和项目认可 digest，因此不能证明完整 syscall allowlist。
-- 当前 `bash` 的最坏能力集合包含 `secret.read + network.egress`，在 Policy hard deny 阶段停止；Preview 则因 production process-boundary mismatch 停止。需要新增窄 capability、可序列化 argv 的受控 process tool，才能完成真实业务 process lane E2E。
+- workspace 子树漂移：已增加 owner-marked bounded verified artifact、完整 source-tree second pass 与 payload root FD；仍不冒充原子 snapshot。
+- shared cgroup：已改为 process-free delegated root 下的随机 per-operation cgroup，写入 memory/swap/PID/CPU/层级限制并使用 `cgroup.kill` 清理。
+- seccomp：已纳入 versioned source、deterministic builder、aarch64/x86_64 candidate、source/artifact manifest 与完整 startup allow/deny probe；仍需逐架构目标内核 attestation 后才能提升为 canonical release。
+- 真实 process lane：已增加固定 `workspace_inspect` 并完成 arm64 production 真实 Key E2E；`bash` 继续 hard deny，Preview 继续因 production boundary mismatch fail closed。
 - Regex worker 仍是受硬边界保护的 ECMAScript RegExp，不是线性时间 RE2。
 
-M3 退出条件：生产 profile 的 `process.execute` 只能经过 Sandbox Backend；sandbox escape、socket、metadata、egress、resource bomb、DNS rebinding、symlink swap 和进程树测试全部通过。
+#### PR 10B：M3 Linux Release Gate 收口（代码完成，发布认证进行中）
+
+PR10B 不扩大 Sandbox 的能力面，只关闭 PR10 审查中剩余的四个发布阻断项。该批次仍限定为单机、单用户 Agent；任意同 UID 恶意宿主进程已经处于 Agent 信任边界内。Workspace staging 必须能检测普通并发写入并给 sandbox 提供独立副本，但不冒充文件系统原生快照，也不宣称可以抵御一个能够任意检查、chmod 或修改 Agent 文件的同 UID 对手。
+
+目标架构：
+
+```mermaid
+flowchart TD
+    Tool["workspace_inspect<br/>固定 action + 相对路径<br/>无 shell / 无任意 executable"] --> Plan["Frozen ExecutionPlan<br/>process.execute + filesystem.read<br/>offline / read-only"]
+    Plan --> Stage["Verified Workspace Artifact<br/>owner.json + payload/<br/>entry set + metadata + bytes + SHA second pass"]
+    Stage --> StageFD["Payload Root FD<br/>private parent + descriptor-relative destination"]
+    Manifest["Versioned Seccomp Source<br/>Architecture + Policy Version"] --> Build["Deterministic Builder"]
+    Build --> Artifact["Candidate BPF + Manifest<br/>source/artifact SHA-256 pin"]
+    StageFD --> Sandbox["SandboxExecutor"]
+    Artifact --> Sandbox
+    Sandbox --> Cgroup["Per-Operation Cgroup Manager<br/>memory.max / memory.swap.max<br/>pids.max / cpu.max / oom.group"]
+    Cgroup --> FIFO["Self-held O_RDWR FIFO<br/>unlink after open<br/>parent death cannot become EOF"]
+    FIFO --> Spawn["bwrap 0.11.2+<br/>info-fd 5 + block-fd 6"]
+    Spawn -->|"1. bounded child host PID"| Identity["Bind PID lifetime<br/>bwrap exe dev:ino + /proc starttime"]
+    Identity --> Attach["Attach blocked child<br/>exact cgroup.procs == PID"]
+    Attach --> Recheck["Recheck exe/starttime<br/>reject PID reuse or extra member"]
+    Recheck -->|"2. write exactly one byte"| Exec["Exec fixed workspace helper<br/>No network + Read-only rootfs"]
+    Exec --> Result["Bounded stdout/stderr + ExecutionResult"]
+    Result --> Kill["cgroup.kill → populated=0 → rmdir"]
+    Kill --> Cleanup["Close FD + Remove Staging"]
+    Supervisor["External systemd / OCI supervisor"] -. "Agent/launcher crash" .-> ServiceKill["Kill whole service subtree"]
+    ServiceKill --> Recovery["Next startup reaps only<br/>provenance-verified stale resources"]
+```
+
+实施与验收契约：
+
+| 边界 | 最小实现 | Fail-closed 条件 | 退出验证 |
+| --- | --- | --- | --- |
+| Per-operation cgroup v2 | production 使用专用 delegated subtree；每个 operation 建立不可预测子目录，写入 `memory.max`、配置的 `memory.swap.max`（默认/release gate 为 0）、`pids.max`、`cpu.max`、`memory.oom.group=1` | controller 未委派、根目录含 task、任一限制写入或回读不一致、PID 归属无法确认或出现额外 member | bwrap 通过 `--info-fd` 暴露 blocked child host PID；先绑定 exe/starttime identity、attach 并要求 exact membership，再复核 PID lifetime，最后向 self-held `--block-fd` 写一个 byte。取消、超时和异常执行 `cgroup.kill`，等待 `cgroup.events populated 0` 后删除 |
+| Verified workspace staging | production 强制使用当前 UID 独占的 private parent；从已锚定 workspace 构造 `owner.json + payload/` 有界独立副本；拒绝 sensitive path、symlink、hardlink、FIFO/device/socket；限制 entry、深度、单文件和总字节；复制前后复核身份、size、mtime/ctime，并校验复制内容 digest | 任何漂移、越界、预算超限、特殊文件、权限设置或清理失败 | sandbox 只绑定 payload FD，不再绑定活跃 workspace；源目录在 staging 完成后变化不影响本次执行视图；取消和崩溃恢复只清理 exact suffix、当前 UID、私有 mode、超过安全年龄且 owner marker/整棵 payload 的 owner/type/link/mode/预算均通过复验的 artifact；不宣称原子 snapshot |
+| Reproducible seccomp | 仓库保存 versioned policy source、deterministic builder、probe helper source 和 manifest；candidate artifact 绑定 architecture、policy version 与 SHA-256 | 架构不匹配、源码/manifest/artifact digest 不一致、任一 must-allow/must-deny probe 不符 | clean Linux 环境可重复生成相同 BPF；覆盖文件只读 helper 所需 allow 集及 namespace/socket/mount/ptrace/bpf/keyring 等 deny 集；逐架构目标内核 attestation 后才能晋升 canonical |
+| 真实 process lane | 新增 `workspace_inspect`；输入只允许固定 action、同时满足字符/UTF-8 字节限制的相对路径与 query，以及结果上限，由 Sandbox 映射为 rootfs 内固定 helper argv；合法空结果保持空字符串 | 任意 command、shell fragment、绝对路径、`..`、超长多字节输入、环境变量、网络/write grant 或未知 action | 真实 Provider 产生 tool call，经 Policy、Approval、Ledger、Router、Sandbox 和 Result Guard 完成；请求有效期限取调用方 deadline 与 sandbox wall limit 的较小值并贯穿递归 preflight；`bash` 继续 hard deny |
+
+当前证据（2026-07-16，非 CI）：
+
+- 宿主普通套件为 281 tests、271 pass、10 个平台 skip、0 fail；typecheck、build 与 deterministic artifact drift check 通过。
+- arm64 Docker 目标内核中现场构建 bwrap 0.11.2 和 musl static helpers，使用 root-owned immutable rootfs、hard `RLIMIT_NOFILE=256`、process-free delegated cgroup 与私有 staging parent；non-skippable `pnpm test:linux-release` 为 1/1 pass、0 skip。
+- 同一 arm64 环境的 Linux 专项为 46 tests、45 pass、1 个 Darwin-only 预期 skip，覆盖真实 `/proc/self/fd`、bwrap、PID identity、workspace pathname swap、owner-marked payload cleanup、self-held FIFO parent `SIGKILL` 与 full-tree staging reverify。
+- 2026-07-15 的同阶段真实 Key production `pnpm start` 使用 workspace 外的 Provider environment 和独立干净 workspace；Provider 只调用一次 `workspace_inspect`，Operation 最终为 `succeeded`，cgroup/staging 无残留，Key 未输出或写入 workspace/rootfs/journal，临时 session 已清理。
+
+证据分层与剩余 gate：
+
+- portable/unit/fault-injection：已通过；包括 limit write/readback、unexpected cgroup member、PID reuse、source drift、cleanup failure 和 launcher fail-closed。
+- arm64 target-Linux public executor matrix：已通过 readonly/output/deadline/cancel/PID/FD/CPU、startup seccomp allow/deny、fixed helper 和 cleanup。
+- x86_64 target-Linux：尚未执行，故两架构 BPF manifest 仍保持 `candidate-linux-release-gate-required`。
+- memory/swap：代码配置并回读、release gate 使用 swap 0；尚需保存真实 OOM 的 `memory.events` 与目标环境 swap 证据。
+- external supervisor：systemd unit/launcher 与静态测试已提供；必须在真实 delegated unit 注入 launcher/Agent `SIGKILL` 和 OOM，确认 `KillMode=control-group` 回收完整 service subtree。环境变量声明不能冒充该证明。
+
+M3 退出条件：生产 profile 的 `process.execute` 只能经过 Sandbox Backend；目标发布架构上的 sandbox escape、socket、metadata、egress、resource bomb、DNS rebinding、symlink swap、进程树和外部 supervisor crash 测试全部通过。当前 aarch64 public `SandboxExecutor` matrix 与 Provider E2E 已通过；aarch64 的 external supervisor/OOM attestation 及 x86_64 target-kernel gate 尚未通过，因此 M3 退出条件未满足。
 
 ### 7.8 M4：运维闭环
 
@@ -950,13 +1003,13 @@ M3 退出条件：生产 profile 的 `process.execute` 只能经过 Sandbox Back
 
 - 对 Operation Ledger 每个状态迁移点进行进程崩溃注入，恢复结果符合规格。
 - `uncertain` 外部写操作不会自动重放。
-- 目标生产平台上取消和超时能够终止完整 Shell 进程树，不遗留后台子进程；当前 M1 仅在 POSIX 达标，Windows 仍只保证直接子进程。
+- 目标生产平台上，所有已启用的 `process.execute` 工具在取消或超时时必须回收完整 sandbox process tree；当前 `bash` hard deny，不能用“未执行 Shell”代替该证据。development POSIX LocalExecutor 已覆盖进程组，Windows 仍只保证直接子进程。
 - 会话尾部半行可恢复，中间损坏可诊断且不会静默丢数据。
 
 ### 8.2 安全
 
 - Prompt injection 无法通过 `read_file + fetch_url` 读取并外传 `.env` 或凭据。
-- `--yes` 下 Shell 仍受沙箱、网络和资源限制。
+- `--yes` 不能绕过当前 `bash` 的 hard deny；不得用“未执行 Shell”冒充 sandbox 证据。未来若启用窄 Shell，仍必须先补齐 sandbox、网络与资源 gate。
 - DNS rebinding、重定向到私网、symlink 替换和危险 socket 访问测试通过。
 - 观测和会话文件中不出现测试 secret 明文。
 
@@ -1009,14 +1062,14 @@ M3 退出条件：生产 profile 的 `process.execute` 只能经过 Sandbox Back
 4. `started` 后无法证明结果的操作进入 `uncertain`，不自动重放。
 5. 提供 `ops list/resolve` 或等价 API 处理人工对账。
 6. 首个生产 Sandbox Backend 只承诺 Linux；macOS 和 Windows 保留开发模式，不宣称同等隔离。
+7. Linux Sandbox Backend 采用直接 bwrap namespace/seccomp + per-operation cgroup，并依赖外部 systemd/OCI supervisor 回收 Agent crash；不在进程内实现容器 runtime。
 
 进入对应里程碑前仍需决定：
 
 1. M1 只承诺进程崩溃耐久，还是同时承诺主机掉电耐久；后者需要目录项 fsync 和更强故障测试。
-2. Linux Sandbox Backend 采用 rootless container 还是直接组合 namespace/seccomp。
-3. 本机 HMAC 密钥的生成、轮换和安全存储方式。
-4. 大型或敏感工具结果使用内联 `modelResult` 还是加密 `resultRef`。
-5. Event Store 的 group commit 窗口、rotation 大小、quota 和 retention 默认值。
-6. OpenTelemetry 指标、trace 和 audit event 的稳定字段命名。
+2. 本机 HMAC 密钥的生成、轮换和安全存储方式。
+3. 大型或敏感工具结果使用内联 `modelResult` 还是加密 `resultRef`。
+4. Event Store 的 group commit 窗口、rotation 大小、quota 和 retention 默认值。
+5. OpenTelemetry 指标、trace 和 audit event 的稳定字段命名。
 
 默认决策原则：优先选择实现规模更小、故障语义更明确、可通过自动化测试证明的方案。
