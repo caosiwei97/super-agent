@@ -159,8 +159,35 @@ export type {
 export type {
   ProcessExecutionOptions,
   ProcessExecutionResult,
+  ProcessSpawnControl,
   ProcessTerminationReason,
 } from './execution/process-executor.js'
+export {
+  LinuxCgroupLifecycleError,
+  LinuxCgroupManager,
+  LinuxCgroupSafetyError,
+  LinuxCgroupUnavailableError,
+  LinuxOperationCgroup,
+} from './execution/linux-cgroup.js'
+export type {
+  LinuxCgroupFileSystem,
+  LinuxCgroupLimits,
+  LinuxCgroupManagerOptions,
+} from './execution/linux-cgroup.js'
+export {
+  WorkspaceSnapshotError,
+  cleanupStaleWorkspaceSnapshots,
+  createWorkspaceSnapshot,
+  withWorkspaceSnapshot,
+} from './execution/workspace-snapshot.js'
+export type {
+  StaleWorkspaceSnapshotCleanupOptions,
+  WorkspaceSnapshot,
+  WorkspaceSnapshotControl,
+  WorkspaceSnapshotLimits,
+  WorkspaceSnapshotOptions,
+  WorkspaceSnapshotSource,
+} from './execution/workspace-snapshot.js'
 export {
   assertSerializableExecutionRequest,
   TOOL_EXECUTION_KINDS,

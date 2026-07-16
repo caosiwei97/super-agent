@@ -1,121 +1,93 @@
 import { constants } from 'node:fs'
-import { lstat, open, opendir, readFile, realpath, rm, stat } from 'node:fs/promises'
+import {
+  lstat,
+  open,
+  opendir,
+  readFile,
+  realpath,
+  rmdir,
+  stat,
+  unlink,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import type { Stats } from 'node:fs'
-import { isAbsolute, join, relative } from 'node:path'
-import { AsyncReadWriteLock } from '../core/async-rw-lock.js'
+import { join } from 'node:path'
 import { isSensitivePath } from '../security/sensitive-paths.js'
 
-function isWithin(parent: string, child: string) {
-  const value = relative(parent, child)
-  return value === '' || (!value.startsWith('..') && !isAbsolute(value))
+const MAX_ROOTFS_ENTRIES = 200_000
+const SANDBOX_PROBE_DIRECTORY = /^super-agent-sandbox-probe-[A-Za-z0-9]{6}$/
+export const SANDBOX_WORKSPACE_PROBE_CONTENT = 'super-agent-workspace-helper-ok\n'
+
+export interface SandboxPreflightControl {
+  readonly signal: AbortSignal
+  readonly deadline: number
 }
 
-async function readTrimmed(path: string) {
-  return (await readFile(path, 'utf8')).trim()
-}
-
-/**
- * Require the agent itself to already run in a bounded cgroup v2 subtree.
- * The bwrap child inherits this membership before it can execute or fork.
- */
-export interface CgroupResourceLimits {
-  readonly maxMemoryBytes: number
-  readonly maxPids: number
-  /** Maximum CPU quota normalized to one second; 1_000_000 equals one CPU. */
-  readonly maxCpuMicrosPerSecond: number
-}
-
-function validResourceLimits(limits: CgroupResourceLimits) {
-  return Object.values(limits).every((value) => Number.isSafeInteger(value) && value > 0)
-}
-
-export function cgroupValuesWithinLimits(
-  memory: string,
-  pids: string,
-  cpu: string,
-  limits: CgroupResourceLimits,
-) {
-  if (!validResourceLimits(limits) || memory === 'max' || pids === 'max') return false
-  const cpuParts = cpu.trim().split(/\s+/)
-  if (cpuParts.length !== 2) return false
-  const [cpuQuota, cpuPeriod] = cpuParts
-  if (cpuQuota === 'max') return false
-  if (!/^\d+$/.test(memory) || !/^\d+$/.test(pids)
-    || !cpuQuota || !cpuPeriod || !/^\d+$/.test(cpuQuota) || !/^\d+$/.test(cpuPeriod)) {
-    return false
+function controlError(control: SandboxPreflightControl) {
+  if (control.signal.aborted) {
+    return control.signal.reason instanceof Error
+      ? control.signal.reason
+      : new DOMException('Sandbox preflight aborted', 'AbortError')
   }
-  const memoryBytes = BigInt(memory)
-  const processCount = BigInt(pids)
-  const quota = BigInt(cpuQuota)
-  const period = BigInt(cpuPeriod)
-  if (memoryBytes <= 0n || processCount <= 0n || quota <= 0n || period <= 0n) return false
-  return memoryBytes <= BigInt(limits.maxMemoryBytes)
-    && processCount <= BigInt(limits.maxPids)
-    && quota * 1_000_000n <= period * BigInt(limits.maxCpuMicrosPerSecond)
+  if (Date.now() >= control.deadline) {
+    return new DOMException('Sandbox preflight deadline exceeded', 'TimeoutError')
+  }
+  return undefined
 }
 
-export async function verifyBoundedCgroupV2(
-  cgroupRoot: string,
-  limits: CgroupResourceLimits,
-) {
+function assertPreflightControl(control?: SandboxPreflightControl) {
+  if (!control) return
+  if (!Number.isFinite(control.deadline) || control.deadline <= 0) {
+    throw new TypeError('sandbox preflight deadline 必须是有限正数')
+  }
+  const error = controlError(control)
+  if (error) throw error
+}
+
+function isPreflightControlError(error: unknown, control?: SandboxPreflightControl) {
+  return control !== undefined && (control.signal.aborted
+    || error instanceof DOMException
+      && (error.name === 'AbortError' || error.name === 'TimeoutError'))
+}
+
+export function openFilesLimitWithinBound(value: string, maximumHardLimit: number) {
+  if (!Number.isSafeInteger(maximumHardLimit) || maximumHardLimit <= 0) return false
+  const line = value.split('\n').find((entry) => entry.startsWith('Max open files'))
+  if (!line) return false
+  const fields = line.slice('Max open files'.length).trim().split(/\s+/)
+  const [soft, hard, units, ...extra] = fields
+  if (!soft || !hard || !units || extra.length > 0
+    || !/^\d+$/.test(soft) || !/^\d+$/.test(hard)) return false
+  const softValue = BigInt(soft)
+  const hardValue = BigInt(hard)
+  return softValue > 0n
+    && softValue <= hardValue
+    && hardValue <= BigInt(maximumHardLimit)
+}
+
+/** cgroup v2 has no file-descriptor controller, so the launcher must bound RLIMIT_NOFILE. */
+export async function verifyBoundedOpenFilesLimit(maximumHardLimit: number) {
   try {
-    if (!validResourceLimits(limits)) return false
-    const membership = (await readTrimmed('/proc/self/cgroup'))
-      .split('\n')
-      .find((line) => line.startsWith('0::'))
-    if (!membership) return false
-    const configured = await realpath(cgroupRoot)
-    const current = await realpath(join('/sys/fs/cgroup', membership.slice(3)))
-    if (!isWithin(configured, current)) return false
-
-    await readTrimmed(join(current, 'cgroup.controllers'))
-    const memory = await readTrimmed(join(current, 'memory.max'))
-    const pids = await readTrimmed(join(current, 'pids.max'))
-    const cpu = await readTrimmed(join(current, 'cpu.max'))
-    if (!cgroupValuesWithinLimits(memory, pids, cpu, limits)) return false
-
-    const processLimits = await readFile('/proc/self/limits', 'utf8')
-    const nofile = processLimits.split('\n').find((line) => line.startsWith('Max open files'))
-    if (!nofile) return false
-    const values = nofile.slice('Max open files'.length).trim().split(/\s+/)
-    const [soft, hard] = values
-    if (!soft || !hard || !/^\d+$/.test(soft) || !/^\d+$/.test(hard)) return false
-    return BigInt(soft) > 0n && BigInt(hard) > 0n && BigInt(hard) <= 4096n
+    return openFilesLimitWithinBound(
+      await readFile('/proc/self/limits', 'utf8'),
+      maximumHardLimit,
+    )
   } catch {
     return false
   }
 }
 
-/**
- * The first sandbox lane inherits one bounded cgroup from the agent instead of
- * creating a per-operation child cgroup. Serializing every sandbox process is
- * therefore a security invariant, not a throughput optimization.
- */
-export class SharedCgroupProcessGate {
-  private readonly lock = new AsyncReadWriteLock()
-
-  async run<T>(signal: AbortSignal, execute: () => Promise<T>): Promise<T> {
-    const release = await this.lock.acquireWrite(signal)
-    try {
-      return await execute()
-    } finally {
-      release()
-    }
-  }
-}
-
-const MAX_ROOTFS_ENTRIES = 200_000
-
 function immutableMetadata(metadata: Stats) {
   return metadata.uid === 0 && (metadata.mode & 0o022) === 0
 }
 
-async function immutableAncestors(path: string) {
+async function immutableAncestors(path: string, control?: SandboxPreflightControl) {
+  assertPreflightControl(control)
   const components = path.split('/').filter(Boolean)
   let current = '/'
   if (!immutableMetadata(await lstat(current))) return false
   for (const component of components) {
+    assertPreflightControl(control)
     current = join(current, component)
     const metadata = await lstat(current)
     if (metadata.isSymbolicLink() || !immutableMetadata(metadata)) return false
@@ -124,10 +96,12 @@ async function immutableAncestors(path: string) {
 }
 
 /** Require a root-owned, non-group/world-writable tree without special files. */
-export async function verifyImmutableRootfs(root: string) {
+export async function verifyImmutableRootfs(root: string, control?: SandboxPreflightControl) {
+  assertPreflightControl(control)
   if (process.getuid?.() === 0) return false
   let entries = 0
   const inspect = async (path: string, rootEntry = false): Promise<boolean> => {
+    assertPreflightControl(control)
     if (++entries > MAX_ROOTFS_ENTRIES) return false
     const metadata = await lstat(path)
     if (metadata.isSymbolicLink()) return !rootEntry && metadata.uid === 0
@@ -137,6 +111,7 @@ export async function verifyImmutableRootfs(root: string) {
     const directory = await opendir(path)
     try {
       for await (const entry of directory) {
+        assertPreflightControl(control)
         if (!await inspect(join(path, entry.name))) return false
       }
       return true
@@ -146,7 +121,8 @@ export async function verifyImmutableRootfs(root: string) {
   }
   try {
     return await inspect(root, true)
-  } catch {
+  } catch (error) {
+    if (isPreflightControlError(error, control)) throw error
     return false
   }
 }
@@ -155,25 +131,35 @@ export async function canonicalTrustedPath(
   path: string,
   kind: 'file' | 'directory',
   executable = false,
+  control?: SandboxPreflightControl,
 ) {
   try {
+    assertPreflightControl(control)
     const canonical = await realpath(path)
-    if (!await immutableAncestors(canonical)) return undefined
+    if (!await immutableAncestors(canonical, control)) return undefined
+    assertPreflightControl(control)
     const metadata = await lstat(canonical)
     if (kind === 'file' && (!metadata.isFile() || (executable && (metadata.mode & 0o111) === 0))) {
       return undefined
     }
     if (kind === 'directory' && !metadata.isDirectory()) return undefined
     return canonical
-  } catch {
+  } catch (error) {
+    if (isPreflightControlError(error, control)) throw error
     return undefined
   }
 }
 
 /** Reject credentials, hardlinks and socket/device/FIFO entries before a read-only bind. */
-export async function verifyReadOnlyWorkspace(root: string, followAnchoredRoot = false) {
+export async function verifyReadOnlyWorkspace(
+  root: string,
+  followAnchoredRoot = false,
+  control?: SandboxPreflightControl,
+) {
+  assertPreflightControl(control)
   let entries = 0
   const inspect = async (path: string, rootEntry = false): Promise<boolean> => {
+    assertPreflightControl(control)
     if (++entries > 100_000 || isSensitivePath(path, root) || isSensitivePath(path)) return false
     // /proc/self/fd/N is intentionally a magic symlink. Follow only that root;
     // nested workspace symlinks remain leaf entries and are never traversed.
@@ -184,6 +170,7 @@ export async function verifyReadOnlyWorkspace(root: string, followAnchoredRoot =
     const directory = await opendir(path)
     try {
       for await (const entry of directory) {
+        assertPreflightControl(control)
         if (!await inspect(join(path, entry.name))) return false
       }
       return true
@@ -193,7 +180,8 @@ export async function verifyReadOnlyWorkspace(root: string, followAnchoredRoot =
   }
   try {
     return await inspect(root, true)
-  } catch {
+  } catch (error) {
+    if (isPreflightControlError(error, control)) throw error
     return false
   }
 }
@@ -222,7 +210,9 @@ function metadataIdentity(metadata: Stats) {
 export async function withReadOnlyWorkspaceFd<T>(
   path: string,
   execute: (workspace: AnchoredReadOnlyWorkspace) => Promise<T>,
+  control?: SandboxPreflightControl,
 ): Promise<T> {
+  assertPreflightControl(control)
   if (process.platform !== 'linux') {
     throw new WorkspaceAnchorUnavailableError('workspace FD anchor 仅支持 Linux')
   }
@@ -233,20 +223,24 @@ export async function withReadOnlyWorkspaceFd<T>(
       constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
     )
   } catch (error) {
+    if (isPreflightControlError(error, control)) throw error
     throw new WorkspaceAnchorUnavailableError('workspace 无法安全打开', { cause: error })
   }
   try {
     let workspace: AnchoredReadOnlyWorkspace
     try {
       const descriptorPath = `/proc/self/fd/${handle.fd}`
+      assertPreflightControl(control)
       const before = await handle.stat()
+      assertPreflightControl(control)
       if (!before.isDirectory()) throw new Error('workspace 不是目录')
       const canonicalPath = await realpath(descriptorPath)
+      assertPreflightControl(control)
       const throughDescriptor = await stat(descriptorPath)
       const identity = metadataIdentity(before)
       if (metadataIdentity(throughDescriptor) !== identity
         || isSensitivePath(canonicalPath)
-        || !await verifyReadOnlyWorkspace(descriptorPath, true)) {
+        || !await verifyReadOnlyWorkspace(descriptorPath, true, control)) {
         throw new Error('workspace FD anchor 校验失败')
       }
       const after = await handle.stat()
@@ -258,6 +252,7 @@ export async function withReadOnlyWorkspaceFd<T>(
         identity,
       })
     } catch (error) {
+      if (isPreflightControlError(error, control)) throw error
       throw new WorkspaceAnchorUnavailableError('workspace FD anchor 校验失败', { cause: error })
     }
     // Callback errors may occur after spawn and must retain their uncertainty
@@ -272,17 +267,39 @@ export async function cleanupStaleSandboxProbeDirectories(
   minimumAgeMs = 60 * 60 * 1000,
   now = Date.now(),
 ) {
-  if (!Number.isSafeInteger(minimumAgeMs) || minimumAgeMs < 0) return false
+  if (!Number.isSafeInteger(minimumAgeMs) || minimumAgeMs < 0 || !Number.isFinite(now)) return false
   try {
-    const directory = await opendir(tmpdir())
+    const parent = tmpdir()
+    const directory = await opendir(parent)
     try {
       for await (const entry of directory) {
-        if (!entry.name.startsWith('super-agent-sandbox-probe-')) continue
-        const candidate = join(tmpdir(), entry.name)
+        if (!SANDBOX_PROBE_DIRECTORY.test(entry.name)) continue
+        const candidate = join(parent, entry.name)
         const metadata = await lstat(candidate)
-        if (!metadata.isDirectory() || metadata.uid !== process.getuid?.()) continue
+        if (!metadata.isDirectory() || metadata.isSymbolicLink()
+          || metadata.uid !== process.getuid?.() || (metadata.mode & 0o077) !== 0) continue
         if (now - metadata.mtimeMs < minimumAgeMs) continue
-        await rm(candidate, { recursive: true, force: true })
+        const contents = await opendir(candidate)
+        const names: string[] = []
+        try {
+          for await (const child of contents) names.push(child.name)
+        } finally {
+          await contents.close().catch(() => undefined)
+        }
+        if (names.length === 1 && names[0] === 'probe.txt') {
+          const probePath = join(candidate, 'probe.txt')
+          const probe = await lstat(probePath)
+          if (!probe.isFile() || probe.isSymbolicLink() || probe.uid !== process.getuid?.()
+            || probe.nlink !== 1 || (probe.mode & 0o077) !== 0
+            || probe.size !== Buffer.byteLength(SANDBOX_WORKSPACE_PROBE_CONTENT)
+            || await readFile(probePath, 'utf8') !== SANDBOX_WORKSPACE_PROBE_CONTENT) continue
+          await unlink(probePath)
+        } else if (names.length !== 0) {
+          continue
+        }
+        const beforeRemove = await lstat(candidate)
+        if (beforeRemove.dev !== metadata.dev || beforeRemove.ino !== metadata.ino) return false
+        await rmdir(candidate)
       }
       return true
     } finally {

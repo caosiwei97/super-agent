@@ -1,10 +1,28 @@
 import type { ExecutionRequest } from './executor.js'
+import {
+  buildWorkspaceInspectHelperArgv,
+  WORKSPACE_INSPECT_HELPER_PATH,
+} from './workspace-inspect-contract.js'
+
+export { WORKSPACE_INSPECT_HELPER_PATH }
+const SECCOMP_POLICY_PROBE_PATH = '/usr/libexec/super-agent/seccomp-probe'
+export const SANDBOX_RELEASE_PROBE_PATH = '/usr/libexec/super-agent/sandbox-release-probe'
+export const SANDBOX_RELEASE_PROBE_ACTIONS = Object.freeze([
+  'readonly',
+  'output',
+  'sleep',
+  'fork',
+  'fd',
+  'cpu',
+] as const)
 
 export interface LinuxSandboxCommandOptions {
   readonly bwrapPath: string
   readonly rootfsPath: string
   readonly seccompFd: number
   readonly workspaceFd: number
+  readonly infoFd?: number
+  readonly blockFd?: number
   readonly scratchBytes: number
 }
 
@@ -24,8 +42,34 @@ export function supportsBwrapVersion(output: string) {
 }
 
 export function supportsBwrapFeatures(help: string) {
-  return ['--disable-userns', '--seccomp', '--size', '--unshare-cgroup', '--ro-bind-fd']
+  return [
+    '--disable-userns',
+    '--seccomp',
+    '--size',
+    '--unshare-cgroup',
+    '--ro-bind-fd',
+    '--info-fd',
+    '--block-fd',
+  ]
     .every((flag) => help.includes(flag))
+}
+
+function sandboxProbeArgv(input: Record<string, unknown>) {
+  if (Object.keys(input).length === 1 && input.command === SECCOMP_POLICY_PROBE_PATH) {
+    return Object.freeze([SECCOMP_POLICY_PROBE_PATH])
+  }
+  throw new TypeError('sandbox-probe input 不符合固定探针契约')
+}
+
+function sandboxReleaseProbeArgv(input: Record<string, unknown>) {
+  if (Object.keys(input).length !== 1
+    || typeof input.action !== 'string'
+    || !SANDBOX_RELEASE_PROBE_ACTIONS.includes(
+      input.action as typeof SANDBOX_RELEASE_PROBE_ACTIONS[number],
+    )) {
+    throw new TypeError('sandbox-release-probe input 不符合固定 action 契约')
+  }
+  return Object.freeze([SANDBOX_RELEASE_PROBE_PATH, 'v1', input.action])
 }
 
 function processArgv(request: ExecutionRequest): readonly string[] {
@@ -33,25 +77,10 @@ function processArgv(request: ExecutionRequest): readonly string[] {
     throw new TypeError('sandbox process input 必须是对象')
   }
   const input = request.input as Record<string, unknown>
-  if (request.toolName === 'bash') {
-    if (Object.keys(input).some((key) => key !== 'command')
-      || typeof input.command !== 'string'
-      || input.command.trim().length === 0) {
-      throw new TypeError('bash sandbox input 必须只包含非空 command')
-    }
-    // The user command remains one argv element. The host never interpolates it
-    // into the bwrap invocation or another shell command string.
-    return Object.freeze(['/bin/sh', '-c', input.command])
-  }
-
-  if (Object.keys(input).some((key) => key !== 'command' && key !== 'args')
-    || typeof input.command !== 'string'
-    || input.command.trim().length === 0
-    || (input.args !== undefined && (!Array.isArray(input.args)
-      || input.args.some((argument) => typeof argument !== 'string')))) {
-    throw new TypeError('sandbox process input 必须是 command + 可选字符串 args')
-  }
-  return Object.freeze([input.command, ...((input.args as string[] | undefined) ?? [])])
+  if (request.toolName === 'workspace_inspect') return buildWorkspaceInspectHelperArgv(input)
+  if (request.toolName === 'sandbox-probe') return sandboxProbeArgv(input)
+  if (request.toolName === 'sandbox-release-probe') return sandboxReleaseProbeArgv(input)
+  throw new TypeError('sandbox 只允许固定的 workspace_inspect 与内部 probe')
 }
 
 /** Build the exact argv-only bwrap boundary. No host shell is involved. */
@@ -65,6 +94,17 @@ export function buildLinuxSandboxCommand(
   if (!Number.isSafeInteger(options.workspaceFd) || options.workspaceFd < 3
     || options.workspaceFd === options.seccompFd) {
     throw new TypeError('workspaceFd 必须是与 seccompFd 不同的 child fd >= 3')
+  }
+  if ((options.infoFd === undefined) !== (options.blockFd === undefined)) {
+    throw new TypeError('infoFd 与 blockFd 必须同时设置')
+  }
+  const controlFds = [options.infoFd, options.blockFd].filter(
+    (descriptor): descriptor is number => descriptor !== undefined,
+  )
+  if (controlFds.some((descriptor) => !Number.isSafeInteger(descriptor) || descriptor < 3)
+    || new Set([options.seccompFd, options.workspaceFd, ...controlFds]).size
+      !== 2 + controlFds.length) {
+    throw new TypeError('sandbox child fd 必须是互不相同的整数且 >= 3')
   }
   if (!Number.isSafeInteger(options.scratchBytes) || options.scratchBytes <= 0) {
     throw new TypeError('scratchBytes 必须是正安全整数')
@@ -100,6 +140,9 @@ export function buildLinuxSandboxCommand(
       // inode identity, then closes FD before the target starts.
       '--ro-bind-fd', String(options.workspaceFd), '/workspace',
       '--chdir', '/workspace',
+      ...(options.infoFd === undefined
+        ? []
+        : ['--info-fd', String(options.infoFd), '--block-fd', String(options.blockFd)]),
       '--seccomp', String(options.seccompFd),
       '--',
       ...target,

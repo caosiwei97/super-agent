@@ -20,6 +20,7 @@ import {
   buildLinuxSandboxCommand,
   supportsBwrapFeatures,
   supportsBwrapVersion,
+  WORKSPACE_INSPECT_HELPER_PATH,
 } from '../src/execution/linux-sandbox-command.js'
 import {
   SECCOMP_POLICY_PROBE_MARKER,
@@ -35,10 +36,11 @@ import {
   withSeccompProfileFd,
 } from '../src/execution/linux-sandbox-seccomp.js'
 import {
-  SharedCgroupProcessGate,
   WorkspaceAnchorUnavailableError,
-  cgroupValuesWithinLimits,
+  SANDBOX_WORKSPACE_PROBE_CONTENT,
   cleanupStaleSandboxProbeDirectories,
+  openFilesLimitWithinBound,
+  verifyImmutableRootfs,
   verifyReadOnlyWorkspace,
   withReadOnlyWorkspaceFd,
 } from '../src/execution/linux-sandbox-prerequisites.js'
@@ -50,9 +52,14 @@ function request(overrides: Partial<ExecutionRequest> = {}): ExecutionRequest {
     operationId: 'sandbox-operation',
     attemptId: 'sandbox-attempt',
     toolCallId: 'sandbox-call',
-    toolName: 'bash',
+    toolName: 'workspace_inspect',
     executionKind: 'process',
-    input: { command: 'printf %s "$HOME"; touch "$(echo literal)"' },
+    input: {
+      action: 'search_text',
+      path: 'src',
+      limit: 20,
+      query: '$(touch should-not-run); * | literal',
+    },
     capabilities: ['process.execute', 'filesystem.read'],
     constraints: {
       filesystemReadRoots: ['/srv/workspace'],
@@ -64,6 +71,42 @@ function request(overrides: Partial<ExecutionRequest> = {}): ExecutionRequest {
 }
 
 describe('Linux bwrap argv contract', () => {
+  it('requires a finite launcher RLIMIT_NOFILE hard bound', () => {
+    assert.equal(openFilesLimitWithinBound(
+      'Max open files            1024                 4096                 files\n',
+      4_096,
+    ), true)
+    assert.equal(openFilesLimitWithinBound(
+      'Max open files            1024                 8192                 files\n',
+      4_096,
+    ), false)
+    assert.equal(openFilesLimitWithinBound(
+      'Max open files            1024                 unlimited            files\n',
+      4_096,
+    ), false)
+    assert.equal(openFilesLimitWithinBound('malformed', 4_096), false)
+  })
+
+  it('propagates cancellation and deadlines through recursive preflight validation', async () => {
+    const cancellation = new AbortController()
+    const sentinel = new Error('preflight cancelled')
+    cancellation.abort(sentinel)
+    await assert.rejects(
+      verifyReadOnlyWorkspace('/path-must-not-be-read', false, {
+        signal: cancellation.signal,
+        deadline: Date.now() + 1_000,
+      }),
+      (error) => error === sentinel,
+    )
+    await assert.rejects(
+      verifyImmutableRootfs('/path-must-not-be-read', {
+        signal: new AbortController().signal,
+        deadline: Date.now() - 1,
+      }),
+      { name: 'TimeoutError' },
+    )
+  })
+
   it('constructs all isolation boundaries without a host shell or inherited environment', () => {
     const command = buildLinuxSandboxCommand(request(), {
       bwrapPath: '/usr/bin/bwrap',
@@ -85,7 +128,12 @@ describe('Linux bwrap argv contract', () => {
 
     const separator = command.args.indexOf('--')
     assert.deepEqual(command.args.slice(separator + 1), [
-      '/bin/sh', '-c', 'printf %s "$HOME"; touch "$(echo literal)"',
+      WORKSPACE_INSPECT_HELPER_PATH,
+      'v1',
+      'search_text',
+      '20',
+      'src',
+      '$(touch should-not-run); * | literal',
     ])
     assert.deepEqual(command.args.slice(command.args.indexOf('--ro-bind'), separator)
       .slice(0, 3), ['--ro-bind', '/opt/super-agent/rootfs', '/'])
@@ -104,6 +152,39 @@ describe('Linux bwrap argv contract', () => {
     ])
   })
 
+  it('adds a paired, non-conflicting info/block handshake for pre-exec cgroup attach', () => {
+    const command = buildLinuxSandboxCommand(request(), {
+      bwrapPath: '/usr/bin/bwrap',
+      rootfsPath: '/rootfs',
+      seccompFd: 3,
+      workspaceFd: 4,
+      infoFd: 5,
+      blockFd: 6,
+      scratchBytes: 1024,
+    })
+    assert.deepEqual(
+      command.args.slice(command.args.indexOf('--info-fd'), command.args.indexOf('--seccomp')),
+      ['--info-fd', '5', '--block-fd', '6'],
+    )
+    assert.throws(() => buildLinuxSandboxCommand(request(), {
+      bwrapPath: '/usr/bin/bwrap',
+      rootfsPath: '/rootfs',
+      seccompFd: 3,
+      workspaceFd: 4,
+      infoFd: 5,
+      scratchBytes: 1024,
+    }), /必须同时设置/)
+    assert.throws(() => buildLinuxSandboxCommand(request(), {
+      bwrapPath: '/usr/bin/bwrap',
+      rootfsPath: '/rootfs',
+      seccompFd: 3,
+      workspaceFd: 4,
+      infoFd: 4,
+      blockFd: 6,
+      scratchBytes: 1024,
+    }), /互不相同/)
+  })
+
   it('rejects malformed process payloads and invalid inherited seccomp descriptors', () => {
     assert.throws(() => buildLinuxSandboxCommand(request({ input: { command: '', extra: true } }), {
       bwrapPath: '/usr/bin/bwrap',
@@ -111,7 +192,17 @@ describe('Linux bwrap argv contract', () => {
       seccompFd: 3,
       workspaceFd: 4,
       scratchBytes: 1024,
-    }), /bash sandbox input/)
+    }), /workspace_inspect/)
+    assert.throws(() => buildLinuxSandboxCommand(request({
+      toolName: 'bash',
+      input: { command: 'true' },
+    }), {
+      bwrapPath: '/usr/bin/bwrap',
+      rootfsPath: '/rootfs',
+      seccompFd: 3,
+      workspaceFd: 4,
+      scratchBytes: 1024,
+    }), /只允许固定/)
     assert.throws(() => buildLinuxSandboxCommand(request(), {
       bwrapPath: '/usr/bin/bwrap',
       rootfsPath: '/rootfs',
@@ -186,7 +277,15 @@ describe('Linux bwrap argv contract', () => {
     assert.equal(supportsBwrapVersion('bubblewrap 0.11.2'), true)
     assert.equal(supportsBwrapVersion('bwrap 0.12.0'), true)
     assert.equal(supportsBwrapVersion('unknown'), false)
-    const complete = '--disable-userns --seccomp --size --unshare-cgroup --ro-bind-fd'
+    const complete = [
+      '--disable-userns',
+      '--seccomp',
+      '--size',
+      '--unshare-cgroup',
+      '--ro-bind-fd',
+      '--info-fd',
+      '--block-fd',
+    ].join(' ')
     assert.equal(supportsBwrapFeatures(complete), true)
     assert.equal(supportsBwrapFeatures(complete.replace('--seccomp', '')), false)
     assert.equal(supportsBwrapFeatures(complete.replace('--ro-bind-fd', '')), false)
@@ -209,49 +308,6 @@ describe('Linux bwrap argv contract', () => {
       exitCode: 1,
       stdout: SECCOMP_POLICY_PROBE_MARKER,
     }), false)
-  })
-
-  it('enforces explicit upper bounds for the inherited shared cgroup', () => {
-    const limits = {
-      maxMemoryBytes: 1024 * 1024 * 1024,
-      maxPids: 64,
-      maxCpuMicrosPerSecond: 1_000_000,
-    }
-    assert.equal(cgroupValuesWithinLimits('536870912', '32', '50000 100000', limits), true)
-    assert.equal(cgroupValuesWithinLimits('1073741825', '32', '50000 100000', limits), false)
-    assert.equal(cgroupValuesWithinLimits('536870912', '65', '50000 100000', limits), false)
-    assert.equal(cgroupValuesWithinLimits('536870912', '32', '100001 100000', limits), false)
-    assert.equal(cgroupValuesWithinLimits('max', '32', '50000 100000', limits), false)
-    assert.equal(cgroupValuesWithinLimits('536870912', 'max', '50000 100000', limits), false)
-    assert.equal(cgroupValuesWithinLimits('536870912', '32', 'max 100000', limits), false)
-  })
-
-  it('serializes processes that inherit the same cgroup and cancels queued work', async () => {
-    const gate = new SharedCgroupProcessGate()
-    let releaseFirst!: () => void
-    const holdFirst = new Promise<void>((resolve) => { releaseFirst = resolve })
-    const events: string[] = []
-    const first = gate.run(new AbortController().signal, async () => {
-      events.push('first-start')
-      await holdFirst
-      events.push('first-end')
-    })
-    await new Promise((resolve) => setImmediate(resolve))
-    const second = gate.run(new AbortController().signal, async () => {
-      events.push('second-start')
-    })
-    await new Promise((resolve) => setImmediate(resolve))
-    assert.deepEqual(events, ['first-start'])
-
-    const cancelled = new AbortController()
-    const third = gate.run(cancelled.signal, async () => {
-      events.push('must-not-start')
-    })
-    cancelled.abort()
-    await assert.rejects(third, { name: 'AbortError' })
-    releaseFirst()
-    await Promise.all([first, second])
-    assert.deepEqual(events, ['first-start', 'first-end', 'second-start'])
   })
 
   it('rejects sensitive files and hardlinks before a read-only workspace bind', async () => {
@@ -347,16 +403,20 @@ describe('Linux bwrap argv contract', () => {
     }
   })
 
-  it('cleans only stale probe directories with the reserved prefix', async () => {
+  it('cleans only exact stale probe artifacts with their fixed content contract', async () => {
     const stale = await mkdtemp(join(tmpdir(), 'super-agent-sandbox-probe-'))
+    const forged = await mkdtemp(join(tmpdir(), 'super-agent-sandbox-probe-'))
     const unrelated = await mkdtemp(join(tmpdir(), 'super-agent-unrelated-'))
     try {
-      await writeFile(join(stale, 'leftover'), 'probe')
+      await writeFile(join(stale, 'probe.txt'), SANDBOX_WORKSPACE_PROBE_CONTENT, { mode: 0o600 })
+      await writeFile(join(forged, 'leftover'), 'not an owned probe artifact', { mode: 0o600 })
       assert.equal(await cleanupStaleSandboxProbeDirectories(0, Date.now() + 1_000), true)
       await assert.rejects(stat(stale), { code: 'ENOENT' })
+      assert.equal((await stat(forged)).isDirectory(), true)
       assert.equal((await stat(unrelated)).isDirectory(), true)
     } finally {
       await rm(stale, { recursive: true, force: true })
+      await rm(forged, { recursive: true, force: true })
       await rm(unrelated, { recursive: true, force: true })
     }
   })
@@ -408,30 +468,41 @@ describe('Linux bwrap integration', () => {
     const seccompProfilePath = process.env.SUPER_AGENT_SANDBOX_SECCOMP_PROFILE
     const seccompProfileSha256 = process.env.SUPER_AGENT_SANDBOX_SECCOMP_SHA256
     const cgroupRoot = process.env.SUPER_AGENT_SANDBOX_CGROUP_ROOT
-    assert.ok(rootfsPath && seccompProfilePath && seccompProfileSha256 && cgroupRoot)
+    const snapshotStagingParent = process.env.SUPER_AGENT_SANDBOX_STAGING_PARENT
+    const crashSupervisorMode = process.env.SUPER_AGENT_SANDBOX_CRASH_SUPERVISOR
+    assert.ok(rootfsPath && seccompProfilePath && seccompProfileSha256 && cgroupRoot
+      && snapshotStagingParent
+      && (crashSupervisorMode === 'systemd-control-group-v1'
+        || crashSupervisorMode === 'container-control-group-v1'))
     const executor = new SandboxExecutor({
       bwrapPath: process.env.SUPER_AGENT_BWRAP_PATH || '/usr/bin/bwrap',
       rootfsPath,
       seccompProfilePath,
       seccompProfileSha256,
       cgroupRoot,
+      snapshotStagingParent,
+      crashSupervisorMode: crashSupervisorMode as
+        | 'systemd-control-group-v1'
+        | 'container-control-group-v1'
+        | undefined,
     })
     assert.deepEqual(await executor.probe(), { available: true })
 
     const workspace = await mkdtemp(join(tmpdir(), 'super-agent-linux-sandbox-test-'))
     try {
+      await writeFile(join(workspace, 'marker.txt'), 'sandbox-ok\n')
       const result = await executor.execute(request({
-        toolName: 'process_probe',
         input: {
-          command: '/bin/sh',
-          args: ['-c', 'test ! -e /proc/self/fd/4 && printf sandbox-ok'],
+          action: 'read_text',
+          path: 'marker.txt',
+          limit: 1,
         },
         constraints: {
           filesystemReadRoots: [workspace],
           requireSandbox: true,
         },
       }), { signal: new AbortController().signal })
-      assert.deepEqual(result, { outcome: 'succeeded', rawOutput: 'sandbox-ok' })
+      assert.deepEqual(result, { outcome: 'succeeded', rawOutput: 'sandbox-ok\n' })
     } finally {
       await executor.close()
       await rm(workspace, { recursive: true, force: true })

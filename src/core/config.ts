@@ -70,6 +70,18 @@ function booleanValue(env: NodeJS.ProcessEnv, name: string, fallback: boolean) {
   throw new Error(`${name} 必须是 true/false 或 1/0，当前值: ${raw}`)
 }
 
+function crashSupervisorMode(env: NodeJS.ProcessEnv):
+  | 'systemd-control-group-v1'
+  | 'container-control-group-v1'
+  | undefined {
+  const value = env.SUPER_AGENT_SANDBOX_CRASH_SUPERVISOR
+  if (value === undefined || value.trim() === '') return undefined
+  if (value === 'systemd-control-group-v1' || value === 'container-control-group-v1') return value
+  throw new Error(
+    'SUPER_AGENT_SANDBOX_CRASH_SUPERVISOR 必须是 systemd-control-group-v1 或 container-control-group-v1',
+  )
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   const profile = executionProfile(env)
   return {
@@ -98,20 +110,61 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       profile,
       sandbox: {
         bwrapPath: optionalAbsolutePath(env, 'SUPER_AGENT_BWRAP_PATH') || '/usr/bin/bwrap',
+        mkfifoPath: optionalAbsolutePath(env, 'SUPER_AGENT_MKFIFO_PATH') || '/usr/bin/mkfifo',
         rootfsPath: optionalAbsolutePath(env, 'SUPER_AGENT_SANDBOX_ROOTFS'),
         seccompProfilePath: optionalAbsolutePath(env, 'SUPER_AGENT_SANDBOX_SECCOMP_PROFILE'),
         seccompProfileSha256: optionalSha256(env, 'SUPER_AGENT_SANDBOX_SECCOMP_SHA256'),
         cgroupRoot: optionalAbsolutePath(env, 'SUPER_AGENT_SANDBOX_CGROUP_ROOT'),
+        crashSupervisorMode: crashSupervisorMode(env),
         maxCgroupMemoryBytes: positiveInteger(
           env,
           'SUPER_AGENT_SANDBOX_MAX_MEMORY_BYTES',
           1024 * 1024 * 1024,
+        ),
+        maxCgroupSwapBytes: nonNegativeInteger(
+          env,
+          'SUPER_AGENT_SANDBOX_MAX_SWAP_BYTES',
+          0,
         ),
         maxCgroupPids: positiveInteger(env, 'SUPER_AGENT_SANDBOX_MAX_PIDS', 64),
         maxCgroupCpuMicrosPerSecond: positiveInteger(
           env,
           'SUPER_AGENT_SANDBOX_MAX_CPU_MICROS_PER_SECOND',
           1_000_000,
+        ),
+        maxOpenFiles: positiveInteger(
+          env,
+          'SUPER_AGENT_SANDBOX_MAX_OPEN_FILES',
+          4_096,
+        ),
+        snapshotStagingParent: optionalAbsolutePath(
+          env,
+          'SUPER_AGENT_SANDBOX_STAGING_PARENT',
+        ),
+        snapshotMaxFiles: positiveInteger(
+          env,
+          'SUPER_AGENT_SANDBOX_SNAPSHOT_MAX_FILES',
+          10_000,
+        ),
+        snapshotMaxEntries: positiveInteger(
+          env,
+          'SUPER_AGENT_SANDBOX_SNAPSHOT_MAX_ENTRIES',
+          20_000,
+        ),
+        snapshotMaxTotalBytes: positiveInteger(
+          env,
+          'SUPER_AGENT_SANDBOX_SNAPSHOT_MAX_TOTAL_BYTES',
+          256 * 1024 * 1024,
+        ),
+        snapshotMaxFileBytes: positiveInteger(
+          env,
+          'SUPER_AGENT_SANDBOX_SNAPSHOT_MAX_FILE_BYTES',
+          16 * 1024 * 1024,
+        ),
+        snapshotMaxDepth: nonNegativeInteger(
+          env,
+          'SUPER_AGENT_SANDBOX_SNAPSHOT_MAX_DEPTH',
+          64,
         ),
       },
     },

@@ -47,13 +47,23 @@ describe('configuration', () => {
       profile: 'production',
       sandbox: {
         bwrapPath: '/opt/super-agent/bin/bwrap',
+        mkfifoPath: '/usr/bin/mkfifo',
         rootfsPath: '/opt/super-agent/rootfs',
         seccompProfilePath: '/opt/super-agent/seccomp.bpf',
         seccompProfileSha256: 'a'.repeat(64),
         cgroupRoot: '/sys/fs/cgroup/super-agent',
+        crashSupervisorMode: undefined,
         maxCgroupMemoryBytes: 1024 * 1024 * 1024,
+        maxCgroupSwapBytes: 0,
         maxCgroupPids: 64,
         maxCgroupCpuMicrosPerSecond: 1_000_000,
+        maxOpenFiles: 4_096,
+        snapshotStagingParent: undefined,
+        snapshotMaxFiles: 10_000,
+        snapshotMaxEntries: 20_000,
+        snapshotMaxTotalBytes: 256 * 1024 * 1024,
+        snapshotMaxFileBytes: 16 * 1024 * 1024,
+        snapshotMaxDepth: 64,
       },
     })
     assert.throws(
@@ -62,9 +72,11 @@ describe('configuration', () => {
     )
     for (const name of [
       'SUPER_AGENT_BWRAP_PATH',
+      'SUPER_AGENT_MKFIFO_PATH',
       'SUPER_AGENT_SANDBOX_ROOTFS',
       'SUPER_AGENT_SANDBOX_SECCOMP_PROFILE',
       'SUPER_AGENT_SANDBOX_CGROUP_ROOT',
+      'SUPER_AGENT_SANDBOX_STAGING_PARENT',
     ]) {
       assert.throws(() => loadConfig({ [name]: 'relative/path' }), /必须是绝对路径/)
     }
@@ -72,7 +84,16 @@ describe('configuration', () => {
       () => loadConfig({ SUPER_AGENT_SANDBOX_SECCOMP_SHA256: 'not-a-digest' }),
       /SHA-256/,
     )
+    assert.throws(
+      () => loadConfig({ SUPER_AGENT_SANDBOX_CRASH_SUPERVISOR: 'trust-me' }),
+      /CRASH_SUPERVISOR/,
+    )
     assert.throws(() => loadConfig({ SUPER_AGENT_SANDBOX_MAX_PIDS: '0' }), /正整数/)
+    assert.throws(() => loadConfig({ SUPER_AGENT_SANDBOX_MAX_OPEN_FILES: '0' }), /正整数/)
+    assert.throws(
+      () => loadConfig({ SUPER_AGENT_SANDBOX_MAX_SWAP_BYTES: '-1' }),
+      /非负整数/,
+    )
   })
 })
 

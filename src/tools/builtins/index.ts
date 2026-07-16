@@ -5,6 +5,7 @@ import { createFileTools } from './file-tools.js'
 import { createShellTools } from './shell-tools.js'
 import { createWebTools, type WebToolDependencies } from './web-tools.js'
 import { createPreviewTools } from './preview-tools.js'
+import { createInspectProcessTool } from './inspect-process-tool.js'
 
 export interface BuiltinToolOptions {
   workspace: Workspace
@@ -17,6 +18,7 @@ export function createBuiltinTools(options: BuiltinToolOptions) {
     ...utilityTools,
     ...createFileTools(options.workspace, { filesystem: options.filesystem }),
     ...createShellTools(options.workspace),
+    createInspectProcessTool(options.workspace),
     ...createWebTools(options.web),
     ...createPreviewTools(options.workspace),
   ]
