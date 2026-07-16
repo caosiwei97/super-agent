@@ -119,6 +119,145 @@ describe('executeProcess', () => {
     )
   })
 
+  it('runs an explicit parent-child spawn gate over inherited pipes', async () => {
+    let observedPid: number | undefined
+    const result = await nodeScript(
+      [
+        "const fs=require('node:fs')",
+        "fs.writeSync(3,String(process.pid))",
+        "const release=Buffer.alloc(1)",
+        "fs.readSync(4,release,0,1,null)",
+        "process.stdout.write('released:'+release.toString())",
+      ].join(';'),
+      {
+        extraStdio: ['pipe', 'pipe'],
+        onSpawn: async ({ pid, extraStdio }) => {
+          observedPid = pid
+          const [info, release] = extraStdio
+          assert.ok(info && 'once' in info)
+          assert.ok(release && 'write' in release)
+          const childPid = await new Promise<number>((resolve, reject) => {
+            info.once('data', (chunk) => resolve(Number(String(chunk))))
+            info.once('error', reject)
+          })
+          assert.equal(childPid, pid)
+          release.write(Buffer.from('1'))
+        },
+      },
+    )
+
+    assert.equal(result.pid, observedPid)
+    assert.equal(result.terminationReason, 'exited')
+    assert.equal(result.stdout, 'released:1')
+  })
+
+  it('kills a blocked child when the spawn gate fails', async () => {
+    const result = await nodeScript(
+      "const fs=require('node:fs');const byte=Buffer.alloc(1);fs.readSync(3,byte,0,1,null)",
+      {
+        extraStdio: ['pipe'],
+        onSpawn: async () => {
+          throw new Error('cgroup attach failed')
+        },
+      },
+    )
+
+    assert.equal(result.terminationReason, 'setup_error')
+    assert.match(result.error?.message ?? '', /cgroup attach failed/)
+  })
+
+  it('records a spawn gate rejection triggered in the child-close tick', async () => {
+    const result = await nodeScript('process.exit(0)', {
+      onSpawn: ({ signal }) => new Promise<void>((_resolve, reject) => {
+        const rejectOnClose = () => reject(new Error('gate rejected while child closed'))
+        if (signal.aborted) rejectOnClose()
+        else signal.addEventListener('abort', rejectOnClose, { once: true })
+      }),
+    })
+
+    assert.equal(result.exitCode, 0)
+    assert.equal(result.terminationReason, 'setup_error')
+    assert.match(result.error?.message ?? '', /gate rejected while child closed/)
+  })
+
+  it('preserves an established timeout over a same-tick spawn gate rejection', async () => {
+    const result = await nodeScript('setInterval(()=>{},1000)', {
+      timeoutMs: 30,
+      onSpawn: ({ signal }) => new Promise<void>((_resolve, reject) => {
+        const rejectOnCancel = () => reject(new Error('gate observed timeout cancellation'))
+        if (signal.aborted) rejectOnCancel()
+        else signal.addEventListener('abort', rejectOnCancel, { once: true })
+      }),
+    })
+
+    assert.equal(result.terminationReason, 'timeout')
+    assert.equal(result.error, undefined)
+  })
+
+  it('cancels and settles a pending spawn gate before returning after child close', async () => {
+    let gateSettled = false
+    let gateSignal: AbortSignal | undefined
+    const result = await nodeScript('process.exit(0)', {
+      terminationGraceMs: 100,
+      onSpawn: async ({ signal }) => {
+        gateSignal = signal
+        try {
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) resolve()
+            else signal.addEventListener('abort', () => resolve(), { once: true })
+          })
+          await new Promise((resolve) => setTimeout(resolve, 20))
+        } finally {
+          gateSettled = true
+        }
+      },
+    })
+
+    assert.equal(result.terminationReason, 'exited')
+    assert.equal(gateSignal?.aborted, true)
+    assert.equal(gateSettled, true)
+  })
+
+  it('cancels a pending info gate on timeout and waits for its cleanup', async () => {
+    let gateSettled = false
+    const result = await nodeScript(
+      "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)",
+      {
+        extraStdio: ['pipe'],
+        timeoutMs: 200,
+        terminationGraceMs: 100,
+        onSpawn: async ({ signal, extraStdio }) => {
+          const info = extraStdio[0]
+          assert.ok(info && 'once' in info)
+          try {
+            await new Promise<void>((resolve) => {
+              if (signal.aborted) resolve()
+              else signal.addEventListener('abort', () => resolve(), { once: true })
+            })
+            await new Promise((resolve) => setTimeout(resolve, 20))
+          } finally {
+            gateSettled = true
+          }
+        },
+      },
+    )
+
+    assert.equal(result.terminationReason, 'timeout')
+    assert.equal(result.signal, 'SIGKILL')
+    assert.equal(gateSettled, true)
+  })
+
+  it('bounds shutdown when a cancelled spawn gate ignores its signal', async () => {
+    const startedAt = Date.now()
+    const result = await nodeScript('process.exit(0)', {
+      terminationGraceMs: 20,
+      onSpawn: () => new Promise<void>(() => undefined),
+    })
+
+    assert.equal(result.terminationReason, 'exited')
+    assert.ok(Date.now() - startedAt < 1_000)
+  })
+
   it('does not take ownership of inherited descriptors on pre-spawn cancellation', async () => {
     const path = join(tmpdir(), `super-agent-cancelled-fd-${process.pid}-${Date.now()}`)
     await writeFile(path, 'still-open')

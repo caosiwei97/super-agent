@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 
 const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024
 const DEFAULT_TERMINATION_GRACE_MS = 500
+const MAX_SPAWN_GATE_SETTLE_MS = 500
 const MAX_TIMER_DELAY_MS = 2_147_483_647
 const activePosixProcessGroups = new Set<number>()
 let exitCleanupInstalled = false
@@ -46,7 +47,21 @@ export type ProcessTerminationReason =
   | 'aborted'
   | 'timeout'
   | 'output_limit'
+  | 'setup_error'
   | 'spawn_error'
+
+export interface ProcessSpawnControl {
+  readonly pid: number
+  /**
+   * Aborted when execution is cancelled, times out, fails to spawn, or the
+   * child closes. Spawn gates must use this signal for every blocking wait.
+   */
+  readonly signal: AbortSignal
+  /** Parent-side endpoints corresponding to child fd 3, 4, ... . */
+  readonly extraStdio: readonly (
+    NodeJS.ReadableStream | NodeJS.WritableStream | null | undefined
+  )[]
+}
 
 export interface ProcessExecutionOptions {
   readonly command: string
@@ -63,6 +78,13 @@ export interface ProcessExecutionOptions {
   readonly terminationGraceMs?: number
   /** Numeric parent descriptors inherited as child fd 3, 4, ... . */
   readonly extraFileDescriptors?: readonly number[]
+  /** Internal backend seam for inherited descriptors and parent/child pipes. */
+  readonly extraStdio?: readonly (number | 'pipe')[]
+  /**
+   * Runs immediately after spawn while a backend-owned child handshake is
+   * expected to keep untrusted code blocked. Throwing terminates the process.
+   */
+  readonly onSpawn?: (control: ProcessSpawnControl) => Promise<void> | void
 }
 
 export interface ProcessExecutionResult {
@@ -105,6 +127,14 @@ function validateOptions(options: ProcessExecutionOptions) {
   )) {
     throw new Error('extraFileDescriptors 必须全部为非负安全整数')
   }
+  if (options.extraStdio !== undefined && options.extraFileDescriptors !== undefined) {
+    throw new Error('extraStdio 与 extraFileDescriptors 不能同时设置')
+  }
+  if (options.extraStdio?.some(
+    (entry) => entry !== 'pipe' && (!Number.isSafeInteger(entry) || entry < 0),
+  )) {
+    throw new Error('extraStdio 只允许 pipe 或非负安全整数')
+  }
 }
 
 function effectiveTimeout(options: ProcessExecutionOptions, now: number): number | undefined {
@@ -117,6 +147,43 @@ function effectiveTimeout(options: ProcessExecutionOptions, now: number): number
 
 function boundedTimerDelay(delay: number) {
   return Math.min(Math.max(0, Math.ceil(delay)), MAX_TIMER_DELAY_MS)
+}
+
+function spawnGateAbortReason(reason: ProcessTerminationReason | 'closed') {
+  return new DOMException(`Process spawn gate cancelled: ${reason}`, 'AbortError')
+}
+
+async function drainSpawnGate(
+  gate: Promise<unknown>,
+  terminationGraceMs: number,
+) {
+  let timeout: NodeJS.Timeout | undefined
+  try {
+    await Promise.race([
+      gate,
+      new Promise<void>((resolve) => {
+        timeout = setTimeout(
+          resolve,
+          boundedTimerDelay(Math.min(terminationGraceMs, MAX_SPAWN_GATE_SETTLE_MS)),
+        )
+      }),
+    ])
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout)
+  }
+}
+
+function closeSpawnControlEndpoints(
+  endpoints: readonly (NodeJS.ReadableStream | NodeJS.WritableStream | null | undefined)[],
+) {
+  for (const endpoint of endpoints) {
+    const destroy = endpoint === null || endpoint === undefined
+      ? undefined
+      : (endpoint as { destroy?: unknown }).destroy
+    if (typeof destroy === 'function') {
+      destroy.call(endpoint)
+    }
+  }
 }
 
 function noProcessResult(
@@ -176,17 +243,24 @@ export async function executeProcess(
   let outputTruncated = false
   let terminationReason: ProcessTerminationReason | undefined
   let spawnError: NodeJS.ErrnoException | undefined
+  let spawnGateError: Error | undefined
   let timeoutHandle: NodeJS.Timeout | undefined
   let killHandle: NodeJS.Timeout | undefined
   let terminationGrace: Promise<void> | undefined
   let finishTerminationGrace: (() => void) | undefined
+  const spawnGateController = new AbortController()
 
   const child = spawn(options.command, [...(options.args ?? [])], {
     cwd: options.cwd,
     env: options.env,
     detached: process.platform !== 'win32',
     shell: false,
-    stdio: ['ignore', 'pipe', 'pipe', ...(options.extraFileDescriptors ?? [])],
+    stdio: [
+      'ignore',
+      'pipe',
+      'pipe',
+      ...(options.extraStdio ?? options.extraFileDescriptors ?? []),
+    ],
     windowsHide: true,
   })
   if (process.platform !== 'win32' && child.pid !== undefined) {
@@ -196,6 +270,7 @@ export async function executeProcess(
   const requestTermination = (reason: Exclude<ProcessTerminationReason, 'exited' | 'spawn_error'>) => {
     if (terminationReason !== undefined || spawnError !== undefined) return
     terminationReason = reason
+    spawnGateController.abort(spawnGateAbortReason(reason))
     signalProcess(child, 'SIGTERM')
 
     terminationGrace = new Promise<void>((resolve) => {
@@ -228,6 +303,21 @@ export async function executeProcess(
   child.stdout?.on('data', (chunk: Buffer | string) => capture(stdout, chunk))
   child.stderr?.on('data', (chunk: Buffer | string) => capture(stderr, chunk))
 
+  const spawnControlEndpoints = Object.freeze(child.stdio.slice(3))
+  const closedPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+    (resolve) => {
+      child.once('error', (error: NodeJS.ErrnoException) => {
+        spawnError = error
+        spawnGateController.abort(spawnGateAbortReason('spawn_error'))
+      })
+      child.once('close', (code, signal) => {
+        spawnGateController.abort(spawnGateAbortReason('closed'))
+        closeSpawnControlEndpoints(spawnControlEndpoints)
+        resolve({ code, signal })
+      })
+    },
+  )
+
   const abort = () => requestTermination('aborted')
   options.signal?.addEventListener('abort', abort, { once: true })
   if (options.signal?.aborted) abort()
@@ -236,12 +326,38 @@ export async function executeProcess(
     timeoutHandle.unref()
   }
 
-  const closed = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
-    child.once('error', (error: NodeJS.ErrnoException) => {
-      spawnError = error
-    })
-    child.once('close', (code, signal) => resolve({ code, signal }))
-  })
+  let startup: Promise<
+    { state: 'ready' } | { state: 'failed'; error: unknown }
+  > | undefined
+  if (options.onSpawn !== undefined && child.pid !== undefined && spawnError === undefined) {
+    startup = Promise.resolve()
+      .then(() => options.onSpawn!({
+        pid: child.pid!,
+        signal: spawnGateController.signal,
+        extraStdio: spawnControlEndpoints,
+      }))
+      .then(
+        () => ({ state: 'ready' as const }),
+        (error: unknown) => {
+          spawnGateError = error instanceof Error
+            ? error
+            : new Error(String(error))
+          return { state: 'failed' as const, error: spawnGateError }
+        },
+      )
+    const startupResult = await Promise.race([
+      startup,
+      closedPromise.then(() => ({ state: 'closed' as const })),
+    ])
+    if (startupResult.state === 'failed'
+      && terminationReason === undefined
+      && spawnError === undefined) {
+      requestTermination('setup_error')
+    }
+  }
+
+  const closed = await closedPromise
+  if (startup !== undefined) await drainSpawnGate(startup, terminationGraceMs)
 
   if (process.platform !== 'win32' && child.pid !== undefined) {
     if (terminationGrace !== undefined) await terminationGrace
@@ -257,7 +373,9 @@ export async function executeProcess(
 
   const reason = spawnError !== undefined
     ? 'spawn_error'
-    : terminationReason ?? 'exited'
+    : terminationReason ?? (spawnGateError === undefined ? 'exited' : 'setup_error')
+  const reportedError = spawnError
+    ?? (reason === 'setup_error' ? spawnGateError : undefined)
   return Object.freeze({
     ...(child.pid === undefined ? {} : { pid: child.pid }),
     exitCode: closed.code,
@@ -268,12 +386,12 @@ export async function executeProcess(
     outputTruncated,
     terminationReason: reason,
     durationMs: Math.max(0, Date.now() - startedAt),
-    ...(spawnError === undefined
+    ...(reportedError === undefined
       ? {}
       : {
           error: Object.freeze({
-            message: spawnError.message,
-            ...(spawnError.code === undefined ? {} : { code: spawnError.code }),
+            message: reportedError.message,
+            ...(spawnError?.code === undefined ? {} : { code: spawnError.code }),
           }),
         }),
   })

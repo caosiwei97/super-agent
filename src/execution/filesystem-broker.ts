@@ -341,10 +341,7 @@ export class FilesystemBroker {
     let actionError: unknown
     try {
       await this.assertRootIdentity()
-      let current = await open(
-        this.rootAnchor(),
-        constants.O_RDONLY | constants.O_DIRECTORY | NO_FOLLOW,
-      )
+      let current = await this.openRootAnchor()
       handles.push(current)
       const parentRelative = relative(this.workspaceRoot, dirname(absolute))
       for (const segment of parentRelative === '' ? [] : parentRelative.split(sep)) {
@@ -395,10 +392,7 @@ export class FilesystemBroker {
     let actionError: unknown
     try {
       await this.assertRootIdentity()
-      let current = await open(
-        this.rootAnchor(),
-        constants.O_RDONLY | constants.O_DIRECTORY | NO_FOLLOW,
-      )
+      let current = await this.openRootAnchor()
       handles.push(current)
       const directoryRelative = relative(this.workspaceRoot, absolute)
       for (const segment of directoryRelative === '' ? [] : directoryRelative.split(sep)) {
@@ -463,8 +457,7 @@ export class FilesystemBroker {
 
   private async assertRootIdentity() {
     if (!this.descriptorAnchoring) return
-    const anchor = this.rootAnchor()
-    const anchored = await open(anchor, constants.O_RDONLY | constants.O_DIRECTORY | NO_FOLLOW)
+    const anchored = await this.openRootAnchor()
     let current: FileHandle | undefined
     try {
       const anchoredMetadata = await anchored.stat()
@@ -481,6 +474,33 @@ export class FilesystemBroker {
       }
     } finally {
       await Promise.allSettled([anchored.close(), current?.close()])
+    }
+  }
+
+  /**
+   * /proc/self/fd/N is intentionally a procfs magic-link. O_NOFOLLOW would
+   * reject the anchor itself with ENOTDIR on Linux, so follow that one trusted
+   * hop and immediately verify the opened directory's inode. Descendant path
+   * components continue to use O_NOFOLLOW.
+   */
+  private async openRootAnchor() {
+    const anchored = await open(
+      this.rootAnchor(),
+      constants.O_RDONLY | constants.O_DIRECTORY,
+    )
+    try {
+      const metadata = await anchored.stat()
+      if (!metadata.isDirectory()
+        || metadata.dev !== this.rootIdentity?.dev
+        || metadata.ino !== this.rootIdentity?.ino) {
+        throw new FilesystemBrokerUnavailableError(
+          'Filesystem Broker root FD anchor identity 不匹配',
+        )
+      }
+      return anchored
+    } catch (error) {
+      await anchored.close().catch(() => undefined)
+      throw error
     }
   }
 }
