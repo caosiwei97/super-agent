@@ -1,7 +1,7 @@
 {
   "name": "super-agent",
   "version": "1.0.0",
-  "description": "A compact, durable TypeScript agent-loop demo",
+  "description": "A compact TypeScript agent kernel with durable and sandboxed execution boundaries",
   "private": true,
   "type": "module",
   "main": "dist/index.js",
@@ -17,6 +17,9 @@
   },
   "files": [
     "dist",
+    "sandbox/seccomp",
+    "scripts/linux-sandbox-launcher.mjs",
+    "deploy",
     "README.md",
     ".env-example"
   ],
@@ -30,6 +33,8 @@
     "build:watch": "pnpm clean && tsc --watch --skipLibCheck --preserveWatchOutput",
     "prepack": "pnpm build",
     "test": "tsx --test test/*.test.ts",
+    "test:linux-release": "tsx --test test/linux-release-gate.release.ts",
+    "test:seccomp-artifacts": "node sandbox/seccomp/build-profile.mjs --check && tsx --test test/seccomp-artifacts.test.ts",
     "typecheck": "tsc --noEmit --skipLibCheck && tsc -p tsconfig.test.json --skipLibCheck",
     "check": "pnpm typecheck && pnpm test"
   },
