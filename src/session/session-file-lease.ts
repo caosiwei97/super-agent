@@ -4,30 +4,33 @@ import {
   createReadStream,
   fchmodSync,
   fstatSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
   openSync,
+  renameSync,
   type Stats,
 } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { open, readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { flockSync } from 'fs-ext'
+import { parseSessionFence } from './session-layout.js'
 
 const DIRECTORY_MODE = 0o700
 const FILE_MODE = 0o600
 const READ_CHUNK_BYTES = 64 * 1024
 
 export interface SessionJournalFile {
-  /** Present on Node's production FileHandle; trusted test adapters may omit it. */
-  readonly fd?: number
+  /** Required so every adapter preserves the production descriptor/flock boundary. */
+  readonly fd: number
   chmod(mode: number): Promise<void>
   truncate(length?: number): Promise<void>
   write(buffer: Uint8Array, offset: number, length: number): Promise<{ bytesWritten: number }>
   datasync(): Promise<void>
   close(): Promise<void>
-  /** Production FileHandle methods; optional for trusted fault-injection adapters. */
-  stat?(): Promise<Stats>
-  read?(
+  stat(): Promise<Stats>
+  read(
     buffer: Uint8Array,
     offset: number,
     length: number,
@@ -35,7 +38,7 @@ export interface SessionJournalFile {
   ): Promise<{ bytesRead: number }>
 }
 
-/** Minimal injectable boundary around journal I/O. Custom implementations are trusted test seams. */
+/** Minimal injectable boundary around journal I/O. Adapters retain real descriptor operations. */
 export interface SessionJournalIo {
   open(path: string, flags: number, mode: number): Promise<SessionJournalFile>
   readFile(path: string): Promise<Buffer>
@@ -51,6 +54,23 @@ export const nodeSessionJournalIo: SessionJournalIo = Object.freeze({
 interface FileIdentity {
   readonly dev: number
   readonly ino: number
+}
+
+export type SessionFenceCommitPoint =
+  | 'fence_locked'
+  | 'fence_synced'
+  | 'fence_renamed'
+  | 'fence_verified'
+  | 'parent_synced'
+  | 'legacy_unlocked'
+
+export type SessionFenceCommitProbe = (
+  point: SessionFenceCommitPoint,
+) => void | Promise<void>
+
+interface ExtraSecondaryHandle {
+  readonly handle: SessionJournalFile
+  lockHeld: boolean
 }
 
 function sameIdentity(expected: FileIdentity, actual: FileIdentity) {
@@ -91,6 +111,8 @@ export class SessionFileLease {
   private lockIdentity: FileIdentity | undefined
   private journalHandle: SessionJournalFile | undefined
   private journalLockHeld = false
+  private journalRole: 'legacy' | 'fence' = 'legacy'
+  private readonly extraSecondaryHandles = new Set<ExtraSecondaryHandle>()
 
   constructor(
     directory: string,
@@ -191,30 +213,25 @@ export class SessionFileLease {
   async *readChunks(): AsyncIterable<Uint8Array> {
     await this.assertSafe()
     const handle = this.requireJournal()
-    if (handle.read) {
-      let position = 0
-      while (true) {
-        const buffer = Buffer.allocUnsafe(READ_CHUNK_BYTES)
-        const { bytesRead } = await handle.read(buffer, 0, buffer.length, position)
-        if (bytesRead === 0) return
-        position += bytesRead
-        yield buffer.subarray(0, bytesRead)
-      }
+    let position = 0
+    while (true) {
+      const buffer = Buffer.allocUnsafe(READ_CHUNK_BYTES)
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, position)
+      if (bytesRead === 0) return
+      position += bytesRead
+      yield buffer.subarray(0, bytesRead)
     }
-    if (this.io.readChunks) {
-      for await (const chunk of this.io.readChunks(this.filePath)) yield chunk
-      return
-    }
-    yield await this.io.readFile(this.filePath)
   }
 
   async truncate(length: number) {
+    this.assertLegacyJournal()
     await this.assertSafe()
     await this.requireJournal().truncate(length)
     await this.assertSafe()
   }
 
   async write(buffer: Uint8Array, offset: number, length: number) {
+    this.assertLegacyJournal()
     await this.assertSafe()
     const result = await this.requireJournal().write(buffer, offset, length)
     await this.assertSafe()
@@ -225,6 +242,98 @@ export class SessionFileLease {
     await this.assertSafe()
     await this.requireJournal().datasync()
     await this.assertSafe()
+  }
+
+  /**
+   * Marks an already-open canonical journal as the exact layout fence. Its
+   * exclusive flock remains held until close().
+   */
+  async adoptJournalFence(expectedBytes: Uint8Array) {
+    parseSessionFence(expectedBytes)
+    await this.assertSafe()
+    await this.assertExactHandleBytes(this.requireJournal(), expectedBytes)
+    this.journalRole = 'fence'
+  }
+
+  /**
+   * Atomically replaces the locked legacy journal path with a pre-locked fence.
+   * The legacy and fence flocks overlap through parent-directory fsync. Any
+   * extra handle retained by a failed probe is still released by close().
+   */
+  async commitJournalFence(
+    fenceBytes: Uint8Array,
+    probe: SessionFenceCommitProbe = () => undefined,
+  ) {
+    this.assertLegacyJournal()
+    await this.assertSafe()
+    parseSessionFence(fenceBytes)
+
+    const legacyHandle = this.requireJournal()
+    const noFollow = constants.O_NOFOLLOW ?? 0
+    const tempPath = resolve(
+      this.directoryPath,
+      `.${this.filePath.slice(this.directoryPath.length + 1)}.${process.pid}.${randomUUID()}.fence.tmp`,
+    )
+    const fenceHandle = await this.io.open(
+      tempPath,
+      constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | noFollow,
+      FILE_MODE,
+    )
+    const extra: ExtraSecondaryHandle = { handle: fenceHandle, lockHeld: false }
+    this.extraSecondaryHandles.add(extra)
+
+    try {
+      const before = await fenceHandle.stat()
+      if (!isOwnedSingleLinkFile(before)) {
+        throw unsafeStorage('storage fence temp 类型、owner 或 nlink 无效')
+      }
+      flockSync(fenceHandle.fd, 'exnb')
+      extra.lockHeld = true
+      await probe('fence_locked')
+      await fenceHandle.chmod(FILE_MODE)
+      const after = await fenceHandle.stat()
+      const tempMetadata = lstatSync(tempPath)
+      if (!sameIdentity(before, after) || !sameIdentity(after, tempMetadata) ||
+        !isPrivateFile(after) || !isPrivateFile(tempMetadata)) {
+        throw unsafeStorage('storage fence temp inode 或 mode 不安全')
+      }
+
+      await this.writeAll(fenceHandle, fenceBytes)
+      await fenceHandle.datasync()
+      await this.assertExactHandleBytes(fenceHandle, fenceBytes)
+      await probe('fence_synced')
+
+      // Revalidate both the fixed lock and the legacy descriptor immediately
+      // before the one and only migration commit point.
+      await this.assertSafe()
+      renameSync(tempPath, this.filePath)
+
+      const legacyExtra: ExtraSecondaryHandle = {
+        handle: legacyHandle,
+        lockHeld: this.journalLockHeld,
+      }
+      this.extraSecondaryHandles.add(legacyExtra)
+      this.extraSecondaryHandles.delete(extra)
+      this.journalHandle = fenceHandle
+      this.journalLockHeld = extra.lockHeld
+      this.journalIdentity = Object.freeze({ dev: after.dev, ino: after.ino })
+      this.journalRole = 'fence'
+      await probe('fence_renamed')
+
+      await this.assertSafe()
+      await this.assertExactHandleBytes(fenceHandle, fenceBytes)
+      await probe('fence_verified')
+      this.assertDirectoryInvariant()
+      fsyncSync(this.requireDirectoryFd())
+      await probe('parent_synced')
+
+      await this.releaseExtraSecondary(legacyExtra)
+      await probe('legacy_unlocked')
+    } catch (error) {
+      // State is intentionally retained. close() releases whichever side(s) of
+      // the handoff were live at the injected/process failure boundary.
+      throw error
+    }
   }
 
   async close() {
@@ -239,6 +348,13 @@ export class SessionFileLease {
       }
       try {
         await handle.close()
+      } catch (error) {
+        closeError ||= error
+      }
+    }
+    for (const extra of [...this.extraSecondaryHandles]) {
+      try {
+        await this.releaseExtraSecondary(extra)
       } catch (error) {
         closeError ||= error
       }
@@ -261,9 +377,75 @@ export class SessionFileLease {
     return this.journalHandle
   }
 
+  private requireDirectoryFd() {
+    if (this.directoryFd === undefined) {
+      throw unsafeStorage('session directory descriptor 不可用')
+    }
+    return this.directoryFd
+  }
+
+  private assertLegacyJournal() {
+    if (this.journalRole !== 'legacy') {
+      throw unsafeStorage('storage fence 不得作为 legacy journal 修改')
+    }
+  }
+
   private async journalMetadata() {
     const handle = this.requireJournal()
-    return handle.stat ? handle.stat() : lstatSync(this.filePath)
+    return handle.stat()
+  }
+
+  private async writeAll(handle: SessionJournalFile, bytes: Uint8Array) {
+    let offset = 0
+    while (offset < bytes.length) {
+      const { bytesWritten } = await handle.write(bytes, offset, bytes.length - offset)
+      if (!Number.isSafeInteger(bytesWritten) || bytesWritten <= 0 ||
+        bytesWritten > bytes.length - offset) {
+        throw unsafeStorage('storage fence write 未取得有效进展')
+      }
+      offset += bytesWritten
+    }
+  }
+
+  private async assertExactHandleBytes(handle: SessionJournalFile, expected: Uint8Array) {
+    const metadata = await handle.stat()
+    if (!isPrivateFile(metadata) || metadata.size !== expected.length) {
+      throw unsafeStorage('storage fence descriptor 大小或属性无效')
+    }
+    const actual = Buffer.allocUnsafe(expected.length)
+    let offset = 0
+    while (offset < actual.length) {
+      const { bytesRead } = await handle.read(actual, offset, actual.length - offset, offset)
+      if (!Number.isSafeInteger(bytesRead) || bytesRead <= 0 ||
+        bytesRead > actual.length - offset) {
+        throw unsafeStorage('storage fence descriptor 无法完整读取')
+      }
+      offset += bytesRead
+    }
+    const eof = Buffer.allocUnsafe(1)
+    const { bytesRead: trailingBytes } = await handle.read(eof, 0, 1, actual.length)
+    if (trailingBytes !== 0 || !actual.equals(Buffer.from(expected))) {
+      throw unsafeStorage('storage fence bytes 不匹配')
+    }
+  }
+
+  private async releaseExtraSecondary(extra: ExtraSecondaryHandle) {
+    if (!this.extraSecondaryHandles.delete(extra)) return
+    let releaseError: unknown
+    if (extra.lockHeld) {
+      extra.lockHeld = false
+      try {
+        flockSync(extra.handle.fd, 'un')
+      } catch (error) {
+        releaseError = error
+      }
+    }
+    try {
+      await extra.handle.close()
+    } catch (error) {
+      releaseError ||= error
+    }
+    if (releaseError) throw releaseError
   }
 
   private assertJournalSnapshot() {
@@ -286,7 +468,6 @@ export class SessionFileLease {
   }
 
   private acquireJournalLock(handle: SessionJournalFile) {
-    if (handle.fd === undefined) return
     try {
       flockSync(handle.fd, 'exnb')
       this.journalLockHeld = true
@@ -300,7 +481,7 @@ export class SessionFileLease {
   }
 
   private releaseJournalLock(handle: SessionJournalFile) {
-    if (!this.journalLockHeld || handle.fd === undefined) return
+    if (!this.journalLockHeld) return
     this.journalLockHeld = false
     flockSync(handle.fd, 'un')
   }
@@ -383,12 +564,13 @@ export class SessionFileLease {
         (expectedLock !== undefined && !sameIdentity(expectedLock, before))) {
         throw unsafeStorage('session lock 类型、owner 或 nlink 无效')
       }
+      // A losing contender must not chmod an inode held by the current owner.
+      flockSync(lockFd, 'exnb')
       fchmodSync(lockFd, FILE_MODE)
       const after = fstatSync(lockFd)
       if (!sameIdentity(before, after) || !isPrivateFile(after)) {
         throw unsafeStorage('session lock inode 或 mode 不安全')
       }
-      flockSync(lockFd, 'exnb')
       this.lockFd = lockFd
       this.lockIdentity = Object.freeze({ dev: after.dev, ino: after.ino })
       this.assertLockInvariant()
