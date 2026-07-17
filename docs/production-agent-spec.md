@@ -543,11 +543,12 @@ flowchart LR
 
 M0 不改变工具行为，先冻结后续实现依赖的语义。
 
-已接受的基础决策见：
+已接受的基础决策与后续存储生命周期决策见：
 
 - [`ADR-0001：版本化 Durable Event Store`](adr/0001-versioned-durable-event-store.md)
 - [`ADR-0002：模型生成与工具执行分为两个阶段`](adr/0002-two-phase-model-and-tool-execution.md)
 - [`ADR-0003：Unknown Outcome 与人工对账`](adr/0003-unknown-outcome-and-reconciliation.md)
+- [`ADR-0004：分阶段演进 Session Storage 生命周期`](adr/0004-session-storage-lifecycle.md)
 
 | ID | 任务 | 产物 | 退出条件 |
 | --- | --- | --- | --- |
@@ -972,8 +973,122 @@ M3 退出条件：生产 profile 的 `process.execute` 只能经过 Sandbox Back
 
 #### PR 11：存储生命周期
 
-- 在 M1 最小耐久基础上增加 rotation、quota、retention、归档和恢复诊断。
-- 明确优雅关闭、异常退出、旧 session 升级和清理流程。
+PR11 不把 rotation、manifest、quota、archive 继续堆入当前 `SessionStore`。公开
+`SessionWriter` / `DurableEventWriter` 契约保持不变，`SessionStore` 只保留门面、
+事件封装与 projection；物理扫描、分段布局和离线生命周期分别落在独立模块。
+实现按 PR11A–PR11D 顺序推进，前一阶段的 crash/fault gate 未通过时不得进入下一阶段。
+
+```mermaid
+flowchart LR
+    Caller["Runner / Recovery / Pipeline"] --> Facade["SessionStore facade<br/>ordered write queue + projection"]
+    Facade --> Lease["Legacy File Lease<br/>pinned directory / lock / journal descriptors"]
+    Lease --> FixedLock["Fixed lock flock<br/>writer ex / doctor sh"]
+    Lease --> JournalLock["Canonical journal lifetime flock<br/>writer ex / doctor sh"]
+    Lease --> Reader["Journal Scanner<br/>bounded record + typed diagnostics"]
+    Facade --> Segments["Segment Storage<br/>legacy fence + active/sealed segments"]
+    Facade --> Reserve["Quota Admission<br/>regular soft limit + critical reserve"]
+    Doctor["session doctor<br/>fixed sh → journal sh"] --> Reader
+    Lifecycle["Offline Lifecycle Manager<br/>archive / restore / retention plan"] --> FixedLock
+    Lifecycle --> Segments
+    Segments --> Live[("Live session bundle")]
+    Lifecycle --> Archive[("Private same-filesystem archive")]
+    Signal["SIGINT / SIGTERM"] --> Shutdown["Abort turn → close Registry → flush Store"]
+    Shutdown --> Facade
+```
+
+##### PR11A：格式诊断与安全关停地基
+
+- 磁盘布局暂时保持 `<sessionId>.jsonl + <sessionId>.lock`，durable ack 语义不变。
+- 新增分块 journal scanner；按最终 UTF-8 字节限制单条新记录为 1 MiB，不再把整个
+  journal 作为一个 `Buffer` 读取。读取既有记录使用独立的 16 MiB 有界兼容上限，避免
+  把新写限制错误地变成旧 session 破坏性升级；超过兼容上限必须诊断并离线迁移，不能
+  在在线恢复中无界分配。跨记录继续全局校验 v1/v2 顺序、`sequence`、`eventId` 和
+  `materializationId`。
+- 新增稳定、脱敏的恢复诊断码和只读 `session doctor --session <id>`；doctor 只获取
+  已存在 fixed lock 与 canonical journal 的 non-blocking shared flock，遇任一活跃 writer
+  返回 `busy`，不得创建、chmod、truncate 或猜测修复。当前版本 writer 按 fixed lock →
+  canonical journal 获取 lifetime exclusive flock，doctor 同序加锁，双方均按 journal →
+  fixed lock 反序释放。只有持有 exclusive writer lock 的正常恢复可以截断 EOF 半行；
+  中间损坏、完整错误尾行、无效 UTF-8、sequence 缺口与重复 ID 继续 fail closed。
+- journal flock 是 fixed lock inode 被替换后的当前版本纵深防护，不会让旧二进制追溯获得
+  第二把锁。PR11A 禁止新旧 writer 并行或滚动升级；升级顺序必须是停止全部旧 writer →
+  doctor → 启动新版本。旧 writer 必然拒绝的 storage-format fence 在 PR11B 实现。
+- checkpoint 增加 `throughSequence`，同时兼容旧 checkpoint。
+- `SessionStore.open()` 成为仓内生产调用的异步准备入口；构造函数暂时保留兼容。
+- chat/run 同时处理 SIGINT 与 SIGTERM。one-shot `run` 先取消 active turn，有界等待后按
+  Registry → Store 顺序关闭；干净的 SIGINT/SIGTERM 取消分别退出 130/143，flush/close
+  失败退出 1。交互 `chat` 的 active turn 上第一次 SIGINT 只取消该 turn 并保留 REPL；
+  空闲 SIGINT 或任意 SIGTERM 才进入完整关停，关停中的第二次 SIGINT 强制退出 130。
+  若 Provider 或工具不响应取消，
+  grace timeout 后必须有界退出并由外部 supervisor 执行最终 `SIGKILL`，此异常路径不承诺
+  flush。第二次 SIGINT/SIGKILL 同样由恢复协议兜底，不伪装成优雅关闭。
+
+PR11A 退出条件：现有 v1/v2 与 Operation crash matrix 全部通过；scanner 的内存由
+chunk、单条记录和必要索引界定；doctor 对 missing/busy/healthy/recoverable/corrupt
+返回稳定结果且不包含记录正文；真实 SIGTERM 能 flush buffered 记录并释放锁。
+本阶段不宣称已经具备 rotation、session quota 或 archive。
+
+当前证据（2026-07-16，非 CI）：`pnpm check` 为 344 tests、334 pass、10 个平台 skip、
+0 fail，PR11A 定向矩阵 92/92，build、diff check 和 deterministic seccomp artifact 2/2
+通过；11 点 Operation `SIGKILL` matrix、真实信号子进程与 doctor 矩阵均包含在内。真实
+Provider Key 的 `pnpm start` 完成 create → clean close → doctor → continue → doctor，两个
+固定标记正确，doctor 从 6 条到 11 条记录均为 `healthy`。值级扫描检查 2 个 `.env` secret
+value，journal 命中为 0，命令输出未显示 Key。该证据不扩张到 rotation、quota、主机掉电、
+目标 Linux supervisor 或混合版本滚动升级。
+
+##### PR11B：分段、rotation 与 session quota
+
+- 物理布局使用 `layoutVersion: 1`；Event schema 仍为 v2。首次迁移必须在固定 session
+  lock 下先构造并同步新 bundle，再把旧 `<sessionId>.jsonl` 原子替换为旧程序必然拒绝的
+  storage-format fence，避免旧 writer 重新创建单文件形成 split brain。
+- manifest 只是可重建索引，不是数据真相；sequence、eventId、materializationId 和
+  Operation projection 必须由全部 segment 连续扫描恢复。
+- rotation 在 Store 单写队列内完成。默认 segment target 为 16 MiB；单条记录不可跨段。
+  先同步并封存 active segment，再建立唯一新 active segment并发布 catalog。sealed segment
+  的任何尾部损坏均 fatal；只有唯一 active segment 的 EOF 半行可修复。
+- 默认 regular session soft quota 为 64 MiB，另有 16 MiB critical reserve。每个
+  `operation.started` 在 durable ack 前，必须从 reserve 原子预留最多两个 1 MiB 记录，
+  覆盖 terminal 与 materialization；额度不足时禁止 dispatch。quota/rotation/admission
+  在同一写队列临界区，拒绝不得消耗 sequence 或留下半条记录。
+- group commit 定时窗口保持关闭；普通 buffered 事件仍由后续 durable event、rotation
+  或 close 同步。PR11 继续只承诺进程崩溃恢复，不把目录 fsync/rename fault test 表述为
+  已证明主机掉电耐久。
+
+PR11B 退出条件：阈值、Unicode 字节、跨段全序、并发 append、单记录超限、critical
+reserve、sealed corruption、legacy fence 和 rotation crash point 全部通过；现有 11 点
+Operation crash matrix 在极小 segment threshold 下再次通过。
+
+##### PR11C：归档、恢复、保留与目录额度
+
+- 生命周期管理是显式离线操作，不进入 `SessionStore` 热路径。active writer、正在恢复、
+  unresolved/uncertain 或 pinned session 一律跳过。
+- archive/restore 首版只支持同一文件系统的 private local directory 与 atomic rename；
+  archive manifest 保存 segment inventory、sequence range、字节数和 SHA-256。发布前必须
+  完整同步并复验；允许 crash 后暂时存在两份 canonical copy，不允许两份都不存在。
+- 固定 `<sessionId>.lock` inode 与 tombstone 永久保留，archive、restore、retention 和 purge
+  均不得 unlink 或替换它。purge 先原子移动到 `.trash` 并同步，再删除；默认 retention
+  只生成 plan/dry-run，显式 `--apply` 才改变数据。
+- 默认 30 天未活动可归档；自动 purge 默认关闭，显式配置可设为归档后 180 天；live
+  directory admission 默认 1 GiB。若要在多个进程间宣称严格目录额度，必须持有独立固定
+  lifecycle lock；无锁 `stat → append` 不能作为硬保证。
+- 遇 symlink、hardlink、特殊文件、owner/mode 异常、digest/catalog 不一致或跨文件系统
+  archive 时 fail closed，并给出不含事件正文的诊断。
+
+PR11C 退出条件：archive publish/source cleanup/tombstone/trash 的 fault 与真实 SIGKILL
+矩阵通过；active writer 竞争、restore 冲突、到期边界、重复执行幂等、权限与 digest
+校验通过；任何故障都保留至少一份可诊断 canonical copy。
+
+##### PR11D：运维验收与真实链路
+
+- 提供 storage runbook、doctor/archive/restore/retention CLI 示例、容量告警与人工恢复流程。
+- 在 Linux release gate 中验证 SIGTERM、grace timeout 后 SIGKILL、极小 segment rotation、
+  lock 竞争和 crash recovery；真实 systemd 行为必须在 delegated unit 中执行。
+- 每阶段真实 Key E2E 只证明装配：Provider → Ledger → Event Store → clean close/reopen，
+  最终阶段再覆盖 doctor、跨 segment continue、archive/restore。真实 Key 不用于证明 fsync、
+  quota 或 crash consistency，也不得出现在 segment、manifest、archive、diagnostic 或输出中。
+
+明确延后：SQLite/Postgres、对象存储、远程/压缩/加密 archive、NFS/distributed writer、
+原地删除历史 Operation 事实、全文 session index，以及 async-iterator RecoveryJournal 大改。
 
 #### PR 12：审计与 OpenTelemetry
 
@@ -1069,7 +1184,8 @@ M3 退出条件：生产 profile 的 `process.execute` 只能经过 Sandbox Back
 1. M1 只承诺进程崩溃耐久，还是同时承诺主机掉电耐久；后者需要目录项 fsync 和更强故障测试。
 2. 本机 HMAC 密钥的生成、轮换和安全存储方式。
 3. 大型或敏感工具结果使用内联 `modelResult` 还是加密 `resultRef`。
-4. Event Store 的 group commit 窗口、rotation 大小、quota 和 retention 默认值。
+4. Event Store 的 timed group commit 是否在 PR13 根据性能数据启用；PR11 固定为关闭，
+   rotation、quota 与 retention 默认值已在 PR11B/PR11C 冻结。
 5. OpenTelemetry 指标、trace 和 audit event 的稳定字段命名。
 
 默认决策原则：优先选择实现规模更小、故障语义更明确、可通过自动化测试证明的方案。

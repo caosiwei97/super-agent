@@ -20,7 +20,7 @@ Session 单写者使用原生内核文件锁。源码安装需要 Python 与 C/C
 - `super-agent`：真正的可执行 CLI。`package.json#bin` 由 npm/pnpm 在 macOS、Linux 生成 POSIX shim，在 Windows 生成 `.cmd`/PowerShell shim。
 - `import { ... } from 'super-agent'`：无启动副作用的 Node 模块入口，类型声明位于 `dist/index.d.ts`。
 
-CLI 包含两个子命令：
+CLI 包含四类命令：
 
 ```bash
 super-agent chat
@@ -28,11 +28,13 @@ super-agent chat --continue --session <session-id>
 super-agent run "只回复 OK"
 super-agent run --prompt "只回复 OK"
 super-agent run "执行可信的写操作" --yes
+super-agent ops list --session <session-id>
+super-agent session doctor --session <session-id>
 ```
 
 不希望全局 link 时，可以使用开发入口 `pnpm cli -- chat`，或在构建后直接运行 `node dist/bin/super-agent.js run "任务"`。
 
-`run` 提供稳定的退出码，适合脚本、CI 和其他进程调用；`chat` 使用 Node `readline` 进入交互模式。两者共用同一个对话编排器。会话状态已经由 JSONL 持久化，因此跨平台核心运行不依赖 tmux。仅在 macOS/Linux 需要人工挂后台或随时接回终端时，可以把 tmux 作为外层托管：
+`run` 提供稳定的退出码，适合脚本、CI 和其他进程调用；正常完成为 0，被 `SIGINT`/`SIGTERM` 取消分别为 130/143，flush 或资源关闭失败为 1。`chat` 使用 Node `readline` 进入交互模式：active turn 上第一次 `SIGINT` 只取消当前 turn 并保留 REPL，空闲时 `SIGINT` 或任意时刻 `SIGTERM` 才进入完整关停；关停中的第二次 `SIGINT` 以 130 强制退出。两者共用同一个对话编排器。会话状态已经由 JSONL 持久化，因此跨平台核心运行不依赖 tmux。仅在 macOS/Linux 需要人工挂后台或随时接回终端时，可以把 tmux 作为外层托管：
 
 ```bash
 tmux new-session -s super-agent 'super-agent chat --continue --session <session-id>'
@@ -86,17 +88,19 @@ M3 PR10 的历史基线为 226 tests、221 pass、5 个 macOS 上的 Linux-only 
 
 2026-07-16 的 PR10B 非 CI 验收结果：宿主普通套件为 281 tests、271 pass、10 个平台 skip、0 fail；aarch64（OCI 平台名 linux/arm64）的 non-skippable `pnpm test:linux-release` 为 1/1 pass，另有 46 项 Linux 专项测试为 45 pass、1 个 Darwin-only 预期 skip。2026-07-15 的同阶段真实 Key production E2E 通过 `pnpm start` 完成 Provider → Policy/Approval → durable Ledger → Router → Sandbox → 固定 `workspace_inspect` helper，两 step 后 Operation 为 `succeeded`，cgroup/staging 无残留。Key 未输出，未进入 workspace、rootfs 或 journal，临时 session 已清理。
 
-上述证据只认证当前 arm64 容器内核和 Provider 装配链。仓库中的 x86_64 BPF 仍是 candidate；`SUPER_AGENT_SANDBOX_CRASH_SUPERVISOR` 只是部署声明，尚需在真实 systemd delegated unit 中注入 launcher/Agent `SIGKILL` 与 OOM，证明 `KillMode=control-group` 回收整个 service subtree。M4 运维闭环也尚未完成。
+2026-07-16 的 PR11A 非 CI 验收结果：最终 `pnpm check` 为 344 tests、334 pass、10 个平台 skip、0 fail，PR11A 定向矩阵为 92/92，`pnpm build`、diff check 与 deterministic seccomp artifact 2/2 均通过。使用 `.env` 中真实 Provider Key 的 `pnpm start` 依次完成 create → clean close → doctor → continue → doctor；两个固定模型标记均返回，doctor 从 6 条记录到 11 条记录都为 `healthy`。值级扫描检查 2 个 `.env` secret value，journal 命中数为 0，命令输出未显示 Key。该证据只证明 Provider、Ledger、Store、close/reopen 和 doctor 装配，不证明 rotation、quota、主机掉电或混合版本滚动升级。
+
+上述 sandbox 证据只认证当前 arm64 容器内核和 Provider 装配链。仓库中的 x86_64 BPF 仍是 candidate；`SUPER_AGENT_SANDBOX_CRASH_SUPERVISOR` 只是部署声明，尚需在真实 systemd delegated unit 中注入 launcher/Agent `SIGKILL` 与 OOM，证明 `KillMode=control-group` 回收整个 service subtree。M4 的 PR11A 已完成本地门禁，分段、quota、archive 与目标 Linux 生命周期验收仍未完成。
 
 ## 运行链路
 
 ```mermaid
 flowchart TD
     Module["index.ts\nNode 模块入口（无副作用）"] --> PublicAPI["可复用 API\nRunner / Registry / Store"]
-    Bin["bin/super-agent.ts\n跨平台可执行入口"] --> CLI["CLI Main\nrun / chat"]
+    Bin["bin/super-agent.ts\n跨平台可执行入口"] --> CLI["CLI Main\nrun / chat / ops / session doctor"]
     CLI --> Runner["ConversationRunner\n单轮事务边界"]
     PublicAPI --> Runner
-    CLI --> Cancel["Root AbortController\nSIGINT + Turn Deadline"]
+    CLI --> Cancel["Root AbortController\nSIGINT / SIGTERM + Turn Deadline"]
     Cancel -.-> Runner
     Runner --> Compact["Context Compactor\nMicrocompact + LLM Summary"]
     Runner --> Recovery["Recovery Coordinator\nuncertain gate / reconciliation"]
@@ -104,7 +108,12 @@ flowchart TD
     Loop --> Model["ModelGateway\nStable requestId + Commit Guard"]
     Model --> Provider["LLM Provider"]
     Model --> Audit["Model attempt audit\nstarted / failed / retried / completed"]
-    Runner --> Store["SessionStore\nVersioned JSONL Event Store\n单写者锁 + Durable Append"]
+    Runner --> Store["SessionStore facade\nOrdered Writes + Projection"]
+    Store --> Lease["SessionFileLease\nPinned Directory / Lock / Journal"]
+    Lease --> FixedLock["Fixed lock flock\nwriter ex / doctor sh"]
+    Lease --> JournalLock["Journal lifetime flock\nwriter ex / doctor sh"]
+    Lease --> Scanner["Journal Scanner\nStreaming + Typed Diagnostics"]
+    Doctor["session doctor\nfixed sh → journal sh"] --> Scanner
     Audit --> Store
     Recovery --> Store
     Loop --> Pipeline["ToolExecutionPipeline\n唯一公开运行时执行入口"]
@@ -207,7 +216,10 @@ flowchart TD
 | `src/execution/` | Operation Ledger、Pipeline/Router、Linux Sandbox、Filesystem/Network Broker、正则 worker、恢复与对账 |
 | `src/security/` | 动态能力、可执行约束、typed policy rules 与 hard-deny 外传门禁 |
 | `src/core/workspace.ts` | 文件工具的工作区路径与 symlink 边界 |
-| `src/session/store.ts` | 版本化 append-only JSONL、单写者锁、durable append 和 checkpoint 恢复 |
+| `src/session/store.ts` | Session 门面、事件顺序、projection、durable append 和 checkpoint 恢复 |
+| `src/session/session-file-lease.ts` | 旧单文件布局的固定 descriptor、fixed→journal 双锁和 inode/path 安全校验 |
+| `src/session/journal-scanner.ts` | 分块 JSONL 扫描、顺序校验和脱敏结构化诊断 |
+| `src/session/doctor.ts` | 只读 shared-lock Session 诊断；不创建、不 chmod、不修复 |
 | `src/tools/` | 内置工具和真实 MCP 工具的延迟发现 `tool_search` |
 | `src/mcp/` | GitHub 托管 Streamable HTTP MCP 客户端 |
 | `src/cli/` | 子命令解析、run/chat 执行、终端展示和人工审批 |
@@ -272,11 +284,11 @@ flowchart TD
 - 未知 MCP 默认声明 `network.egress + external.write`，绑定 endpoint origin、拒绝 HTTP redirect、串行执行并要求审批。
 - GitHub token 只发送到代码中固定的官方 HTTPS MCP 地址。
 - 工具结果长度、文件大小、搜索文件数和匹配数均有上限。
-- Session journal 使用固定 lock inode 上的内核单写者锁、单调事件序号、`0700/0600` 权限和显式 durable append；旧版无版本 JSONL 仍可恢复。
+- Session journal 的当前版本 writer 按 fixed lock → canonical journal 获取两个 lifetime exclusive flock，doctor 同序获取 shared flock，释放顺序相反；再配合固定 descriptor、单调事件序号、`0700/0600` 权限和显式 durable append。新记录限制为 1 MiB，旧记录使用独立的 16 MiB 有界兼容读取上限。`session doctor` 只读诊断，旧版无版本 JSONL 仍可恢复。PR11A 不支持旧二进制与新 writer 并行或滚动升级：必须先停掉全部旧 writer、运行 doctor，再启动新版本；旧程序无法理解新布局的 storage fence 留到 PR11B。
 - 每轮取消与 deadline 贯穿模型、摘要、审批、锁、Web、MCP 和工具；POSIX Shell 取消/超时会回收独立进程组，Windows 当前仅保证直接子进程终止。
 
 仍未关闭的发布边界：verified staging 不是原子文件系统 snapshot，也不抵御任意同 UID 恶意宿主进程；staging 发生在 operation cgroup 之前，仍依赖 service envelope、串行 admission 与宿主配额。seccomp manifest 当前状态是 `candidate-linux-release-gate-required`，必须分别在 aarch64/x86_64 目标内核执行并保存 attestation。probe 只能校验 crash supervisor 声明值，不能证明 systemd/OCI 真的回收过崩溃 service；真实部署必须做外部 `SIGKILL/OOM` 测试。memory/swap 的配置和回读已有测试，但当前公开 matrix 没有保存 OOM 的 `memory.events` 证明。Regex worker 仍使用受硬边界保护的 ECMAScript RegExp，而非线性时间 RE2。详见 [`docs/operations/linux-sandbox.md`](docs/operations/linux-sandbox.md)。
 
 循环检测的细节见 [`src/agent/loop-detection.md`](src/agent/loop-detection.md)。
 
-从当前 Demo 骨架演进到单机生产 Agent 内核的目标架构、里程碑和验收门槛，见 [`docs/production-agent-spec.md`](docs/production-agent-spec.md)。
+Session 诊断、信号关停和故障处理见 [`docs/operations/session-storage.md`](docs/operations/session-storage.md)。从当前 Demo 骨架演进到单机生产 Agent 内核的目标架构、里程碑和验收门槛，见 [`docs/production-agent-spec.md`](docs/production-agent-spec.md)。
