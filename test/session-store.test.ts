@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict'
-import { appendFile, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { appendFile, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import type { ModelMessage } from 'ai'
 import { SessionStore } from '../src/session/store.js'
+import {
+  activeSessionSegmentPath,
+  readSessionEventBytes,
+} from './session-storage-helpers.js'
 
 describe('SessionStore', () => {
   it('restores the latest checkpoint plus raw tail and budget snapshot', async (context) => {
@@ -23,14 +27,20 @@ describe('SessionStore', () => {
 
     await store.appendCheckpoint({ messages: compacted, summary: 'summary-v1', budgetUsed: 11 })
     await store.appendMessages(tail, 17)
-    await appendFile(join(directory, 'recoverable.jsonl'), '{"torn":', 'utf-8')
+    await store.close()
+    const activePath = await activeSessionSegmentPath(directory, 'recoverable')
+    await appendFile(activePath, '{"torn":', 'utf-8')
+    const recovered = await SessionStore.open('recoverable', {
+      directory,
+      onWarning: (warning) => warnings.push(warning),
+    })
 
-    const restored = await store.loadState()
+    const restored = await recovered.loadState()
 
     assert.deepEqual(restored.messages, [...compacted, ...tail])
     assert.equal(restored.summary, 'summary-v1')
     assert.equal(restored.budgetUsed, 17)
-    const log = await readFile(join(directory, 'recoverable.jsonl'), 'utf-8')
+    const log = (await readSessionEventBytes(directory, 'recoverable')).toString('utf-8')
     assert.match(log, /"type":"checkpoint"/)
     assert.match(log, /"type":"messages"/)
     const entries = log.trim().split('\n').flatMap((line) => {
@@ -45,6 +55,7 @@ describe('SessionStore', () => {
     assert.equal(checkpoint.throughSequence, 0)
     assert.equal(batch.messages.length, 1)
     assert.equal(batch.budgetUsed, 17)
+    await recovered.close()
   })
 
   it('uses the newest checkpoint as the recovery base', async (context) => {

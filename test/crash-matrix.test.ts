@@ -18,6 +18,7 @@ import {
   type CrashPoint,
   type CrashSignal,
 } from './fixtures/crash-matrix-contract.js'
+import { sessionSegmentPaths } from './session-storage-helpers.js'
 
 const workerFixture = fileURLToPath(
   new URL('./fixtures/crash-matrix-worker.ts', import.meta.url),
@@ -114,6 +115,8 @@ async function runCase(context: TestContext, point: CrashPoint) {
 
   let store = await SessionStore.open(sessionId, { directory })
   let events = await store.replayEvents()
+  assert.ok((await sessionSegmentPaths(directory, sessionId)).entries.length > 1,
+    'tiny segment target must exercise cross-segment recovery')
   assertContinuousSequence(events)
   assertCausalPrelude(events)
   assert.equal(events.some((event) => event.type === 'checkpoint'), false)

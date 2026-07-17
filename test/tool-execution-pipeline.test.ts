@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { constants } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -23,11 +24,16 @@ import {
 import type { OperationEventDraft, OperationProjection } from '../src/execution/operation-types.js'
 import {
   SessionStore,
-  nodeSessionJournalIo,
-  type SessionJournalFile,
   type SessionJournalIo,
+  type SessionStoreOptions,
 } from '../src/session/store.js'
 import { RecoveryCoordinator } from '../src/execution/recovery-coordinator.js'
+import { SessionQuotaError } from '../src/session/session-quota.js'
+import {
+  nodeSessionSegmentStorageIo,
+  type SessionSegmentFile,
+  type SessionSegmentStorageIo,
+} from '../src/session/session-segment-storage.js'
 
 function definition(
   name: string,
@@ -55,9 +61,14 @@ async function setup(
   context: TestContext,
   io?: SessionJournalIo,
   pipelineOptions?: ToolExecutionPipelineOptions,
+  storeOptions: Omit<SessionStoreOptions, 'directory' | 'io'> = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), 'super-agent-pipeline-'))
-  const store = await SessionStore.open('pipeline-test', { directory: root, io })
+  const store = await SessionStore.open('pipeline-test', {
+    directory: root,
+    ...storeOptions,
+    ...(io === undefined ? {} : { io }),
+  })
   const registry = new ToolRegistry()
   context.after(async () => {
     await registry.close().catch(() => undefined)
@@ -383,23 +394,52 @@ describe('ToolExecutionPipeline', () => {
   })
 
   it('does not dispatch when the durable start sync fails', async (context) => {
-    const io: SessionJournalIo = {
-      readFile: (path) => nodeSessionJournalIo.readFile(path),
+    let failStartedSync = false
+    const segmentIo: SessionSegmentStorageIo = {
+      ...nodeSessionSegmentStorageIo,
       open: async (path, flags, mode) => {
-        const handle = await nodeSessionJournalIo.open(path, flags, mode)
-        const wrapped: SessionJournalFile = {
+        const handle = await nodeSessionSegmentStorageIo.open(path, flags, mode)
+        if (!path.endsWith('.active.jsonl') || (flags & constants.O_APPEND) === 0) return handle
+        const wrapped: SessionSegmentFile = {
+          fd: handle.fd,
           chmod: (value) => handle.chmod(value),
           truncate: (length) => handle.truncate(length),
-          write: (buffer, offset, length) => handle.write(buffer, offset, length),
+          stat: () => handle.stat(),
+          read: (buffer, offset, length, position) =>
+            handle.read(buffer, offset, length, position),
+          write: async (buffer, offset, length) => {
+            const result = await handle.write(buffer, offset, length)
+            const raw = Buffer.from(
+              buffer.subarray(offset, offset + result.bytesWritten),
+            ).toString('utf8')
+            try {
+              const event = JSON.parse(raw.trimEnd()) as Record<string, unknown>
+              if (event.type === 'operation' && event.status === 'started') {
+                failStartedSync = true
+              }
+            } catch {
+              // Short writes are reassembled by production storage; this test
+              // uses the native complete-write path.
+            }
+            return result
+          },
           datasync: async () => {
-            throw Object.assign(new Error('injected start datasync failure'), { code: 'EIO' })
+            if (failStartedSync) {
+              throw Object.assign(new Error('injected start datasync failure'), { code: 'EIO' })
+            }
+            await handle.datasync()
           },
           close: () => handle.close(),
         }
         return wrapped
       },
     }
-    const { registry, pipeline } = await setup(context, io)
+    const { registry, pipeline } = await setup(
+      context,
+      undefined,
+      undefined,
+      { segmentIo },
+    )
     let executions = 0
     registry.register(definition('write_probe', async () => { executions++; return 'never' }, {
       capabilitySet: ['external.write'],
@@ -421,6 +461,93 @@ describe('ToolExecutionPipeline', () => {
     })
     assert.equal(executions, 0)
   })
+
+  it('does not dispatch when started cannot reserve its third critical slot',
+    async (context) => {
+      const { store, registry, pipeline } = await setup(
+        context,
+        undefined,
+        undefined,
+        {
+          maxRecordBytes: 1024,
+          maxReadRecordBytes: 4096,
+          segmentTargetBytes: 4096,
+          regularQuotaBytes: 1024 * 1024,
+          criticalReserveBytes: 2 * 1024,
+        },
+      )
+      let executions = 0
+      registry.register(definition('quota_write_probe', async () => {
+        executions++
+        return 'must-not-run'
+      }, {
+        capabilitySet: ['external.write'],
+        isConcurrencySafe: false,
+        isReadOnly: false,
+        requiresApproval: true,
+      }))
+
+      await assert.rejects(pipeline.executeBatch(runContext(), [{
+        toolCallId: 'call-quota-write',
+        toolName: 'quota_write_probe',
+        input: { value: 'safe' },
+      }], { approve: async () => true }), (error: unknown) => {
+        const values = error instanceof AggregateError ? error.errors : [error]
+        return values.some((value) => value instanceof SessionQuotaError &&
+          value.code === 'critical_reserve_exceeded')
+      })
+      assert.equal(executions, 0)
+      const statuses = (await store.replayEvents())
+        .filter(({ type }) => type === 'operation')
+        .map((event) => parseOperationEvent(event).status)
+      assert.equal(statuses.includes('started'), false)
+    })
+
+  it('dispatches after durable started even when only manifest cache publication fails',
+    async (context) => {
+      let manifestPublications = 0
+      let warnings = 0
+      const { store, registry, pipeline } = await setup(
+        context,
+        undefined,
+        undefined,
+        {
+          onWarning: () => { warnings++ },
+          segmentProbe(point) {
+            if (point !== 'manifest_published') return
+            manifestPublications++
+            if (manifestPublications === 4) {
+              throw new Error('injected started manifest cache failure')
+            }
+          },
+        },
+      )
+      let executions = 0
+      registry.register(definition('manifest_cache_probe', async () => {
+        executions++
+        return 'executed-once'
+      }, {
+        capabilitySet: ['external.write'],
+        isConcurrencySafe: false,
+        isReadOnly: false,
+        requiresApproval: true,
+      }))
+
+      const result = await pipeline.executeBatch(runContext(), [{
+        toolCallId: 'call-manifest-cache',
+        toolName: 'manifest_cache_probe',
+        input: { value: 'safe' },
+      }], { approve: async () => true })
+
+      assert.equal(executions, 1)
+      assert.equal(result.outcomes[0]?.operation.status, 'succeeded')
+      assert.ok(warnings >= 1)
+      assert.deepEqual((await store.replayEvents())
+        .filter(({ type }) => type === 'operation')
+        .map((event) => parseOperationEvent(event).status), [
+        'proposed', 'approved', 'started', 'succeeded',
+      ])
+    })
 
   it('maps a generic dispatch rejection to uncertain and emits no fake result', async (context) => {
     const { registry, pipeline } = await setup(context)
@@ -540,10 +667,28 @@ describe('ToolExecutionPipeline', () => {
     const { registry, pipeline } = await setup(context)
     let active = 0
     let maxActive = 0
+    let releaseBoth!: () => void
+    const bothEntered = new Promise<void>((resolve) => { releaseBoth = resolve })
+    const waitForBoth = async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([
+          bothEntered,
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error(
+              'concurrency-safe dispatches did not overlap',
+            )), 2_000)
+          }),
+        ])
+      } finally {
+        if (timer) clearTimeout(timer)
+      }
+    }
     const execute = async ({ value }: { value: string }) => {
       active++
       maxActive = Math.max(maxActive, active)
-      await new Promise((resolve) => setTimeout(resolve, 15))
+      if (active === 2) releaseBoth()
+      await waitForBoth()
       active--
       return value
     }

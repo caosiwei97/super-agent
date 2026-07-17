@@ -7,7 +7,6 @@ import {
 } from '../execution/operation-ledger.js'
 import type { OperationProjection } from '../execution/operation-types.js'
 import {
-  DEFAULT_MAX_JOURNAL_RECORD_BYTES,
   SessionJournalScanError,
   scanSessionJournal,
   type SessionJournalDiagnostic,
@@ -26,6 +25,30 @@ import {
   nodeSessionJournalIo,
   type SessionJournalIo,
 } from './session-file-lease.js'
+import {
+  DEFAULT_SESSION_MAX_READ_RECORD_BYTES,
+  DEFAULT_SESSION_MAX_RECORD_BYTES,
+  defaultSessionStorageLimits,
+  type SessionFormatV1,
+  type SessionStorageLimits,
+} from './session-layout.js'
+import {
+  migrateLegacySession,
+  type SessionMigrationProbe,
+} from './session-migration.js'
+import {
+  calculateOperationReservationTransition,
+  operationQuotaAdmissionClass,
+  preflightSessionQuotaAdmission,
+  rebuildSessionQuotaReservation,
+  type SessionQuotaAdmissionClass,
+} from './session-quota.js'
+import {
+  SessionSegmentStorage,
+  type SessionSegmentDiagnostic,
+  type SessionSegmentStorageIo,
+  type SessionSegmentStorageProbe,
+} from './session-segment-storage.js'
 
 export {
   nodeSessionJournalIo,
@@ -38,7 +61,7 @@ const SESSION_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/
 const CURRENT_SCHEMA_VERSION = 2 as const
 
 /** Existing v1/v2 records may be larger than the stricter ceiling for new writes. */
-export const DEFAULT_MAX_SESSION_READ_RECORD_BYTES = 16 * 1024 * 1024
+export const DEFAULT_MAX_SESSION_READ_RECORD_BYTES = DEFAULT_SESSION_MAX_READ_RECORD_BYTES
 
 interface EntryBase {
   timestamp: string
@@ -125,6 +148,7 @@ export interface DurableEventWriter {
 export type SessionStoreDiagnosticCode =
   | SessionJournalScanError['code']
   | SessionJournalDiagnostic['code']
+  | SessionSegmentDiagnostic['code']
 
 export interface SessionStoreDiagnostic {
   code: SessionStoreDiagnosticCode
@@ -158,12 +182,29 @@ export interface SessionStoreOptions {
   maxRecordBytes?: number
   /** Compatibility ceiling for existing records. Must be at least maxRecordBytes. */
   maxReadRecordBytes?: number
+  /** Immutable soft segment target for newly migrated/created layout-v1 sessions. */
+  segmentTargetBytes?: number
+  /** Immutable regular event soft quota. */
+  regularQuotaBytes?: number
+  /** Immutable reserve for Operation recovery obligations and critical records. */
+  criticalReserveBytes?: number
   io?: SessionJournalIo
+  /** Descriptor-preserving segment I/O seam for fault tests. */
+  segmentIo?: SessionSegmentStorageIo
+  migrationProbe?: SessionMigrationProbe
+  segmentProbe?: SessionSegmentStorageProbe
 }
 
 interface PreparedSessionEvent {
   readonly event: SessionEvent
   readonly bytes: Uint8Array
+}
+
+interface RecoveredSessionStorageState {
+  readonly scanned: SessionJournalScanResult
+  readonly operations: Map<string, OperationProjection>
+  readonly materializedOperationIds: Set<string>
+  readonly reservationSlots: number
 }
 
 export function createSessionId(now = new Date()) {
@@ -209,17 +250,27 @@ function assertMessages(messages: ModelMessage[]) {
 export class SessionStore implements SessionWriter, DurableEventWriter {
   private readonly lease: SessionFileLease
   private readonly filePath: string
+  private readonly directoryPath: string
   private readonly onWarning: (message: string) => void
   private readonly onDiagnostic: (diagnostic: SessionStoreDiagnostic) => void
-  private readonly maxRecordBytes: number
-  private readonly maxReadRecordBytes: number
+  private readonly requestedLimits: Partial<SessionStorageLimits>
+  private readonly segmentIo: SessionSegmentStorageIo | undefined
+  private readonly migrationProbe: SessionMigrationProbe | undefined
+  private readonly segmentProbe: SessionSegmentStorageProbe | undefined
+  private maxRecordBytes = DEFAULT_SESSION_MAX_RECORD_BYTES
+  private maxReadRecordBytes = DEFAULT_MAX_SESSION_READ_RECORD_BYTES
+  private format: SessionFormatV1 | undefined
+  private segmentStorage: SessionSegmentStorage | undefined
   private writeTail: Promise<void> = Promise.resolve()
   private fatalError: unknown
   private initialized = false
   private nextSequence = 1
   private eventIds = new Set<string>()
   private materializationIds = new Set<string>()
+  private materializedOperationIds = new Set<string>()
   private operations = new Map<string, OperationProjection>()
+  private usedEventBytes = 0
+  private reservedCriticalSlots = 0
   private hasV1Records = false
   private hasV2Records = false
   private closing = false
@@ -233,20 +284,26 @@ export class SessionStore implements SessionWriter, DurableEventWriter {
     validateSessionId(sessionId)
     this.onWarning = options.onWarning || ((message) => console.warn(message))
     this.onDiagnostic = options.onDiagnostic || (() => undefined)
-    this.maxRecordBytes = options.maxRecordBytes ?? DEFAULT_MAX_JOURNAL_RECORD_BYTES
-    if (!Number.isSafeInteger(this.maxRecordBytes) || this.maxRecordBytes <= 0) {
-      throw new Error('maxRecordBytes 必须是正安全整数')
-    }
-    this.maxReadRecordBytes = options.maxReadRecordBytes ??
-      DEFAULT_MAX_SESSION_READ_RECORD_BYTES
-    if (!Number.isSafeInteger(this.maxReadRecordBytes) || this.maxReadRecordBytes <= 0) {
-      throw new Error('maxReadRecordBytes 必须是正安全整数')
-    }
-    if (this.maxReadRecordBytes < this.maxRecordBytes) {
-      throw new Error('maxReadRecordBytes 不得小于 maxRecordBytes')
-    }
+    this.requestedLimits = Object.freeze({
+      ...(options.maxRecordBytes === undefined
+        ? {} : { maxRecordBytes: options.maxRecordBytes }),
+      ...(options.maxReadRecordBytes === undefined
+        ? {} : { maxReadRecordBytes: options.maxReadRecordBytes }),
+      ...(options.segmentTargetBytes === undefined
+        ? {} : { segmentTargetBytes: options.segmentTargetBytes }),
+      ...(options.regularQuotaBytes === undefined
+        ? {} : { regularQuotaBytes: options.regularQuotaBytes }),
+      ...(options.criticalReserveBytes === undefined
+        ? {} : { criticalReserveBytes: options.criticalReserveBytes }),
+    })
+    // Validate explicit values without turning omitted defaults into reopen conflicts.
+    defaultSessionStorageLimits(this.requestedLimits)
+    this.segmentIo = options.segmentIo
+    this.migrationProbe = options.migrationProbe
+    this.segmentProbe = options.segmentProbe
+    this.directoryPath = resolve(options.directory || DEFAULT_SESSION_DIR)
     this.lease = new SessionFileLease(
-      resolve(options.directory || DEFAULT_SESSION_DIR),
+      this.directoryPath,
       sessionId,
       options.io || nodeSessionJournalIo,
     )
@@ -319,10 +376,7 @@ export class SessionStore implements SessionWriter, DurableEventWriter {
         operationId: commit.operationId,
         ...(budgetUsed === undefined ? {} : { budgetUsed }),
       }, this.nextAppendSequence()))
-      await this.ensureV2UpgradeMarker()
-      this.assertPreparedEventStillNext(prepared.event)
-      await this.writeEvent(prepared, 'durable')
-      this.acceptEvent(prepared.event)
+      await this.commitPreparedEvent(prepared, undefined, 'durable')
       return true
     })
   }
@@ -354,10 +408,7 @@ export class SessionStore implements SessionWriter, DurableEventWriter {
         this.createEvent(input, this.nextAppendSequence()),
       )
       const operationProjection = this.projectOperationEvent(prepared.event)
-      await this.ensureV2UpgradeMarker()
-      this.assertPreparedEventStillNext(prepared.event)
-      await this.writeEvent(prepared, durability)
-      this.acceptEvent(prepared.event, operationProjection)
+      await this.commitPreparedEvent(prepared, operationProjection, durability)
       return prepared.event
     })
   }
@@ -405,7 +456,8 @@ export class SessionStore implements SessionWriter, DurableEventWriter {
     try {
       await this.writeTail
       if (this.fatalError) closeError = this.fatalError
-      if (this.lease.hasOpenJournal()) await this.lease.datasync()
+      if (this.segmentStorage) await this.segmentStorage.close()
+      else if (this.lease.hasOpenJournal()) await this.lease.datasync()
     } catch (error) {
       closeError = error
     }
@@ -436,42 +488,164 @@ export class SessionStore implements SessionWriter, DurableEventWriter {
 
   private async ensureInitialized() {
     if (this.initialized) return
-    await this.lease.openJournal()
-    const operations = new Map<string, OperationProjection>()
-    const schemaTransition = createSessionSchemaTransitionState()
-    const scanned = await this.scanJournal(false, (record, location) => {
-      validateSessionRecord(record, location.line)
-      validateSessionSchemaTransition(schemaTransition, record, location.line)
-      if (record.schemaVersion === CURRENT_SCHEMA_VERSION && record.type === 'operation') {
-        const operation = parseOperationEvent(record)
-        const projection = applyOperationEvent(operations.get(operation.operationId), operation)
-        operations.set(operation.operationId, projection)
-      }
+    let migrationState: RecoveredSessionStorageState | undefined
+    const migration = await migrateLegacySession({
+      directory: this.directoryPath,
+      sessionId: this.sessionId,
+      lease: this.lease,
+      limits: this.requestedLimits,
+      verifyPreparedBundle: async ({ format, readChunks }) => {
+        migrationState = await this.recoverStorageState(readChunks(), format)
+        this.assertRecoveredQuota(format, migrationState)
+      },
+      ...(this.migrationProbe === undefined ? {} : { probe: this.migrationProbe }),
     })
-    this.nextSequence = scanned.nextSequence
-    this.eventIds = new Set(scanned.eventIds)
-    this.materializationIds = new Set(scanned.materializationIds)
-    this.operations = operations
-    this.hasV2Records = scanned.v2RecordCount > 0
-    this.hasV1Records = scanned.v1RecordCount > 0
+    this.format = migration.format
+    this.maxRecordBytes = migration.format.limits.maxRecordBytes
+    this.maxReadRecordBytes = migration.format.limits.maxReadRecordBytes
 
-    const trailing = scanned.diagnostics[0]
-    if (trailing) {
-      await this.lease.truncate(scanned.validLength)
-      this.reportTrailingFragment(trailing, true)
+    const storage = await SessionSegmentStorage.open({
+      paths: migration.paths,
+      format: migration.format,
+      ...(this.segmentIo === undefined ? {} : { io: this.segmentIo }),
+      ...(this.segmentProbe === undefined ? {} : { probe: this.segmentProbe }),
+      onManifestCacheWarning: (message) => this.emitWarning(message),
+    })
+    let recovered: RecoveredSessionStorageState
+    try {
+      recovered = await this.recoverStorageState(storage.readChunks(), migration.format)
+      this.assertRecoveredQuota(migration.format, recovered)
+      this.acceptRecoveredState(recovered)
+    } catch (error) {
+      try {
+        await storage.close()
+      } catch (closeError) {
+        throw new AggregateError(
+          [error, closeError],
+          '[Session] recovery failed and its segment descriptors could not be closed',
+        )
+      }
+      throw error
     }
+    // Ownership transfers only after recovery and quota admission succeed.
+    // A lazy-init retry must never overwrite an unreachable open storage.
+    this.segmentStorage = storage
+
+    if (migration.repairedLegacyEofBytes > 0) {
+      this.reportTrailingFragment(Object.freeze({
+        code: 'trailing_eof_fragment',
+        severity: 'warning',
+        repaired: false,
+        line: recovered.scanned.lineCount + 1,
+        byteOffset: migration.format.source.byteLength,
+        byteLength: migration.repairedLegacyEofBytes,
+        message: 'Legacy session journal had an unterminated EOF record',
+      }), true, migration.paths.legacyJournalPath)
+    }
+    for (const diagnostic of storage.recoveryDiagnostics) {
+      this.reportSegmentDiagnostic(diagnostic)
+    }
+    // The migration callback is deliberately rechecked against the opened
+    // writer catalog; never trust a callback result across the fence handoff.
+    void migrationState
     this.initialized = true
   }
 
-  private async ensureV2UpgradeMarker() {
-    if (!this.hasV1Records || this.hasV2Records) return
-    const prepared = this.serializeEvent(this.createEvent({
-      type: 'schema.upgraded',
-      fromSchemaVersion: 1,
-      toSchemaVersion: CURRENT_SCHEMA_VERSION,
-    }))
-    await this.writeEvent(prepared, 'buffered')
-    this.acceptEvent(prepared.event)
+  private async recoverStorageState(
+    input: AsyncIterable<Uint8Array>,
+    format: SessionFormatV1,
+  ): Promise<RecoveredSessionStorageState> {
+    const operations = new Map<string, OperationProjection>()
+    const materializedOperationIds = new Set<string>()
+    const schemaTransition = createSessionSchemaTransitionState()
+    await this.lease.assertSafe()
+    const scanned = await scanSessionJournal(input, {
+      maxRecordBytes: format.limits.maxReadRecordBytes,
+      onRecord: (record, location) => {
+        validateSessionRecord(record, location.line)
+        validateSessionSchemaTransition(schemaTransition, record, location.line)
+        if (record.schemaVersion === CURRENT_SCHEMA_VERSION && record.type === 'operation') {
+          const operation = parseOperationEvent(record)
+          const projection = applyOperationEvent(operations.get(operation.operationId), operation)
+          operations.set(operation.operationId, projection)
+        }
+        if (typeof record.materializationId === 'string' &&
+            typeof record.operationId === 'string') {
+          materializedOperationIds.add(record.operationId)
+        }
+      },
+    })
+    await this.lease.assertSafe()
+    if (scanned.diagnostics.length > 0) {
+      throw new Error('[Session] opened segment storage retained an EOF fragment')
+    }
+    const reservation = rebuildSessionQuotaReservation({
+      operations: operations.values(),
+      materializedOperationIds,
+      slotBytes: format.limits.maxRecordBytes,
+    })
+    return Object.freeze({
+      scanned,
+      operations,
+      materializedOperationIds,
+      reservationSlots: reservation.totalSlots,
+    })
+  }
+
+  private assertRecoveredQuota(
+    format: SessionFormatV1,
+    recovered: RecoveredSessionStorageState,
+  ) {
+    const reservedBytes = recovered.reservationSlots * format.limits.maxRecordBytes
+    const hardLimit = format.limits.regularQuotaBytes + format.limits.criticalReserveBytes
+    if (!Number.isSafeInteger(reservedBytes) ||
+        reservedBytes > format.limits.criticalReserveBytes ||
+        !Number.isSafeInteger(recovered.scanned.byteLength + reservedBytes) ||
+        recovered.scanned.byteLength + reservedBytes > hardLimit) {
+      throw new Error(
+        '[Session] recovered event bytes and Operation obligations exceed the immutable quota',
+      )
+    }
+  }
+
+  private acceptRecoveredState(recovered: RecoveredSessionStorageState) {
+    const { scanned } = recovered
+    this.nextSequence = scanned.nextSequence
+    this.eventIds = new Set(scanned.eventIds)
+    this.materializationIds = new Set(scanned.materializationIds)
+    this.materializedOperationIds = new Set(recovered.materializedOperationIds)
+    this.operations = recovered.operations
+    this.usedEventBytes = scanned.byteLength
+    this.reservedCriticalSlots = recovered.reservationSlots
+    this.hasV2Records = scanned.v2RecordCount > 0
+    this.hasV1Records = scanned.v1RecordCount > 0
+  }
+
+  private reportSegmentDiagnostic(diagnostic: SessionSegmentDiagnostic) {
+    const repaired = diagnostic.repaired
+    const message = diagnostic.code === 'trailing_eof_fragment'
+      ? repaired
+        ? '已截断 active session segment 的 EOF 未完成记录'
+        : 'active session segment 存在 EOF 未完成记录，尚未修复'
+      : diagnostic.code === 'active_segment_missing'
+        ? repaired
+          ? '已在 sealed tail 后建立新的 active session segment'
+          : 'sealed tail 后缺少 active session segment，尚未修复'
+        : repaired
+          ? '已从 segment 事实重建可重建 session manifest'
+          : 'session manifest 重建失败；segment 事实仍可用于后续重建'
+    const value: SessionStoreDiagnostic = Object.freeze({
+      code: diagnostic.code,
+      severity: 'warning',
+      sessionId: this.sessionId,
+      path: diagnostic.path,
+      ...(diagnostic.byteOffset === undefined ? {} : { byteOffset: diagnostic.byteOffset }),
+      ...(diagnostic.byteLength === undefined ? {} : { byteLength: diagnostic.byteLength }),
+      repaired,
+      message,
+    })
+    this.emitDiagnostic(value)
+    this.emitWarning(`[Session] ${message}`)
   }
 
   private nextAppendSequence() {
@@ -544,23 +718,142 @@ export class SessionStore implements SessionWriter, DurableEventWriter {
     return event
   }
 
-  private assertPreparedEventStillNext(event: SessionEvent) {
-    if (event.sequence !== this.nextSequence) {
-      throw new Error('[Session] prepared event sequence 已过期')
-    }
-    if (this.eventIds.has(event.eventId)) {
-      throw new Error(`[Session] eventId 重复: ${event.eventId}`)
-    }
-    if (typeof event.materializationId === 'string' &&
-      this.materializationIds.has(event.materializationId)) {
-      throw new Error(`[Session] materializationId 重复: ${event.materializationId}`)
-    }
-  }
-
   private projectOperationEvent(event: SessionEvent) {
     if (event.type !== 'operation') return undefined
     const operation = parseOperationEvent(event)
     return applyOperationEvent(this.operations.get(operation.operationId), operation)
+  }
+
+  private async commitPreparedEvent(
+    prepared: PreparedSessionEvent,
+    operationProjection: OperationProjection | undefined,
+    durability: EventDurability,
+  ) {
+    try {
+      await this.lease.assertSafe()
+    } catch (error) {
+      this.fatalError ||= error
+      throw error
+    }
+    const format = this.requireFormat()
+    const storage = this.requireSegmentStorage()
+    const marker = this.hasV1Records && !this.hasV2Records
+      ? this.serializeEvent(this.createEvent({
+          type: 'schema.upgraded',
+          fromSchemaVersion: 1,
+          toSchemaVersion: CURRENT_SCHEMA_VERSION,
+        }))
+      : undefined
+    const batch = marker === undefined ? [prepared] : [marker, prepared]
+    this.assertPreparedBatchStillNext(batch)
+
+    let reservationSlotsAfter = this.reservedCriticalSlots
+    if (operationProjection) {
+      const before = this.operations.get(operationProjection.operationId)
+      const materialized = this.materializedOperationIds.has(operationProjection.operationId)
+      reservationSlotsAfter += calculateOperationReservationTransition({
+        ...(before === undefined ? {} : { before }),
+        after: operationProjection,
+        materializedBefore: materialized,
+        materializedAfter: materialized,
+      }).deltaSlots
+    }
+    let newlyMaterializedOperationId: string | undefined
+    if (typeof prepared.event.materializationId === 'string' &&
+        typeof prepared.event.operationId === 'string') {
+      const operationId = prepared.event.operationId
+      if (!this.materializedOperationIds.has(operationId)) {
+        newlyMaterializedOperationId = operationId
+        const projection = operationProjection?.operationId === operationId
+          ? operationProjection
+          : this.operations.get(operationId)
+        if (projection) {
+          reservationSlotsAfter += calculateOperationReservationTransition({
+            before: projection,
+            after: projection,
+            materializedBefore: false,
+            materializedAfter: true,
+          }).deltaSlots
+        }
+      }
+    }
+    const businessClass = this.quotaAdmissionClass(prepared.event)
+    const admission = preflightSessionQuotaAdmission({
+      limits: format.limits,
+      usedEventBytes: this.usedEventBytes,
+      reservedCriticalSlots: this.reservedCriticalSlots,
+    }, {
+      records: batch.map(({ bytes }) => ({
+        bytes,
+        admissionClass: businessClass,
+      })),
+      reservedCriticalSlotsAfter: reservationSlotsAfter,
+    })
+    const appendPlan = storage.prepareAppendBatch(batch.map(({ bytes }) => bytes))
+
+    try {
+      await storage.appendPreparedBatch(appendPlan, { durability })
+      await this.lease.assertSafe()
+    } catch (error) {
+      this.fatalError ||= error
+      throw error
+    }
+    if (storage.catalog.totalEventBytes !== admission.usedEventBytesAfter) {
+      const error = new Error('[Session] segment catalog byte count diverged after append')
+      this.fatalError ||= error
+      throw error
+    }
+    if (marker) this.acceptEvent(marker.event)
+    this.acceptEvent(prepared.event, operationProjection)
+    if (newlyMaterializedOperationId) {
+      this.materializedOperationIds.add(newlyMaterializedOperationId)
+    }
+    this.usedEventBytes = admission.usedEventBytesAfter
+    this.reservedCriticalSlots = reservationSlotsAfter
+  }
+
+  private quotaAdmissionClass(event: SessionEvent): SessionQuotaAdmissionClass {
+    if (event.type === 'operation') {
+      return operationQuotaAdmissionClass(parseOperationEvent(event).status)
+    }
+    if (typeof event.materializationId === 'string' &&
+        typeof event.operationId === 'string' &&
+        this.operations.has(event.operationId)) {
+      return 'critical'
+    }
+    return 'regular'
+  }
+
+  private assertPreparedBatchStillNext(batch: readonly PreparedSessionEvent[]) {
+    let sequence = this.nextSequence
+    const eventIds = new Set(this.eventIds)
+    const materializationIds = new Set(this.materializationIds)
+    for (const { event } of batch) {
+      if (event.sequence !== sequence) {
+        throw new Error('[Session] prepared event sequence 已过期')
+      }
+      if (eventIds.has(event.eventId)) {
+        throw new Error(`[Session] eventId 重复: ${event.eventId}`)
+      }
+      eventIds.add(event.eventId)
+      if (typeof event.materializationId === 'string') {
+        if (materializationIds.has(event.materializationId)) {
+          throw new Error(`[Session] materializationId 重复: ${event.materializationId}`)
+        }
+        materializationIds.add(event.materializationId)
+      }
+      sequence++
+    }
+  }
+
+  private requireFormat() {
+    if (!this.format) throw new Error('[Session] immutable format 尚未准备')
+    return this.format
+  }
+
+  private requireSegmentStorage() {
+    if (!this.segmentStorage) throw new Error('[Session] segment storage 尚未准备')
+    return this.segmentStorage
   }
 
   private acceptEvent(event: SessionEvent, operationProjection?: OperationProjection) {
@@ -613,31 +906,13 @@ export class SessionStore implements SessionWriter, DurableEventWriter {
     return Object.freeze({ event: canonical as SessionEvent, bytes })
   }
 
-  private async writeEvent(
-    prepared: PreparedSessionEvent,
-    durability: EventDurability,
-  ) {
-    const { bytes } = prepared
-    try {
-      let offset = 0
-      while (offset < bytes.length) {
-        const { bytesWritten } = await this.lease.write(bytes, offset, bytes.length - offset)
-        if (bytesWritten <= 0) throw new Error('[Session] journal write 未取得进展')
-        offset += bytesWritten
-      }
-      if (durability === 'durable') await this.lease.datasync()
-    } catch (error) {
-      this.fatalError ||= error
-      throw error
-    }
-  }
-
   private async scanJournal(
     reportTrailing: boolean,
     onRecord?: SessionJournalRecordHandler,
   ): Promise<SessionJournalScanResult> {
     try {
-      const scanned = await scanSessionJournal(this.lease.readChunks(), {
+      await this.lease.assertSafe()
+      const scanned = await scanSessionJournal(this.requireSegmentStorage().readChunks(), {
         maxRecordBytes: this.maxReadRecordBytes,
         ...(onRecord === undefined ? {} : { onRecord }),
       })
@@ -653,12 +928,16 @@ export class SessionStore implements SessionWriter, DurableEventWriter {
     }
   }
 
-  private reportTrailingFragment(diagnostic: SessionJournalDiagnostic, repaired: boolean) {
+  private reportTrailingFragment(
+    diagnostic: SessionJournalDiagnostic,
+    repaired: boolean,
+    path = this.filePath,
+  ) {
     const value: SessionStoreDiagnostic = Object.freeze({
       code: diagnostic.code,
       severity: 'warning',
       sessionId: this.sessionId,
-      path: this.filePath,
+      path,
       line: diagnostic.line,
       byteOffset: diagnostic.byteOffset,
       byteLength: diagnostic.byteLength,
@@ -673,18 +952,21 @@ export class SessionStore implements SessionWriter, DurableEventWriter {
 
   private reportScanError(error: SessionJournalScanError) {
     const location = error.location
+    const localized = location === undefined
+      ? undefined
+      : this.segmentStorage?.localizeRecordLocation(location)
     this.emitDiagnostic(Object.freeze({
       code: error.code,
       severity: 'fatal',
       sessionId: this.sessionId,
-      path: this.filePath,
+      path: localized?.path ?? this.filePath,
       ...(location === undefined ? {} : {
-        line: location.line,
-        byteOffset: location.byteOffset,
-        byteLength: location.byteLength,
+        line: localized?.line ?? location.line,
+        byteOffset: localized?.byteOffset ?? location.byteOffset,
+        byteLength: localized?.byteLength ?? location.byteLength,
       }),
       repaired: false,
-      message: error.message,
+      message: `Session journal validation failed: ${error.code}`,
     }))
   }
 

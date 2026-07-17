@@ -32,6 +32,27 @@ describe('configuration', () => {
     })
   })
 
+  it('passes only explicitly configured immutable session storage limits', () => {
+    assert.deepEqual(loadConfig({}).sessionStorage, {})
+    assert.deepEqual(loadConfig({
+      SUPER_AGENT_SESSION_MAX_RECORD_BYTES: '1048576',
+      SUPER_AGENT_SESSION_MAX_READ_RECORD_BYTES: '16777216',
+      SUPER_AGENT_SESSION_SEGMENT_TARGET_BYTES: '512',
+      SUPER_AGENT_SESSION_REGULAR_QUOTA_BYTES: '67108864',
+      SUPER_AGENT_SESSION_CRITICAL_RESERVE_BYTES: '16777216',
+    }).sessionStorage, {
+      maxRecordBytes: 1_048_576,
+      maxReadRecordBytes: 16_777_216,
+      segmentTargetBytes: 512,
+      regularQuotaBytes: 67_108_864,
+      criticalReserveBytes: 16_777_216,
+    })
+    assert.throws(
+      () => loadConfig({ SUPER_AGENT_SESSION_SEGMENT_TARGET_BYTES: '0' }),
+      /正整数/,
+    )
+  })
+
   it('defaults to development execution and validates production sandbox paths', () => {
     assert.equal(loadConfig({}).execution.profile, 'development')
     const execution = loadConfig({

@@ -9,13 +9,15 @@ import { ToolExecutionPipeline } from '../../src/execution/tool-execution-pipeli
 import type { RecoveryJournal } from '../../src/execution/recovery-coordinator.js'
 import {
   SessionStore,
-  nodeSessionJournalIo,
   type SessionEvent,
   type SessionEventInput,
-  type SessionJournalFile,
-  type SessionJournalIo,
   type ToolResultCommit,
 } from '../../src/session/store.js'
+import {
+  nodeSessionSegmentStorageIo,
+  type SessionSegmentFile,
+  type SessionSegmentStorageIo,
+} from '../../src/session/session-segment-storage.js'
 import {
   isCrashPoint,
   type CrashPoint,
@@ -58,16 +60,21 @@ function durableLog(path: string, value: Record<string, unknown>) {
   }
 }
 
-function journalIo(): SessionJournalIo {
+function segmentIo(): SessionSegmentStorageIo {
   let pending = Buffer.alloc(0)
   return {
-    readFile: (path) => nodeSessionJournalIo.readFile(path),
+    ...nodeSessionSegmentStorageIo,
     open: async (path, flags, mode) => {
-      const handle = await nodeSessionJournalIo.open(path, flags, mode)
-      const wrapped: SessionJournalFile = {
+      const handle = await nodeSessionSegmentStorageIo.open(path, flags, mode)
+      if (!path.endsWith('.active.jsonl')) return handle
+      const wrapped: SessionSegmentFile = {
+        fd: handle.fd,
         chmod: (value) => handle.chmod(value),
         truncate: (length) => handle.truncate(length),
         datasync: () => handle.datasync(),
+        stat: () => handle.stat(),
+        read: (buffer, offset, length, position) =>
+          handle.read(buffer, offset, length, position),
         close: () => handle.close(),
         write: async (buffer, offset, length) => {
           const result = await handle.write(buffer, offset, length)
@@ -134,7 +141,11 @@ function instrumentJournal(store: SessionStore): RecoveryJournal {
   }
 }
 
-const store = await SessionStore.open(sessionId, { directory, io: journalIo() })
+const store = await SessionStore.open(sessionId, {
+  directory,
+  segmentTargetBytes: 256,
+  segmentIo: segmentIo(),
+})
 await store.appendEvent({
   type: 'messages',
   messages: [{
@@ -147,6 +158,7 @@ await store.appendEvent({
     }],
   }],
 }, 'durable')
+await store.appendEvent({ type: 'test.rotation-anchor' }, 'durable')
 const journal = instrumentJournal(store)
 const registry = new ToolRegistry()
 registry.register({

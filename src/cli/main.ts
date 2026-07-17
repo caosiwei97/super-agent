@@ -38,7 +38,7 @@ function printableOperation(operation: Awaited<ReturnType<RecoveryCoordinator['l
 }
 
 async function runOps(cli: OpsCliOptions) {
-  const store = await SessionStore.open(cli.sessionId)
+  const store = await SessionStore.open(cli.sessionId, loadConfig().sessionStorage)
   let operationError: unknown
   try {
     if (!store.exists()) throw new Error(`会话不存在: ${cli.sessionId}`)
@@ -124,7 +124,7 @@ export async function runCli(args: string[]) {
     registry.register(createToolSearch(registry))
     await connectGitHubMCP(registry, config.githubMcp)
 
-    store = await SessionStore.open(cli.sessionId)
+    store = await SessionStore.open(cli.sessionId, config.sessionStorage)
     if (cli.continueSession && !store.exists()) {
       throw new Error(`会话不存在: ${cli.sessionId}`)
     }

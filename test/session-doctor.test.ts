@@ -21,6 +21,7 @@ import {
   type SessionDoctorIo,
 } from '../src/session/doctor.js'
 import { SessionStore, type SessionStoreDiagnostic } from '../src/session/store.js'
+import { activeSessionSegmentPath } from './session-storage-helpers.js'
 
 async function createClosedSession(root: string, sessionId: string) {
   const store = await SessionStore.open(sessionId, { directory: root })
@@ -29,6 +30,7 @@ async function createClosedSession(root: string, sessionId: string) {
   return {
     journalPath: join(root, `${sessionId}.jsonl`),
     lockPath: join(root, `${sessionId}.lock`),
+    activePath: await activeSessionSegmentPath(root, sessionId),
   }
 }
 
@@ -78,11 +80,11 @@ describe('session doctor', () => {
   it('diagnoses but does not repair an EOF fragment; writer recovery reports the repair',
     async () => {
       const root = await mkdtemp(join(tmpdir(), 'super-agent-doctor-tail-'))
-      const path = join(root, 'tail.jsonl')
       const store = await SessionStore.open('tail', { directory: root })
       try {
         await store.appendEvent({ type: 'test.complete' }, 'durable')
         await store.close()
+        const path = await activeSessionSegmentPath(root, 'tail')
         await appendFile(path, '{"unfinished":', 'utf-8')
         const before = await stat(path)
 
@@ -127,8 +129,8 @@ describe('session doctor', () => {
     skip: process.platform === 'win32' ? 'POSIX flock contract is required' : false,
   }, async () => {
     const root = await mkdtemp(join(tmpdir(), 'super-agent-doctor-split-lock-'))
-    const { journalPath, lockPath } = await createClosedSession(root, 'split-lock')
-    await appendFile(journalPath, '{malformed complete record}\n', 'utf-8')
+    const { journalPath, lockPath, activePath } = await createClosedSession(root, 'split-lock')
+    await appendFile(activePath, '{malformed complete record}\n', 'utf-8')
     const oldLockFd = openSync(lockPath, constants.O_RDWR)
     let journalFd: number | undefined
     try {
@@ -175,7 +177,7 @@ describe('session doctor', () => {
       await store.appendEvent({ type: 'test.event' }, 'durable')
       await store.close()
       await appendFile(
-        join(root, 'corrupt.jsonl'),
+        await activeSessionSegmentPath(root, 'corrupt'),
         `{"value":"${secret}" BROKEN}\n`,
         'utf-8',
       )
@@ -192,9 +194,9 @@ describe('session doctor', () => {
 
   it('validates known record payloads without retaining conversation state', async () => {
     const root = await mkdtemp(join(tmpdir(), 'super-agent-doctor-payload-'))
-    const { journalPath } = await createClosedSession(root, 'payload')
+    const { activePath } = await createClosedSession(root, 'payload')
     try {
-      await appendFile(journalPath, `${JSON.stringify({
+      await appendFile(activePath, `${JSON.stringify({
         schemaVersion: 2,
         eventId: 'invalid-messages-event',
         sequence: 2,

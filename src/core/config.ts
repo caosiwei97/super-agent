@@ -40,6 +40,17 @@ function positiveInteger(env: NodeJS.ProcessEnv, name: string, fallback: number)
   return value
 }
 
+function optionalPositiveInteger(env: NodeJS.ProcessEnv, name: string) {
+  const raw = env[name]
+  if (raw === undefined || raw === '') return undefined
+
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${name} 必须是正整数，当前值: ${raw}`)
+  }
+  return value
+}
+
 function nonNegativeInteger(env: NodeJS.ProcessEnv, name: string, fallback: number) {
   const raw = env[name]
   if (raw === undefined || raw === '') return fallback
@@ -84,6 +95,26 @@ function crashSupervisorMode(env: NodeJS.ProcessEnv):
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   const profile = executionProfile(env)
+  const sessionMaxRecordBytes = optionalPositiveInteger(
+    env,
+    'SUPER_AGENT_SESSION_MAX_RECORD_BYTES',
+  )
+  const sessionMaxReadRecordBytes = optionalPositiveInteger(
+    env,
+    'SUPER_AGENT_SESSION_MAX_READ_RECORD_BYTES',
+  )
+  const sessionSegmentTargetBytes = optionalPositiveInteger(
+    env,
+    'SUPER_AGENT_SESSION_SEGMENT_TARGET_BYTES',
+  )
+  const sessionRegularQuotaBytes = optionalPositiveInteger(
+    env,
+    'SUPER_AGENT_SESSION_REGULAR_QUOTA_BYTES',
+  )
+  const sessionCriticalReserveBytes = optionalPositiveInteger(
+    env,
+    'SUPER_AGENT_SESSION_CRITICAL_RESERVE_BYTES',
+  )
   return {
     model: {
       baseURL: env.MODEL_BASE_URL || 'https://api.deepseek.com',
@@ -106,6 +137,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     },
     workspaceRoot: resolve(env.SUPER_AGENT_WORKSPACE || process.cwd()),
     autoApprove: booleanValue(env, 'SUPER_AGENT_AUTO_APPROVE', false),
+    sessionStorage: {
+      ...(sessionMaxRecordBytes === undefined
+        ? {} : { maxRecordBytes: sessionMaxRecordBytes }),
+      ...(sessionMaxReadRecordBytes === undefined
+        ? {} : { maxReadRecordBytes: sessionMaxReadRecordBytes }),
+      ...(sessionSegmentTargetBytes === undefined
+        ? {} : { segmentTargetBytes: sessionSegmentTargetBytes }),
+      ...(sessionRegularQuotaBytes === undefined
+        ? {} : { regularQuotaBytes: sessionRegularQuotaBytes }),
+      ...(sessionCriticalReserveBytes === undefined
+        ? {} : { criticalReserveBytes: sessionCriticalReserveBytes }),
+    },
     execution: {
       profile,
       sandbox: {

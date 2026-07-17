@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it, type TestContext } from 'node:test'
@@ -14,6 +14,7 @@ import type { ContextCompactionResult } from '../src/context/compressor.js'
 import { ToolRegistry } from '../src/core/tool-registry.js'
 import { SessionStore } from '../src/session/store.js'
 import { summaryModel } from './helpers.js'
+import { readSessionEventBytes } from './session-storage-helpers.js'
 
 const COMPACTION = {
   tokenThreshold: 300,
@@ -207,7 +208,7 @@ describe('ConversationRunner', () => {
       summary: state.summary,
       budgetUsed: state.budget.used,
     })
-    const rawLog = await readFile(join(directory, 'runner.jsonl'), 'utf-8')
+    const rawLog = (await readSessionEventBytes(directory, 'runner')).toString('utf-8')
     assert.ok(rawLog.includes(largeAnswer), 'raw assistant output should remain in the audit log')
   })
 

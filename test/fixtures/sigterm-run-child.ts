@@ -1,11 +1,13 @@
 import type { LanguageModel } from 'ai'
+import { constants } from 'node:fs'
 import { runOnce } from '../../src/cli/repl.js'
 import { ToolRegistry } from '../../src/core/tool-registry.js'
+import { SessionStore } from '../../src/session/store.js'
 import {
-  nodeSessionJournalIo,
-  SessionStore,
-  type SessionJournalIo,
-} from '../../src/session/store.js'
+  nodeSessionSegmentStorageIo,
+  type SessionSegmentFile,
+  type SessionSegmentStorageIo,
+} from '../../src/session/session-segment-storage.js'
 
 const [directory, mode = 'cooperative'] = process.argv.slice(2)
 if (!directory) throw new Error('missing session directory')
@@ -39,16 +41,22 @@ const model = {
   },
 } satisfies LanguageModel
 
-const io: SessionJournalIo | undefined = mode === 'fail-close'
+const segmentIo: SessionSegmentStorageIo | undefined = mode === 'fail-close'
   ? {
-      readFile: (path) => nodeSessionJournalIo.readFile(path),
-      readChunks: (path) => nodeSessionJournalIo.readChunks!(path),
+      ...nodeSessionSegmentStorageIo,
       open: async (path, flags, fileMode) => {
-        const handle = await nodeSessionJournalIo.open(path, flags, fileMode)
-        return {
+        const handle = await nodeSessionSegmentStorageIo.open(path, flags, fileMode)
+        if (!path.endsWith('.active.jsonl') ||
+            (flags & constants.O_APPEND) === 0 ||
+            (flags & constants.O_CREAT) !== 0) return handle
+        const wrapped: SessionSegmentFile = {
+          fd: handle.fd,
           chmod: (value) => handle.chmod(value),
           truncate: (length) => handle.truncate(length),
           write: (buffer, offset, length) => handle.write(buffer, offset, length),
+          stat: () => handle.stat(),
+          read: (buffer, offset, length, position) =>
+            handle.read(buffer, offset, length, position),
           datasync: async () => {
             throw Object.assign(new Error('injected one-shot shutdown datasync failure'), {
               code: 'EIO',
@@ -56,11 +64,15 @@ const io: SessionJournalIo | undefined = mode === 'fail-close'
           },
           close: () => handle.close(),
         }
+        return wrapped
       },
     }
   : undefined
 
-const store = await SessionStore.open('sigterm-run', { directory, ...(io ? { io } : {}) })
+const store = await SessionStore.open('sigterm-run', {
+  directory,
+  ...(segmentIo ? { segmentIo } : {}),
+})
 const registry = new ToolRegistry()
 await runOnce({
   model,

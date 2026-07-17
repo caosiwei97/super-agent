@@ -3,6 +3,7 @@ import { once } from 'node:events'
 import { closeSync, constants, openSync } from 'node:fs'
 import {
   appendFile,
+  chmod,
   link,
   mkdtemp,
   readFile,
@@ -29,6 +30,15 @@ import {
   type SessionJournalIo,
 } from '../src/session/store.js'
 import { SessionFileLease } from '../src/session/session-file-lease.js'
+import {
+  nodeSessionSegmentStorageIo,
+  type SessionSegmentFile,
+  type SessionSegmentStorageIo,
+} from '../src/session/session-segment-storage.js'
+import {
+  activeSessionSegmentPath,
+  readSessionEventBytes,
+} from './session-storage-helpers.js'
 
 async function createJournal(context: TestContext, sessionId = 'journal') {
   const root = await mkdtemp(join(tmpdir(), 'super-agent-journal-'))
@@ -57,29 +67,57 @@ function wrapJournalFile(
   overrides: Partial<SessionJournalFile>,
 ): SessionJournalFile {
   return {
+    fd: handle.fd,
     chmod: (mode) => handle.chmod(mode),
     truncate: (length) => handle.truncate(length),
     write: (buffer, offset, length) => handle.write(buffer, offset, length),
+    datasync: () => handle.datasync(),
+    stat: () => handle.stat(),
+    read: (buffer, offset, length, position) =>
+      handle.read(buffer, offset, length, position),
+    close: () => handle.close(),
+    ...overrides,
+  }
+}
+
+function injectedSegmentIo(
+  customize: (
+    handle: SessionSegmentFile,
+    path: string,
+    flags: number,
+  ) => SessionSegmentFile,
+): SessionSegmentStorageIo {
+  return {
+    ...nodeSessionSegmentStorageIo,
+    open: async (path, flags, mode) => customize(
+      await nodeSessionSegmentStorageIo.open(path, flags, mode),
+      path,
+      flags,
+    ),
+  }
+}
+
+function wrapSegmentFile(
+  handle: SessionSegmentFile,
+  overrides: Partial<SessionSegmentFile>,
+): SessionSegmentFile {
+  return {
+    fd: handle.fd,
+    chmod: (mode) => handle.chmod(mode),
+    stat: () => handle.stat(),
+    read: (buffer, offset, length, position) =>
+      handle.read(buffer, offset, length, position),
+    write: (buffer, offset, length) => handle.write(buffer, offset, length),
+    truncate: (length) => handle.truncate(length),
     datasync: () => handle.datasync(),
     close: () => handle.close(),
     ...overrides,
   }
 }
 
-function injectedIo(
-  customize: (handle: SessionJournalFile) => SessionJournalFile,
-): SessionJournalIo {
-  return {
-    readFile: (path) => nodeSessionJournalIo.readFile(path),
-    open: async (path, flags, mode) => customize(
-      await nodeSessionJournalIo.open(path, flags, mode),
-    ),
-  }
-}
-
 describe('SessionStore journal', () => {
   it('assigns unique, strictly increasing v2 metadata under concurrent appends', async (context) => {
-    const { file, store } = await createJournal(context, 'concurrent')
+    const { directory, store } = await createJournal(context, 'concurrent')
 
     const appended = await Promise.all(
       Array.from({ length: 32 }, (_, index) =>
@@ -91,7 +129,7 @@ describe('SessionStore journal', () => {
     assert.equal(new Set(appended.map((event) => event.eventId)).size, appended.length)
     assert.ok(appended.every((event) => event.schemaVersion === 2))
 
-    const raw = await readFile(file, 'utf-8')
+    const raw = (await readSessionEventBytes(directory, 'concurrent')).toString('utf-8')
     assert.ok(raw.endsWith('\n'))
     const records = raw.trimEnd().split('\n').map((line) => JSON.parse(line) as SessionEvent)
     assert.equal(records.length, 32, 'one append must produce exactly one complete JSONL record')
@@ -255,7 +293,6 @@ describe('SessionStore journal', () => {
     async (context) => {
       const root = await mkdtemp(join(tmpdir(), 'super-agent-canonical-event-'))
       const directory = join(root, 'sessions')
-      const file = join(directory, 'canonical-event.jsonl')
       context.after(() => rm(root, { recursive: true, force: true }))
       const store = await SessionStore.open('canonical-event', { directory })
 
@@ -274,7 +311,7 @@ describe('SessionStore journal', () => {
         }),
         /序列化.*保护字段|serialization/i,
       )
-      assert.equal(await readFile(file, 'utf-8'), '')
+      assert.equal((await readSessionEventBytes(directory, 'canonical-event')).length, 0)
 
       const accepted = await store.appendEvent({
         type: 'test.nested-to-json',
@@ -286,7 +323,10 @@ describe('SessionStore journal', () => {
         },
       }, 'durable')
       assert.deepEqual(accepted.payload, { visible: 'persisted-value' })
-      assert.deepEqual(JSON.parse((await readFile(file, 'utf-8')).trim()), accepted)
+      assert.deepEqual(
+        JSON.parse((await readSessionEventBytes(directory, 'canonical-event')).toString('utf-8').trim()),
+        accepted,
+      )
       await store.close()
 
       const reopened = await SessionStore.open('canonical-event', { directory })
@@ -424,6 +464,26 @@ describe('SessionStore journal', () => {
     await successor.close()
   })
 
+  it('does not chmod a fixed lock owned by another active lease', async (context) => {
+    const root = await mkdtemp(join(tmpdir(), 'super-agent-lock-contender-'))
+    const directory = join(root, 'sessions')
+    const owner = new SessionFileLease(directory, 'contended-mode')
+    const lockPath = join(directory, 'contended-mode.lock')
+    context.after(async () => {
+      await chmod(lockPath, 0o600).catch(() => undefined)
+      await owner.close().catch(() => undefined)
+      await rm(root, { recursive: true, force: true })
+    })
+
+    await chmod(lockPath, 0o640)
+    assert.throws(
+      () => new SessionFileLease(directory, 'contended-mode'),
+      /活跃写者锁定/,
+    )
+    assert.equal((await stat(lockPath)).mode & 0o777, 0o640)
+    await chmod(lockPath, 0o600)
+  })
+
   it('releases the fixed lock when async open fails while checking journal existence',
     async (context) => {
       const root = await mkdtemp(join(tmpdir(), 'super-agent-open-exists-cleanup-'))
@@ -456,7 +516,8 @@ describe('SessionStore journal', () => {
     const { file, store } = await createJournal(context, 'partial-eof')
     const complete = await store.appendEvent({ type: 'test.event', value: 'complete' })
     await store.close()
-    await appendFile(file, '{"schemaVersion":2,"eventId":"torn', 'utf-8')
+    const activePath = await activeSessionSegmentPath(dirname(file), 'partial-eof')
+    await appendFile(activePath, '{"schemaVersion":2,"eventId":"torn', 'utf-8')
 
     const reader = new SessionStore('partial-eof', { directory: dirname(file) })
     assert.deepEqual(await reader.replayEvents(), [complete])
@@ -466,12 +527,12 @@ describe('SessionStore journal', () => {
   it('repairs a trailing fragment even when diagnostic callbacks throw', async (context) => {
     const root = await mkdtemp(join(tmpdir(), 'super-agent-diagnostic-callback-'))
     const directory = join(root, 'sessions')
-    const file = join(directory, 'callback-tail.jsonl')
     context.after(() => rm(root, { recursive: true, force: true }))
     const writer = await SessionStore.open('callback-tail', { directory })
     await writer.appendEvent({ type: 'test.before-tail' }, 'durable')
     await writer.close()
-    await appendFile(file, '{"torn":', 'utf-8')
+    const activePath = await activeSessionSegmentPath(directory, 'callback-tail')
+    await appendFile(activePath, '{"torn":', 'utf-8')
 
     const recovered = await SessionStore.open('callback-tail', {
       directory,
@@ -481,7 +542,7 @@ describe('SessionStore journal', () => {
     const accepted = await recovered.appendEvent({ type: 'test.after-tail' }, 'durable')
     assert.equal(accepted.sequence, 2)
     await recovered.close()
-    const raw = await readFile(file, 'utf-8')
+    const raw = (await readSessionEventBytes(directory, 'callback-tail')).toString('utf-8')
     assert.equal(raw.trimEnd().split('\n').length, 2)
     assert.doesNotMatch(raw, /torn/)
   })
@@ -635,7 +696,7 @@ describe('SessionStore journal', () => {
       /lock inode|存储安全/,
     )
     await assert.rejects(lockStore.close(), /lock inode|存储安全/)
-    const lockJournal = await readFile(join(directory, 'lock-swap.jsonl'), 'utf-8')
+    const lockJournal = (await readSessionEventBytes(directory, 'lock-swap')).toString('utf-8')
     assert.equal(lockJournal.trimEnd().split('\n').length, 1)
 
     const journalStore = await SessionStore.open('journal-swap', { directory })
@@ -657,7 +718,11 @@ describe('SessionStore journal', () => {
     const { file, store } = await createJournal(context, 'bad-line')
     await store.appendEvent({ type: 'test.event' })
     await store.close()
-    await appendFile(file, '{broken json}\n', 'utf-8')
+    await appendFile(
+      await activeSessionSegmentPath(dirname(file), 'bad-line'),
+      '{broken json}\n',
+      'utf-8',
+    )
 
     const reader = new SessionStore('bad-line', { directory: dirname(file) })
     await assert.rejects(reader.replayEvents(), /损坏|JSON|第 2 行|line 2/i)
@@ -802,12 +867,17 @@ describe('SessionStore journal', () => {
       const root = await mkdtemp(join(tmpdir(), 'super-agent-write-failure-'))
       const directory = join(root, 'sessions')
       context.after(() => rm(root, { recursive: true, force: true }))
-      const io = injectedIo((handle) => wrapJournalFile(handle, {
-        write: async () => {
-          throw Object.assign(new Error('injected ENOSPC write failure'), { code: 'ENOSPC' })
-        },
-      }))
-      const store = await SessionStore.open('write-failure', { directory, io })
+      const segmentIo = injectedSegmentIo((handle, path) =>
+        path.endsWith('.active.jsonl')
+          ? wrapSegmentFile(handle, {
+              write: async () => {
+                throw Object.assign(new Error('injected ENOSPC write failure'), {
+                  code: 'ENOSPC',
+                })
+              },
+            })
+          : handle)
+      const store = await SessionStore.open('write-failure', { directory, segmentIo })
 
       const first = store.appendEvent({ type: 'test.first' })
       const queued = store.appendEvent({ type: 'test.queued' })
@@ -826,12 +896,17 @@ describe('SessionStore journal', () => {
       const root = await mkdtemp(join(tmpdir(), 'super-agent-sync-failure-'))
       const directory = join(root, 'sessions')
       context.after(() => rm(root, { recursive: true, force: true }))
-      const io = injectedIo((handle) => wrapJournalFile(handle, {
-        datasync: async () => {
-          throw Object.assign(new Error('injected EACCES datasync failure'), { code: 'EACCES' })
-        },
-      }))
-      const store = await SessionStore.open('sync-failure', { directory, io })
+      const segmentIo = injectedSegmentIo((handle, path) =>
+        path.endsWith('.active.jsonl')
+          ? wrapSegmentFile(handle, {
+              datasync: async () => {
+                throw Object.assign(new Error('injected EACCES datasync failure'), {
+                  code: 'EACCES',
+                })
+              },
+            })
+          : handle)
+      const store = await SessionStore.open('sync-failure', { directory, segmentIo })
 
       const first = store.appendEvent({ type: 'test.first' }, 'durable')
       const queued = store.appendEvent({ type: 'test.queued' })
@@ -850,13 +925,16 @@ describe('SessionStore journal', () => {
       const root = await mkdtemp(join(tmpdir(), 'super-agent-close-failure-'))
       const directory = join(root, 'sessions')
       context.after(() => rm(root, { recursive: true, force: true }))
-      const io = injectedIo((handle) => wrapJournalFile(handle, {
-        close: async () => {
-          await handle.close()
-          throw new Error('injected close failure')
-        },
-      }))
-      const store = await SessionStore.open('close-failure', { directory, io })
+      const segmentIo = injectedSegmentIo((handle, path, flags) =>
+        path.endsWith('.active.jsonl') && (flags & constants.O_APPEND) !== 0
+          ? wrapSegmentFile(handle, {
+              close: async () => {
+                await handle.close()
+                throw new Error('injected close failure')
+              },
+            })
+          : handle)
+      const store = await SessionStore.open('close-failure', { directory, segmentIo })
       await store.appendEvent({ type: 'test.event' })
 
       const firstClose = store.close()
