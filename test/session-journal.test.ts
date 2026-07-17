@@ -1,19 +1,34 @@
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
-import { appendFile, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { closeSync, constants, openSync } from 'node:fs'
+import {
+  appendFile,
+  link,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  stat,
+  symlink,
+  unlink,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { describe, it, type TestContext } from 'node:test'
+import { flockSync } from 'fs-ext'
 import {
   nodeSessionJournalIo,
+  SessionRecordTooLargeError,
   SessionStore,
   type SessionEvent,
   type SessionJournalFile,
   type SessionJournalIo,
 } from '../src/session/store.js'
+import { SessionFileLease } from '../src/session/session-file-lease.js'
 
 async function createJournal(context: TestContext, sessionId = 'journal') {
   const root = await mkdtemp(join(tmpdir(), 'super-agent-journal-'))
@@ -96,6 +111,7 @@ describe('SessionStore journal', () => {
       'durable',
     )
     await writer.close()
+    assert.equal(writer.exists(), true)
 
     const reader = new SessionStore('durable', { directory })
     assert.deepEqual(await reader.replayEvents(), [written])
@@ -134,6 +150,255 @@ describe('SessionStore journal', () => {
     await reopened.close()
   })
 
+  it('validates every known payload before async open allows appends', async (context) => {
+    const root = await mkdtemp(join(tmpdir(), 'super-agent-open-payload-'))
+    const directory = join(root, 'sessions')
+    const file = join(directory, 'invalid-payload.jsonl')
+    context.after(() => rm(root, { recursive: true, force: true }))
+    const bootstrap = await SessionStore.open('invalid-payload', { directory })
+    await bootstrap.close()
+    await writeFile(file, `${JSON.stringify(persistedEvent({
+      type: 'messages',
+      messages: 'not-an-array',
+    }))}\n`, { encoding: 'utf-8', mode: 0o600 })
+
+    await assert.rejects(
+      SessionStore.open('invalid-payload', { directory }),
+      /messages\.messages|payload|无效/i,
+    )
+  })
+
+  it('scans through the pinned journal descriptor when the adapter exposes positional reads',
+    async (context) => {
+      const root = await mkdtemp(join(tmpdir(), 'super-agent-pinned-read-'))
+      const directory = join(root, 'sessions')
+      context.after(() => rm(root, { recursive: true, force: true }))
+      const writer = await SessionStore.open('pinned-read', { directory })
+      await writer.appendEvent({ type: 'test.persisted' }, 'durable')
+      await writer.close()
+      let pathReads = 0
+      const io: SessionJournalIo = {
+        open: (path, flags, mode) => nodeSessionJournalIo.open(path, flags, mode),
+        readFile: async () => {
+          pathReads++
+          throw new Error('path read must not be used')
+        },
+        readChunks: async function* () {
+          pathReads++
+          throw new Error('path stream must not be used')
+        },
+      }
+
+      const reopened = await SessionStore.open('pinned-read', { directory, io })
+      assert.deepEqual((await reopened.replayEvents()).map(({ sequence }) => sequence), [1])
+      assert.equal(pathReads, 0)
+      await reopened.close()
+    })
+
+  it('closes a newly opened journal descriptor when inode validation fails', {
+    skip: process.platform === 'win32' ? 'POSIX rename semantics are required' : false,
+  }, async (context) => {
+    const root = await mkdtemp(join(tmpdir(), 'super-agent-open-validation-close-'))
+    const directory = join(root, 'sessions')
+    const file = join(directory, 'unsafe-journal.jsonl')
+    context.after(() => rm(root, { recursive: true, force: true }))
+    const writer = await SessionStore.open('unsafe-journal', { directory })
+    await writer.appendEvent({ type: 'test.persisted' }, 'durable')
+    await writer.close()
+    let handleClosed = false
+    const io: SessionJournalIo = {
+      readFile: (path) => nodeSessionJournalIo.readFile(path),
+      open: async (path, flags, mode) => {
+        const handle = await nodeSessionJournalIo.open(path, flags, mode)
+        await rename(path, `${path}.retained`)
+        await writeFile(path, 'replacement', { mode: 0o600 })
+        return wrapJournalFile(handle, {
+          stat: () => handle.stat!(),
+          close: async () => {
+            handleClosed = true
+            await handle.close()
+          },
+        })
+      },
+    }
+
+    await assert.rejects(
+      SessionStore.open('unsafe-journal', { directory, io }),
+      /inode|存储安全/,
+    )
+    assert.equal(handleClosed, true)
+    assert.equal(await readFile(file, 'utf-8'), 'replacement')
+  })
+
+  it('owns checkpoint throughSequence and rejects mismatches without consuming sequence',
+    async (context) => {
+      const { store } = await createJournal(context, 'checkpoint-sequence')
+      await store.appendEvent({ type: 'test.before-checkpoint' })
+      const checkpoint = {
+        type: 'checkpoint',
+        messages: [{ role: 'assistant' as const, content: 'state' }],
+        summary: 'summary',
+        budgetUsed: 1,
+      }
+
+      await assert.rejects(
+        store.appendEvent({ ...checkpoint, throughSequence: 0 }),
+        /throughSequence.*1|期望 1/,
+      )
+      const accepted = await store.appendEvent(checkpoint)
+      assert.equal(accepted.sequence, 2)
+      assert.equal(accepted.throughSequence, 1)
+      assert.equal((await store.appendEvent({ type: 'test.after-checkpoint' })).sequence, 3)
+    })
+
+  it('acks, accepts, and replays the canonical event represented by the written bytes',
+    async (context) => {
+      const root = await mkdtemp(join(tmpdir(), 'super-agent-canonical-event-'))
+      const directory = join(root, 'sessions')
+      const file = join(directory, 'canonical-event.jsonl')
+      context.after(() => rm(root, { recursive: true, force: true }))
+      const store = await SessionStore.open('canonical-event', { directory })
+
+      await assert.rejects(
+        store.appendEvent({
+          type: 'test.root-to-json',
+          toJSON() {
+            return {
+              schemaVersion: 2,
+              eventId: 'changed-by-to-json',
+              sequence: 99,
+              type: 'test.changed',
+              timestamp: '2026-07-16T00:00:00.000Z',
+            }
+          },
+        }),
+        /序列化.*保护字段|serialization/i,
+      )
+      assert.equal(await readFile(file, 'utf-8'), '')
+
+      const accepted = await store.appendEvent({
+        type: 'test.nested-to-json',
+        payload: {
+          visible: 'memory-value',
+          toJSON() {
+            return { visible: 'persisted-value' }
+          },
+        },
+      }, 'durable')
+      assert.deepEqual(accepted.payload, { visible: 'persisted-value' })
+      assert.deepEqual(JSON.parse((await readFile(file, 'utf-8')).trim()), accepted)
+      await store.close()
+
+      const reopened = await SessionStore.open('canonical-event', { directory })
+      assert.deepEqual(await reopened.replayEvents(), [accepted])
+      await reopened.close()
+    })
+
+  it('rejects persisted checkpoints whose throughSequence does not cover the prior record',
+    async (context) => {
+      const root = await mkdtemp(join(tmpdir(), 'super-agent-checkpoint-mismatch-'))
+      const directory = join(root, 'sessions')
+      const file = join(directory, 'checkpoint-mismatch.jsonl')
+      context.after(() => rm(root, { recursive: true, force: true }))
+      const bootstrap = await SessionStore.open('checkpoint-mismatch', { directory })
+      await bootstrap.close()
+      await writeFile(file, [
+        JSON.stringify(persistedEvent({ type: 'test.before-checkpoint' })),
+        JSON.stringify(persistedEvent({
+          eventId: 'event-2',
+          sequence: 2,
+          type: 'checkpoint',
+          messages: [{ role: 'assistant', content: 'state' }],
+          summary: 'summary',
+          budgetUsed: 1,
+          throughSequence: 0,
+        })),
+      ].join('\n') + '\n', { encoding: 'utf-8', mode: 0o600 })
+
+      await assert.rejects(
+        SessionStore.open('checkpoint-mismatch', { directory }),
+        /checkpoint\.throughSequence|无效/,
+      )
+    })
+
+  it('requires exactly one valid schema upgrade marker at the v1/v2 boundary',
+    async (context) => {
+      const root = await mkdtemp(join(tmpdir(), 'super-agent-schema-transition-'))
+      const directory = join(root, 'sessions')
+      context.after(() => rm(root, { recursive: true, force: true }))
+      const timestamp = '2026-07-15T00:00:00.000Z'
+      const legacy = {
+        type: 'message',
+        timestamp,
+        message: { role: 'user', content: 'legacy' },
+      }
+      const marker = persistedEvent({
+        type: 'schema.upgraded',
+        fromSchemaVersion: 1,
+        toSchemaVersion: 2,
+      })
+      const cases: Array<{ id: string; records: Record<string, unknown>[] }> = [
+        {
+          id: 'missing-marker',
+          records: [legacy, persistedEvent({ type: 'test.v2' })],
+        },
+        {
+          id: 'bad-marker-payload',
+          records: [legacy, { ...marker, fromSchemaVersion: 0 }],
+        },
+        {
+          id: 'marker-without-v1',
+          records: [marker],
+        },
+        {
+          id: 'duplicate-marker',
+          records: [
+            legacy,
+            marker,
+            { ...marker, eventId: 'event-2', sequence: 2 },
+          ],
+        },
+      ]
+
+      for (const { id, records } of cases) {
+        const bootstrap = await SessionStore.open(id, { directory })
+        await bootstrap.close()
+        await writeFile(
+          join(directory, `${id}.jsonl`),
+          records.map((record) => JSON.stringify(record)).join('\n') + '\n',
+          { encoding: 'utf-8', mode: 0o600 },
+        )
+        await assert.rejects(
+          SessionStore.open(id, { directory }),
+          /schema\.upgraded|marker|无效|缺少|重复/,
+          id,
+        )
+      }
+    })
+
+  it('rejects empty and duplicate generic materialization IDs without consuming sequence',
+    async (context) => {
+      const { store } = await createJournal(context, 'generic-materialization')
+      const first = await store.appendEvent({
+        type: 'test.materialized',
+        materializationId: 'materialization-generic-1',
+      })
+      assert.equal(first.sequence, 1)
+
+      await assert.rejects(
+        store.appendEvent({ type: 'test.empty', materializationId: '' }),
+        /materializationId.*无效/,
+      )
+      await assert.rejects(
+        store.appendEvent({
+          type: 'test.duplicate',
+          materializationId: 'materialization-generic-1',
+        }),
+        /materializationId.*重复/,
+      )
+      assert.equal((await store.appendEvent({ type: 'test.next' })).sequence, 2)
+    })
+
   it('creates private session directories and files', async (context) => {
     const { directory, file, store } = await createJournal(context, 'private')
     await store.appendEvent({ type: 'test.event' })
@@ -159,6 +424,34 @@ describe('SessionStore journal', () => {
     await successor.close()
   })
 
+  it('releases the fixed lock when async open fails while checking journal existence',
+    async (context) => {
+      const root = await mkdtemp(join(tmpdir(), 'super-agent-open-exists-cleanup-'))
+      const directory = join(root, 'sessions')
+      context.after(() => rm(root, { recursive: true, force: true }))
+      const originalExists = SessionFileLease.prototype.exists
+      let injected = true
+      SessionFileLease.prototype.exists = function existsWithInjectedFailure() {
+        if (injected) {
+          injected = false
+          throw new Error('injected journal snapshot mismatch')
+        }
+        return originalExists.call(this)
+      }
+      try {
+        await assert.rejects(
+          SessionStore.open('exists-cleanup', { directory }),
+          /injected journal snapshot mismatch/,
+        )
+      } finally {
+        SessionFileLease.prototype.exists = originalExists
+      }
+
+      const successor = await SessionStore.open('exists-cleanup', { directory })
+      await successor.appendEvent({ type: 'test.successor' }, 'durable')
+      await successor.close()
+    })
+
   it('ignores an unterminated EOF fragment', async (context) => {
     const { file, store } = await createJournal(context, 'partial-eof')
     const complete = await store.appendEvent({ type: 'test.event', value: 'complete' })
@@ -168,6 +461,196 @@ describe('SessionStore journal', () => {
     const reader = new SessionStore('partial-eof', { directory: dirname(file) })
     assert.deepEqual(await reader.replayEvents(), [complete])
     await reader.close()
+  })
+
+  it('repairs a trailing fragment even when diagnostic callbacks throw', async (context) => {
+    const root = await mkdtemp(join(tmpdir(), 'super-agent-diagnostic-callback-'))
+    const directory = join(root, 'sessions')
+    const file = join(directory, 'callback-tail.jsonl')
+    context.after(() => rm(root, { recursive: true, force: true }))
+    const writer = await SessionStore.open('callback-tail', { directory })
+    await writer.appendEvent({ type: 'test.before-tail' }, 'durable')
+    await writer.close()
+    await appendFile(file, '{"torn":', 'utf-8')
+
+    const recovered = await SessionStore.open('callback-tail', {
+      directory,
+      onDiagnostic: () => { throw new Error('observer diagnostic failure') },
+      onWarning: () => { throw new Error('observer warning failure') },
+    })
+    const accepted = await recovered.appendEvent({ type: 'test.after-tail' }, 'durable')
+    assert.equal(accepted.sequence, 2)
+    await recovered.close()
+    const raw = await readFile(file, 'utf-8')
+    assert.equal(raw.trimEnd().split('\n').length, 2)
+    assert.doesNotMatch(raw, /torn/)
+  })
+
+  it('fails closed when an existing journal has lost its fixed lock inode',
+    async (context) => {
+      const root = await mkdtemp(join(tmpdir(), 'super-agent-missing-lock-'))
+      const directory = join(root, 'sessions')
+      context.after(() => rm(root, { recursive: true, force: true }))
+      const writer = await SessionStore.open('missing-lock', { directory })
+      await writer.appendEvent({ type: 'test.persisted' }, 'durable')
+      await writer.close()
+      await unlink(join(directory, 'missing-lock.lock'))
+
+      await assert.rejects(
+        SessionStore.open('missing-lock', { directory }),
+        /缺少固定 lock inode|missing.*lock/i,
+      )
+    })
+
+  it('never recreates a journal that disappears after the fixed lock is acquired',
+    async (context) => {
+      const root = await mkdtemp(join(tmpdir(), 'super-agent-missing-journal-race-'))
+      const directory = join(root, 'sessions')
+      const file = join(directory, 'missing-journal-race.jsonl')
+      context.after(() => rm(root, { recursive: true, force: true }))
+      const writer = await SessionStore.open('missing-journal-race', { directory })
+      await writer.appendEvent({ type: 'test.persisted' }, 'durable')
+      await writer.close()
+
+      const pinned = new SessionStore('missing-journal-race', { directory })
+      await unlink(file)
+      await assert.rejects(pinned.replayEvents(), /journal path.*消失|存储安全/i)
+      await pinned.close()
+      await assert.rejects(stat(file), { code: 'ENOENT' })
+    })
+
+  it('never adopts a journal path that appears after a new-session lock is acquired',
+    async (context) => {
+      const root = await mkdtemp(join(tmpdir(), 'super-agent-appearing-journal-race-'))
+      const directory = join(root, 'sessions')
+      const file = join(directory, 'appearing-journal-race.jsonl')
+      context.after(() => rm(root, { recursive: true, force: true }))
+      const pinned = new SessionStore('appearing-journal-race', { directory })
+      await writeFile(file, 'untrusted-existing-bytes', { mode: 0o600 })
+
+      await assert.rejects(
+        pinned.appendEvent({ type: 'test.must-not-overwrite' }),
+        /EEXIST|file already exists|异常出现|存储安全/i,
+      )
+      await pinned.close()
+      assert.equal(await readFile(file, 'utf-8'), 'untrusted-existing-bytes')
+
+      await writeFile(file, `${JSON.stringify(persistedEvent())}\n`, { mode: 0o600 })
+      const successor = await SessionStore.open('appearing-journal-race', { directory })
+      await successor.close()
+    })
+
+  it('rejects replacement between journal snapshot and descriptor open', {
+    skip: process.platform === 'win32' ? 'POSIX rename semantics are required' : false,
+  }, async (context) => {
+    const root = await mkdtemp(join(tmpdir(), 'super-agent-journal-snapshot-race-'))
+    const directory = join(root, 'sessions')
+    const file = join(directory, 'snapshot-race.jsonl')
+    context.after(() => rm(root, { recursive: true, force: true }))
+    const writer = await SessionStore.open('snapshot-race', { directory })
+    await writer.appendEvent({ type: 'test.original' }, 'durable')
+    await writer.close()
+
+    const pinned = new SessionStore('snapshot-race', { directory })
+    await rename(file, `${file}.retained`)
+    await writeFile(file, `${JSON.stringify(persistedEvent({ type: 'test.replacement' }))}\n`, {
+      mode: 0o600,
+    })
+    await assert.rejects(pinned.replayEvents(), /journal inode|存储安全/)
+    await pinned.close()
+  })
+
+  it('uses a lifetime journal flock to stop writers after the fixed lock inode splits', {
+    skip: process.platform === 'win32' ? 'POSIX flock semantics are required' : false,
+  }, async (context) => {
+    const root = await mkdtemp(join(tmpdir(), 'super-agent-split-lock-'))
+    const directory = join(root, 'sessions')
+    const file = join(directory, 'split-lock.jsonl')
+    const lockPath = join(directory, 'split-lock.lock')
+    context.after(() => rm(root, { recursive: true, force: true }))
+    const writer = await SessionStore.open('split-lock', { directory })
+    await writer.appendEvent({ type: 'test.persisted' }, 'durable')
+    await writer.close()
+
+    const oldWriterJournalFd = openSync(file, constants.O_RDWR)
+    flockSync(oldWriterJournalFd, 'exnb')
+    try {
+      await rename(lockPath, `${lockPath}.old-inode`)
+      await writeFile(lockPath, '', { mode: 0o600 })
+      await assert.rejects(
+        SessionStore.open('split-lock', { directory }),
+        /journal.*锁定|writer|EAGAIN|EWOULDBLOCK/i,
+      )
+    } finally {
+      flockSync(oldWriterJournalFd, 'un')
+      closeSync(oldWriterJournalFd)
+    }
+
+    const successor = await SessionStore.open('split-lock', { directory })
+    assert.deepEqual((await successor.replayEvents()).map(({ sequence }) => sequence), [1])
+    await successor.close()
+  })
+
+  it('rejects lock hardlinks and journal symlinks', {
+    skip: process.platform === 'win32' ? 'POSIX inode semantics are required' : false,
+  }, async (context) => {
+    const root = await mkdtemp(join(tmpdir(), 'super-agent-unsafe-inodes-'))
+    const directory = join(root, 'sessions')
+    context.after(() => rm(root, { recursive: true, force: true }))
+    const seed = await SessionStore.open('seed', { directory })
+    await seed.close()
+    await link(join(directory, 'seed.lock'), join(directory, 'hardlink.lock'))
+    await assert.rejects(
+      SessionStore.open('hardlink', { directory }),
+      /nlink|存储安全/,
+    )
+
+    const writer = await SessionStore.open('journal-link', { directory })
+    await writer.appendEvent({ type: 'test.persisted' }, 'durable')
+    await writer.close()
+    const journal = join(directory, 'journal-link.jsonl')
+    const retained = join(directory, 'journal-link.retained')
+    await rename(journal, retained)
+    await symlink(retained, journal)
+    await assert.rejects(
+      SessionStore.open('journal-link', { directory }),
+      /ELOOP|symbolic|symlink|符号链接|存储安全/i,
+    )
+  })
+
+  it('detects active lock and journal path replacement before acknowledging writes', {
+    skip: process.platform === 'win32' ? 'POSIX inode semantics are required' : false,
+  }, async (context) => {
+    const root = await mkdtemp(join(tmpdir(), 'super-agent-path-swap-'))
+    const directory = join(root, 'sessions')
+    context.after(() => rm(root, { recursive: true, force: true }))
+
+    const lockStore = await SessionStore.open('lock-swap', { directory })
+    await lockStore.appendEvent({ type: 'test.before-lock-swap' }, 'durable')
+    const lockPath = join(directory, 'lock-swap.lock')
+    await rename(lockPath, `${lockPath}.retained`)
+    await writeFile(lockPath, 'replacement', { mode: 0o600 })
+    await assert.rejects(
+      lockStore.appendEvent({ type: 'test.after-lock-swap' }),
+      /lock inode|存储安全/,
+    )
+    await assert.rejects(lockStore.close(), /lock inode|存储安全/)
+    const lockJournal = await readFile(join(directory, 'lock-swap.jsonl'), 'utf-8')
+    assert.equal(lockJournal.trimEnd().split('\n').length, 1)
+
+    const journalStore = await SessionStore.open('journal-swap', { directory })
+    await journalStore.appendEvent({ type: 'test.before-journal-swap' }, 'durable')
+    const journalPath = join(directory, 'journal-swap.jsonl')
+    const retainedJournal = `${journalPath}.retained`
+    await rename(journalPath, retainedJournal)
+    await writeFile(journalPath, '', { mode: 0o600 })
+    await assert.rejects(
+      journalStore.appendEvent({ type: 'test.after-journal-swap' }),
+      /journal inode|存储安全/,
+    )
+    await assert.rejects(journalStore.close(), /journal inode|存储安全/)
+    assert.equal(await readFile(journalPath, 'utf-8'), '')
+    assert.equal((await readFile(retainedJournal, 'utf-8')).trimEnd().split('\n').length, 1)
   })
 
   it('rejects a complete malformed JSONL record, including at EOF', async (context) => {
@@ -385,5 +868,111 @@ describe('SessionStore journal', () => {
       await successor.close()
       const finalWriter = await SessionStore.open('close-failure', { directory })
       await finalWriter.close()
+    })
+
+  it('rejects an oversized serialized record before writing or consuming sequence',
+    async (context) => {
+      const root = await mkdtemp(join(tmpdir(), 'super-agent-record-limit-'))
+      const directory = join(root, 'sessions')
+      context.after(() => rm(root, { recursive: true, force: true }))
+      const store = await SessionStore.open('record-limit', {
+        directory,
+        maxRecordBytes: 512,
+      })
+
+      await assert.rejects(
+        store.appendEvent({ type: 'test.oversized', value: '界'.repeat(512) }),
+        (error: unknown) => {
+          assert.ok(error instanceof SessionRecordTooLargeError)
+          assert.equal(error.maxRecordBytes, 512)
+          assert.ok(error.actualBytes > error.maxRecordBytes)
+          return true
+        },
+      )
+      const accepted = await store.appendEvent({ type: 'test.accepted' }, 'durable')
+      assert.equal(accepted.sequence, 1)
+      assert.deepEqual((await store.replayEvents()).map(({ sequence }) => sequence), [1])
+      await store.close()
+    })
+
+  it('admits a legacy append size before writing the v2 upgrade marker', async (context) => {
+    const root = await mkdtemp(join(tmpdir(), 'super-agent-legacy-record-limit-'))
+    const directory = join(root, 'sessions')
+    const file = join(directory, 'legacy-record-limit.jsonl')
+    context.after(() => rm(root, { recursive: true, force: true }))
+    const bootstrap = await SessionStore.open('legacy-record-limit', { directory })
+    await bootstrap.close()
+    await writeFile(file, `${JSON.stringify({
+      type: 'message',
+      timestamp: '2026-07-15T00:00:00.000Z',
+      message: { role: 'user', content: 'legacy' },
+    })}\n`, { encoding: 'utf-8', mode: 0o600 })
+    const store = await SessionStore.open('legacy-record-limit', {
+      directory,
+      maxRecordBytes: 512,
+    })
+    const before = await readFile(file, 'utf-8')
+
+    await assert.rejects(
+      store.appendEvent({ type: 'test.oversized', value: 'x'.repeat(1024) }),
+      SessionRecordTooLargeError,
+    )
+    assert.equal(await readFile(file, 'utf-8'), before)
+    assert.deepEqual(await store.replayEvents(), [])
+
+    const accepted = await store.appendEvent({ type: 'test.accepted' }, 'durable')
+    assert.equal(accepted.sequence, 2)
+    assert.deepEqual((await store.replayEvents()).map(({ type, sequence }) => ({
+      type,
+      sequence,
+    })), [
+      { type: 'schema.upgraded', sequence: 1 },
+      { type: 'test.accepted', sequence: 2 },
+    ])
+    await store.close()
+  })
+
+  it('validates an operation transition before writing a legacy upgrade marker',
+    async (context) => {
+      const root = await mkdtemp(join(tmpdir(), 'super-agent-legacy-operation-validation-'))
+      const directory = join(root, 'sessions')
+      const file = join(directory, 'legacy-operation-validation.jsonl')
+      context.after(() => rm(root, { recursive: true, force: true }))
+      const bootstrap = await SessionStore.open('legacy-operation-validation', { directory })
+      await bootstrap.close()
+      await writeFile(file, `${JSON.stringify({
+        type: 'message',
+        timestamp: '2026-07-15T00:00:00.000Z',
+        message: { role: 'user', content: 'legacy' },
+      })}\n`, { encoding: 'utf-8', mode: 0o600 })
+      const store = await SessionStore.open('legacy-operation-validation', { directory })
+      const before = await readFile(file, 'utf-8')
+
+      await assert.rejects(store.appendEvent({
+        type: 'operation',
+        operationId: 'operation-invalid-transition',
+        sessionId: 'legacy-operation-validation',
+        turnId: 'turn-1',
+        stepId: 'step-1',
+        requestId: 'request-1',
+        toolCallId: 'call-1',
+        toolName: 'probe',
+        capabilitySet: [],
+        inputDigest: 'a'.repeat(64),
+        status: 'approved',
+      }), /非法 operation 状态迁移/)
+      assert.equal(await readFile(file, 'utf-8'), before)
+      assert.deepEqual(await store.replayEvents(), [])
+
+      const accepted = await store.appendEvent({ type: 'test.accepted' }, 'durable')
+      assert.equal(accepted.sequence, 2)
+      assert.deepEqual((await store.replayEvents()).map(({ type, sequence }) => ({
+        type,
+        sequence,
+      })), [
+        { type: 'schema.upgraded', sequence: 1 },
+        { type: 'test.accepted', sequence: 2 },
+      ])
+      await store.close()
     })
 })

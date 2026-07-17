@@ -45,7 +45,11 @@ export type {
 } from './core/tool-registry.js'
 export { Workspace, WorkspaceBoundaryError } from './core/workspace.js'
 export { loadConfig } from './core/config.js'
-export { SessionStore, createSessionId } from './session/store.js'
+export {
+  SessionRecordTooLargeError,
+  SessionStore,
+  createSessionId,
+} from './session/store.js'
 export type {
   DurableEventWriter,
   EventDurability,
@@ -54,9 +58,19 @@ export type {
   SessionEventInput,
   SessionState,
   SessionStoreOptions,
+  SessionStoreDiagnostic,
+  SessionStoreDiagnosticCode,
   SessionWriter,
   ToolResultCommit,
 } from './session/store.js'
+export { diagnoseSession } from './session/doctor.js'
+export type {
+  DiagnoseSessionOptions,
+  SessionDoctorDiagnostic,
+  SessionDoctorDiagnosticCode,
+  SessionDoctorReport,
+  SessionDoctorStatus,
+} from './session/doctor.js'
 export {
   applyOperationEvent,
   assertOperationTransition,

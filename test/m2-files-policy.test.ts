@@ -82,7 +82,11 @@ describe('M2 file capability policy', () => {
 
   it('uses canonical realpaths for capabilities and rechecks execution constraints', async (context) => {
     const root = await mkdtemp(join(tmpdir(), 'super-agent-files-'))
-    context.after(() => rm(root, { recursive: true, force: true }))
+    let store: SessionStore | undefined
+    context.after(async () => {
+      await store?.close()
+      await rm(root, { recursive: true, force: true })
+    })
     await writeFile(join(root, '.env'), 'ARBITRARY_VALUE=canonical-secret')
     await writeFile(join(root, 'ordinary.txt'), 'ordinary')
     await symlink('.env', join(root, 'innocent.txt'))
@@ -101,8 +105,7 @@ describe('M2 file capability policy', () => {
     assert.deepEqual(resolution.invocation.supportedConstraintKeys, ['filesystemReadRoots'])
     assert.deepEqual(warnings, [])
 
-    const store = await SessionStore.open('files-policy', { directory: join(root, '.sessions') })
-    context.after(() => store.close())
+    store = await SessionStore.open('files-policy', { directory: join(root, '.sessions') })
     const pipeline = new ToolExecutionPipeline(registry, store)
     const batch = await pipeline.executeBatch({
       sessionId: 'files-policy',

@@ -1,29 +1,44 @@
-import {
-  chmodSync,
-  closeSync,
-  constants,
-  existsSync,
-  mkdirSync,
-  openSync,
-} from 'node:fs'
-import { open, readFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 import { modelMessageSchema, type ModelMessage, type ToolModelMessage } from 'ai'
-import { flockSync } from 'fs-ext'
 import {
   applyOperationEvent,
   parseOperationEvent,
-  reduceOperationEvents,
 } from '../execution/operation-ledger.js'
 import type { OperationProjection } from '../execution/operation-types.js'
+import {
+  DEFAULT_MAX_JOURNAL_RECORD_BYTES,
+  SessionJournalScanError,
+  scanSessionJournal,
+  type SessionJournalDiagnostic,
+  type SessionJournalRecordHandler,
+  type SessionJournalScanResult,
+} from './journal-scanner.js'
+import {
+  applySessionRecord,
+  createEmptySessionState,
+  createSessionSchemaTransitionState,
+  validateSessionRecord,
+  validateSessionSchemaTransition,
+} from './session-records.js'
+import {
+  SessionFileLease,
+  nodeSessionJournalIo,
+  type SessionJournalIo,
+} from './session-file-lease.js'
+
+export {
+  nodeSessionJournalIo,
+  type SessionJournalFile,
+  type SessionJournalIo,
+} from './session-file-lease.js'
 
 const DEFAULT_SESSION_DIR = '.sessions'
 const SESSION_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/
-const DIRECTORY_MODE = 0o700
-const FILE_MODE = 0o600
 const CURRENT_SCHEMA_VERSION = 2 as const
-const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true })
+
+/** Existing v1/v2 records may be larger than the stricter ceiling for new writes. */
+export const DEFAULT_MAX_SESSION_READ_RECORD_BYTES = 16 * 1024 * 1024
 
 interface EntryBase {
   timestamp: string
@@ -52,6 +67,8 @@ export interface CheckpointEntry extends EntryBase {
   messages: ModelMessage[]
   summary: string
   budgetUsed: number
+  /** Last journal sequence represented by this derived checkpoint. */
+  throughSequence?: number
 }
 
 export type SessionEntry = MessagesEntry | MessageEntry | BudgetEntry | CheckpointEntry
@@ -105,35 +122,48 @@ export interface DurableEventWriter {
   appendEvent(event: SessionEventInput, durability?: EventDurability): Promise<SessionEvent>
 }
 
-export interface SessionJournalFile {
-  chmod(mode: number): Promise<void>
-  truncate(length?: number): Promise<void>
-  write(buffer: Uint8Array, offset: number, length: number): Promise<{ bytesWritten: number }>
-  datasync(): Promise<void>
-  close(): Promise<void>
+export type SessionStoreDiagnosticCode =
+  | SessionJournalScanError['code']
+  | SessionJournalDiagnostic['code']
+
+export interface SessionStoreDiagnostic {
+  code: SessionStoreDiagnosticCode
+  severity: 'warning' | 'fatal'
+  sessionId: string
+  path: string
+  line?: number
+  byteOffset?: number
+  byteLength?: number
+  repaired: boolean
+  message: string
 }
 
-/** Minimal injectable boundary around journal file I/O. */
-export interface SessionJournalIo {
-  open(path: string, flags: number, mode: number): Promise<SessionJournalFile>
-  readFile(path: string): Promise<Buffer>
-}
+export class SessionRecordTooLargeError extends Error {
+  readonly code = 'session_record_too_large'
 
-export const nodeSessionJournalIo: SessionJournalIo = Object.freeze({
-  open: (path: string, flags: number, mode: number) => open(path, flags, mode),
-  readFile: (path: string) => readFile(path),
-})
+  constructor(
+    readonly actualBytes: number,
+    readonly maxRecordBytes: number,
+  ) {
+    super(`Session journal 记录为 ${actualBytes} bytes，超过 ${maxRecordBytes} bytes 上限`)
+    this.name = 'SessionRecordTooLargeError'
+  }
+}
 
 export interface SessionStoreOptions {
   directory?: string
   onWarning?: (message: string) => void
+  onDiagnostic?: (diagnostic: SessionStoreDiagnostic) => void
+  /** Maximum UTF-8 bytes for newly appended JSONL records, including newline. */
+  maxRecordBytes?: number
+  /** Compatibility ceiling for existing records. Must be at least maxRecordBytes. */
+  maxReadRecordBytes?: number
   io?: SessionJournalIo
 }
 
-interface ParsedJournal {
-  records: Record<string, unknown>[]
-  validLength: number
-  hasTrailingFragment: boolean
+interface PreparedSessionEvent {
+  readonly event: SessionEvent
+  readonly bytes: Uint8Array
 }
 
 export function createSessionId(now = new Date()) {
@@ -141,15 +171,14 @@ export function createSessionId(now = new Date()) {
   return `${timestamp}_${randomUUID().slice(0, 8)}`
 }
 
-function validateSessionId(sessionId: string) {
+export function validateSessionId(sessionId: string) {
   if (!SESSION_ID_PATTERN.test(sessionId) || sessionId === '.' || sessionId === '..') {
     throw new Error(`非法 session ID: ${sessionId}`)
   }
 }
 
 function emptyState(): SessionState {
-  const messages: ModelMessage[] = []
-  return { messages, summary: '', budgetUsed: 0 }
+  return createEmptySessionState()
 }
 
 function assertBudget(budgetUsed: number) {
@@ -172,80 +201,18 @@ function assertMessages(messages: ModelMessage[]) {
   }
 }
 
-function asRecord(value: unknown, lineNumber: number): Record<string, unknown> {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    throw new Error(`[Session] 第 ${lineNumber} 行不是 JSON object`)
-  }
-  return value as Record<string, unknown>
-}
-
-function validateV2Events(records: Record<string, unknown>[]) {
-  let nextSequence = 1
-  let sawV2 = false
-  const eventIds = new Set<string>()
-  const materializationIds = new Set<string>()
-
-  for (const [index, record] of records.entries()) {
-    const lineNumber = index + 1
-    if (record.schemaVersion === undefined) {
-      if (sawV2) {
-        throw new Error(`[Session] 第 ${lineNumber} 行在 v2 事件后出现无版本 v1 记录`)
-      }
-      continue
-    }
-    if (record.schemaVersion !== CURRENT_SCHEMA_VERSION) {
-      throw new Error(`[Session] 第 ${lineNumber} 行 schemaVersion 不受支持`)
-    }
-
-    sawV2 = true
-    if (typeof record.type !== 'string' || record.type.length === 0) {
-      throw new Error(`[Session] 第 ${lineNumber} 行 type 无效`)
-    }
-    if (typeof record.timestamp !== 'string' || record.timestamp.length === 0) {
-      throw new Error(`[Session] 第 ${lineNumber} 行 timestamp 无效`)
-    }
-    if (typeof record.eventId !== 'string' || record.eventId.length === 0) {
-      throw new Error(`[Session] 第 ${lineNumber} 行 eventId 无效`)
-    }
-    if (eventIds.has(record.eventId)) {
-      throw new Error(`[Session] 第 ${lineNumber} 行 eventId 重复: ${record.eventId}`)
-    }
-    if (!Number.isSafeInteger(record.sequence) || record.sequence !== nextSequence) {
-      throw new Error(
-        `[Session] 第 ${lineNumber} 行 sequence 无效: 期望 ${nextSequence}，实际 ${String(record.sequence)}`,
-      )
-    }
-
-    eventIds.add(record.eventId)
-    if (record.materializationId !== undefined) {
-      if (typeof record.materializationId !== 'string' || record.materializationId.length === 0) {
-        throw new Error(`[Session] 第 ${lineNumber} 行 materializationId 无效`)
-      }
-      if (materializationIds.has(record.materializationId)) {
-        throw new Error(
-          `[Session] 第 ${lineNumber} 行 materializationId 重复: ${record.materializationId}`,
-        )
-      }
-      materializationIds.add(record.materializationId)
-    }
-    nextSequence++
-  }
-
-  return { nextSequence, eventIds, materializationIds, sawV2 }
-}
-
 /**
  * Append-only, versioned session journal with a process-lifetime single-writer lock.
  * Buffered writes are complete OS writes; durable writes additionally wait for
  * fdatasync before acknowledging the event.
  */
 export class SessionStore implements SessionWriter, DurableEventWriter {
+  private readonly lease: SessionFileLease
   private readonly filePath: string
-  private readonly lockPath: string
   private readonly onWarning: (message: string) => void
-  private readonly io: SessionJournalIo
-  private lockFd: number | undefined
-  private journalHandle: SessionJournalFile | undefined
+  private readonly onDiagnostic: (diagnostic: SessionStoreDiagnostic) => void
+  private readonly maxRecordBytes: number
+  private readonly maxReadRecordBytes: number
   private writeTail: Promise<void> = Promise.resolve()
   private fatalError: unknown
   private initialized = false
@@ -264,20 +231,38 @@ export class SessionStore implements SessionWriter, DurableEventWriter {
     options: SessionStoreOptions = {},
   ) {
     validateSessionId(sessionId)
-    const directory = resolve(options.directory || DEFAULT_SESSION_DIR)
-    mkdirSync(directory, { recursive: true, mode: DIRECTORY_MODE })
-    chmodSync(directory, DIRECTORY_MODE)
-    this.filePath = resolve(directory, `${sessionId}.jsonl`)
-    this.lockPath = resolve(directory, `${sessionId}.lock`)
     this.onWarning = options.onWarning || ((message) => console.warn(message))
-    this.io = options.io || nodeSessionJournalIo
-
-    if (existsSync(this.filePath)) chmodSync(this.filePath, FILE_MODE)
-    this.acquireLock()
+    this.onDiagnostic = options.onDiagnostic || (() => undefined)
+    this.maxRecordBytes = options.maxRecordBytes ?? DEFAULT_MAX_JOURNAL_RECORD_BYTES
+    if (!Number.isSafeInteger(this.maxRecordBytes) || this.maxRecordBytes <= 0) {
+      throw new Error('maxRecordBytes 必须是正安全整数')
+    }
+    this.maxReadRecordBytes = options.maxReadRecordBytes ??
+      DEFAULT_MAX_SESSION_READ_RECORD_BYTES
+    if (!Number.isSafeInteger(this.maxReadRecordBytes) || this.maxReadRecordBytes <= 0) {
+      throw new Error('maxReadRecordBytes 必须是正安全整数')
+    }
+    if (this.maxReadRecordBytes < this.maxRecordBytes) {
+      throw new Error('maxReadRecordBytes 不得小于 maxRecordBytes')
+    }
+    this.lease = new SessionFileLease(
+      resolve(options.directory || DEFAULT_SESSION_DIR),
+      sessionId,
+      options.io || nodeSessionJournalIo,
+    )
+    this.filePath = this.lease.filePath
   }
 
   static async open(sessionId: string, options: SessionStoreOptions = {}) {
-    return new SessionStore(sessionId, options)
+    const store = new SessionStore(sessionId, options)
+    try {
+      if (!store.exists()) return store
+      await store.ensureInitialized()
+      return store
+    } catch (error) {
+      await store.close().catch(() => undefined)
+      throw error
+    }
   }
 
   getSessionId() {
@@ -285,7 +270,7 @@ export class SessionStore implements SessionWriter, DurableEventWriter {
   }
 
   exists() {
-    return existsSync(this.filePath)
+    return this.lease.exists()
   }
 
   async appendMessages(messages: ModelMessage[], budgetUsed?: number) {
@@ -324,20 +309,20 @@ export class SessionStore implements SessionWriter, DurableEventWriter {
     assertMessages([commit.message])
     if (budgetUsed !== undefined) assertBudget(budgetUsed)
 
-    return this.enqueueWrite(async () => {
+    return this.enqueueOperation(async () => {
       await this.ensureInitialized()
       if (this.materializationIds.has(commit.materializationId)) return false
-      await this.ensureV2UpgradeMarker()
-      const event = this.createEvent({
+      const prepared = this.serializeEvent(this.createEvent({
         type: 'messages',
         messages: [commit.message],
         materializationId: commit.materializationId,
         operationId: commit.operationId,
         ...(budgetUsed === undefined ? {} : { budgetUsed }),
-      })
-      await this.writeEvent(event, 'durable')
-      this.acceptEvent(event)
-      this.materializationIds.add(commit.materializationId)
+      }, this.nextAppendSequence()))
+      await this.ensureV2UpgradeMarker()
+      this.assertPreparedEventStillNext(prepared.event)
+      await this.writeEvent(prepared, 'durable')
+      this.acceptEvent(prepared.event)
       return true
     })
   }
@@ -356,109 +341,56 @@ export class SessionStore implements SessionWriter, DurableEventWriter {
     if (typeof input.type !== 'string' || input.type.length === 0) {
       throw new Error('[Session] event.type 无效')
     }
+    if (input.type === 'schema.upgraded') {
+      throw new Error('[Session] schema.upgraded 是 Store 保留事件类型')
+    }
     if (input.schemaVersion !== undefined && input.schemaVersion !== CURRENT_SCHEMA_VERSION) {
       throw new Error(`[Session] event.schemaVersion 必须为 ${CURRENT_SCHEMA_VERSION}`)
     }
 
-    return this.enqueueWrite(async () => {
+    return this.enqueueOperation(async () => {
       await this.ensureInitialized()
-
+      const prepared = this.serializeEvent(
+        this.createEvent(input, this.nextAppendSequence()),
+      )
+      const operationProjection = this.projectOperationEvent(prepared.event)
       await this.ensureV2UpgradeMarker()
-
-      const event = this.createEvent(input)
-      const operationProjection = this.projectOperationEvent(event)
-      await this.writeEvent(event, durability)
-      this.acceptEvent(event, operationProjection)
-      return event
+      this.assertPreparedEventStillNext(prepared.event)
+      await this.writeEvent(prepared, durability)
+      this.acceptEvent(prepared.event, operationProjection)
+      return prepared.event
     })
   }
 
   /** Returns the ordered v2 stream; v1 records remain available through loadState(). */
-  async replayEvents(): Promise<SessionEvent[]> {
-    await this.awaitPendingWrites()
-    const parsed = await this.readJournal()
-    validateV2Events(parsed.records)
-    return parsed.records
-      .filter((record) => record.schemaVersion === CURRENT_SCHEMA_VERSION)
-      .map((record) => record as SessionEvent)
+  replayEvents(): Promise<SessionEvent[]> {
+    if (this.closing || this.closed) {
+      return Promise.reject(new Error(`[Session] session ${this.sessionId} 已关闭`))
+    }
+    return this.enqueueOperation(async () => {
+      if (!this.exists()) return []
+      await this.ensureInitialized()
+      const events: SessionEvent[] = []
+      await this.scanJournal(true, (record) => {
+        if (record.schemaVersion === CURRENT_SCHEMA_VERSION) events.push(record as SessionEvent)
+      })
+      return events
+    })
   }
 
-  async loadState() {
-    await this.awaitPendingWrites()
-    if (!this.exists()) return emptyState()
-
-    const parsed = await this.readJournal()
-    validateV2Events(parsed.records)
-    let state = emptyState()
-
-    for (const [index, entry] of parsed.records.entries()) {
-      const lineNumber = index + 1
-      const type = entry.type
-
-      if (type === 'messages') {
-        if (!Array.isArray(entry.messages)) {
-          throw new Error(`[Session] 第 ${lineNumber} 行 messages.messages 不是数组`)
-        }
-        const parsedMessages = entry.messages.map((message) => modelMessageSchema.safeParse(message))
-        if (parsedMessages.some((message) => !message.success)) {
-          throw new Error(`[Session] 第 ${lineNumber} 行 messages 包含无效消息`)
-        }
-        if (entry.budgetUsed !== undefined) {
-          if (typeof entry.budgetUsed !== 'number') {
-            throw new Error(`[Session] 第 ${lineNumber} 行 messages.budgetUsed 无效`)
-          }
-          assertBudget(entry.budgetUsed)
-          state.budgetUsed = entry.budgetUsed
-        }
-        state.messages.push(...parsedMessages.map((message) => message.data!))
-        continue
-      }
-
-      if (type === 'message') {
-        const message = modelMessageSchema.safeParse(entry.message)
-        if (!message.success) throw new Error(`[Session] 第 ${lineNumber} 行 message 结构无效`)
-        state.messages.push(message.data)
-        continue
-      }
-
-      if (type === 'budget') {
-        if (typeof entry.budgetUsed !== 'number') {
-          throw new Error(`[Session] 第 ${lineNumber} 行 budget.budgetUsed 无效`)
-        }
-        assertBudget(entry.budgetUsed)
-        state.budgetUsed = entry.budgetUsed
-        continue
-      }
-
-      if (type === 'checkpoint') {
-        if (!Array.isArray(entry.messages)) {
-          throw new Error(`[Session] 第 ${lineNumber} 行 checkpoint.messages 不是数组`)
-        }
-        const parsedMessages = entry.messages.map((message) => modelMessageSchema.safeParse(message))
-        if (parsedMessages.some((message) => !message.success)) {
-          throw new Error(`[Session] 第 ${lineNumber} 行 checkpoint 包含无效消息`)
-        }
-        if (typeof entry.summary !== 'string') {
-          throw new Error(`[Session] 第 ${lineNumber} 行 checkpoint.summary 无效`)
-        }
-        if (typeof entry.budgetUsed !== 'number') {
-          throw new Error(`[Session] 第 ${lineNumber} 行 checkpoint.budgetUsed 无效`)
-        }
-        assertBudget(entry.budgetUsed)
-        state = {
-          messages: parsedMessages.map((message) => message.data!),
-          summary: entry.summary,
-          budgetUsed: entry.budgetUsed,
-        }
-        continue
-      }
-
-      // v2 contains operation and control-plane events which do not alter this projection.
-      if (entry.schemaVersion === CURRENT_SCHEMA_VERSION) continue
-      throw new Error(`[Session] 第 ${lineNumber} 行未知 v1 entry type`)
+  loadState(): Promise<SessionState> {
+    if (this.closing || this.closed) {
+      return Promise.reject(new Error(`[Session] session ${this.sessionId} 已关闭`))
     }
-
-    return state
+    return this.enqueueOperation(async () => {
+      if (!this.exists()) return emptyState()
+      await this.ensureInitialized()
+      let state = emptyState()
+      await this.scanJournal(true, (record, location) => {
+        state = applySessionRecord(state, record, location.line)
+      })
+      return state
+    })
   }
 
   close(): Promise<void> {
@@ -473,22 +405,16 @@ export class SessionStore implements SessionWriter, DurableEventWriter {
     try {
       await this.writeTail
       if (this.fatalError) closeError = this.fatalError
-      if (this.journalHandle) await this.journalHandle.datasync()
+      if (this.lease.hasOpenJournal()) await this.lease.datasync()
     } catch (error) {
       closeError = error
     }
 
     try {
-      await this.journalHandle?.close()
+      await this.lease.close()
     } catch (error) {
       closeError ||= error
     } finally {
-      this.journalHandle = undefined
-      try {
-        this.releaseLock()
-      } catch (error) {
-        closeError ||= error
-      }
       this.closed = true
       this.closing = false
     }
@@ -496,47 +422,7 @@ export class SessionStore implements SessionWriter, DurableEventWriter {
     if (closeError) throw closeError
   }
 
-  private acquireLock() {
-    let lockFd: number | undefined
-    try {
-      lockFd = openSync(this.lockPath, constants.O_CREAT | constants.O_RDWR, FILE_MODE)
-      chmodSync(this.lockPath, FILE_MODE)
-      flockSync(lockFd, 'exnb')
-      this.lockFd = lockFd
-    } catch (error) {
-      try {
-        if (lockFd !== undefined) closeSync(lockFd)
-      } catch {
-        // Preserve the acquisition error.
-      }
-      this.lockFd = undefined
-      const code = (error as NodeJS.ErrnoException).code
-      if (code === 'EAGAIN' || code === 'EACCES' || code === 'EWOULDBLOCK') {
-        throw new Error(`[Session] session ${this.sessionId} 已被其他活跃写者锁定`, { cause: error })
-      }
-      throw error
-    }
-  }
-
-  private releaseLock() {
-    if (this.lockFd === undefined) return
-    const lockFd = this.lockFd
-    this.lockFd = undefined
-    let releaseError: unknown
-    try {
-      flockSync(lockFd, 'un')
-    } catch (error) {
-      releaseError = error
-    }
-    try {
-      closeSync(lockFd)
-    } catch (error) {
-      releaseError ||= error
-    }
-    if (releaseError) throw releaseError
-  }
-
-  private enqueueWrite<T>(operation: () => Promise<T>): Promise<T> {
+  private enqueueOperation<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.writeTail.then(async () => {
       if (this.fatalError) throw this.fatalError
       return operation()
@@ -548,53 +434,51 @@ export class SessionStore implements SessionWriter, DurableEventWriter {
     return result
   }
 
-  private async awaitPendingWrites() {
-    await this.writeTail
-    if (this.fatalError) throw this.fatalError
-  }
-
   private async ensureInitialized() {
     if (this.initialized) return
-    try {
-      const parsed = await this.readJournal()
-      const validated = validateV2Events(parsed.records)
-      this.nextSequence = validated.nextSequence
-      this.eventIds = validated.eventIds
-      this.materializationIds = validated.materializationIds
-      this.operations = new Map(reduceOperationEvents(
-        parsed.records
-          .filter((record) => record.schemaVersion === CURRENT_SCHEMA_VERSION && record.type === 'operation')
-          .map((record) => parseOperationEvent(record)),
-      ))
-      this.hasV2Records = validated.sawV2
-      this.hasV1Records = parsed.records.some((record) => record.schemaVersion === undefined)
+    await this.lease.openJournal()
+    const operations = new Map<string, OperationProjection>()
+    const schemaTransition = createSessionSchemaTransitionState()
+    const scanned = await this.scanJournal(false, (record, location) => {
+      validateSessionRecord(record, location.line)
+      validateSessionSchemaTransition(schemaTransition, record, location.line)
+      if (record.schemaVersion === CURRENT_SCHEMA_VERSION && record.type === 'operation') {
+        const operation = parseOperationEvent(record)
+        const projection = applyOperationEvent(operations.get(operation.operationId), operation)
+        operations.set(operation.operationId, projection)
+      }
+    })
+    this.nextSequence = scanned.nextSequence
+    this.eventIds = new Set(scanned.eventIds)
+    this.materializationIds = new Set(scanned.materializationIds)
+    this.operations = operations
+    this.hasV2Records = scanned.v2RecordCount > 0
+    this.hasV1Records = scanned.v1RecordCount > 0
 
-      this.journalHandle = await this.io.open(
-        this.filePath,
-        constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY,
-        FILE_MODE,
-      )
-      await this.journalHandle.chmod(FILE_MODE)
-      if (parsed.hasTrailingFragment) await this.journalHandle.truncate(parsed.validLength)
-      this.initialized = true
-    } catch (error) {
-      this.fatalError ||= error
-      throw error
+    const trailing = scanned.diagnostics[0]
+    if (trailing) {
+      await this.lease.truncate(scanned.validLength)
+      this.reportTrailingFragment(trailing, true)
     }
+    this.initialized = true
   }
 
   private async ensureV2UpgradeMarker() {
     if (!this.hasV1Records || this.hasV2Records) return
-    const marker = this.createEvent({
+    const prepared = this.serializeEvent(this.createEvent({
       type: 'schema.upgraded',
       fromSchemaVersion: 1,
       toSchemaVersion: CURRENT_SCHEMA_VERSION,
-    })
-    await this.writeEvent(marker, 'buffered')
-    this.acceptEvent(marker)
+    }))
+    await this.writeEvent(prepared, 'buffered')
+    this.acceptEvent(prepared.event)
   }
 
-  private createEvent(input: SessionEventInput): SessionEvent {
+  private nextAppendSequence() {
+    return this.nextSequence + (this.hasV1Records && !this.hasV2Records ? 1 : 0)
+  }
+
+  private createEvent(input: SessionEventInput, sequence = this.nextSequence): SessionEvent {
     const {
       schemaVersion: _schemaVersion,
       eventId: requestedEventId,
@@ -604,9 +488,9 @@ export class SessionStore implements SessionWriter, DurableEventWriter {
     } = input
     void _schemaVersion
 
-    if (requestedSequence !== undefined && requestedSequence !== this.nextSequence) {
+    if (requestedSequence !== undefined && requestedSequence !== sequence) {
       throw new Error(
-        `[Session] event.sequence 无效: 期望 ${this.nextSequence}，实际 ${requestedSequence}`,
+        `[Session] event.sequence 无效: 期望 ${sequence}，实际 ${requestedSequence}`,
       )
     }
     if (
@@ -626,13 +510,50 @@ export class SessionStore implements SessionWriter, DurableEventWriter {
     }
     const timestamp = requestedTimestamp ?? new Date().toISOString()
 
-    return {
+    if (payload.materializationId !== undefined) {
+      if (typeof payload.materializationId !== 'string' ||
+        payload.materializationId.length === 0) {
+        throw new Error('[Session] event.materializationId 无效')
+      }
+      if (this.materializationIds.has(payload.materializationId)) {
+        throw new Error(`[Session] materializationId 重复: ${payload.materializationId}`)
+      }
+    }
+
+    const checkpointSequence = sequence - 1
+    if (input.type === 'checkpoint' && payload.throughSequence !== undefined &&
+      payload.throughSequence !== checkpointSequence) {
+      throw new Error(
+        `[Session] checkpoint.throughSequence 无效: 期望 ${checkpointSequence}，实际 ${String(payload.throughSequence)}`,
+      )
+    }
+    const checkpointFields = input.type === 'checkpoint'
+      ? { throughSequence: checkpointSequence }
+      : {}
+
+    const event: SessionEvent = {
       ...payload,
+      ...checkpointFields,
       schemaVersion: CURRENT_SCHEMA_VERSION,
       eventId,
-      sequence: this.nextSequence,
+      sequence,
       type: input.type,
       timestamp,
+    }
+    validateSessionRecord(event, sequence)
+    return event
+  }
+
+  private assertPreparedEventStillNext(event: SessionEvent) {
+    if (event.sequence !== this.nextSequence) {
+      throw new Error('[Session] prepared event sequence 已过期')
+    }
+    if (this.eventIds.has(event.eventId)) {
+      throw new Error(`[Session] eventId 重复: ${event.eventId}`)
+    }
+    if (typeof event.materializationId === 'string' &&
+      this.materializationIds.has(event.materializationId)) {
+      throw new Error(`[Session] materializationId 重复: ${event.materializationId}`)
     }
   }
 
@@ -644,6 +565,9 @@ export class SessionStore implements SessionWriter, DurableEventWriter {
 
   private acceptEvent(event: SessionEvent, operationProjection?: OperationProjection) {
     this.eventIds.add(event.eventId)
+    if (typeof event.materializationId === 'string') {
+      this.materializationIds.add(event.materializationId)
+    }
     this.nextSequence++
     this.hasV2Records = true
     if (operationProjection) {
@@ -651,64 +575,132 @@ export class SessionStore implements SessionWriter, DurableEventWriter {
     }
   }
 
-  private async writeEvent(event: SessionEvent, durability: EventDurability) {
-    if (!this.journalHandle) throw new Error('[Session] journal 尚未打开')
+  private serializeEvent(event: SessionEvent): PreparedSessionEvent {
+    const expectedEnvelope = Object.freeze({
+      schemaVersion: event.schemaVersion,
+      eventId: event.eventId,
+      sequence: event.sequence,
+      type: event.type,
+      timestamp: event.timestamp,
+      materializationId: event.materializationId,
+      throughSequence: event.type === 'checkpoint' ? event.throughSequence : undefined,
+    })
     const serialized = JSON.stringify(event)
     if (serialized === undefined) throw new Error('[Session] event 无法序列化')
     const bytes = Buffer.from(`${serialized}\n`, 'utf-8')
+    if (bytes.length > this.maxRecordBytes) {
+      throw new SessionRecordTooLargeError(bytes.length, this.maxRecordBytes)
+    }
+
+    const parsed: unknown = JSON.parse(serialized)
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new Error('[Session] event 序列化结果必须是 object')
+    }
+    const canonical = parsed as Record<string, unknown>
+    if (
+      canonical.schemaVersion !== expectedEnvelope.schemaVersion ||
+      canonical.eventId !== expectedEnvelope.eventId ||
+      canonical.sequence !== expectedEnvelope.sequence ||
+      canonical.type !== expectedEnvelope.type ||
+      canonical.timestamp !== expectedEnvelope.timestamp ||
+      canonical.materializationId !== expectedEnvelope.materializationId ||
+      (expectedEnvelope.type === 'checkpoint' &&
+        canonical.throughSequence !== expectedEnvelope.throughSequence)
+    ) {
+      throw new Error('[Session] event 序列化改变了 Store 保护字段')
+    }
+    validateSessionRecord(canonical, expectedEnvelope.sequence)
+    return Object.freeze({ event: canonical as SessionEvent, bytes })
+  }
+
+  private async writeEvent(
+    prepared: PreparedSessionEvent,
+    durability: EventDurability,
+  ) {
+    const { bytes } = prepared
     try {
       let offset = 0
       while (offset < bytes.length) {
-        const { bytesWritten } = await this.journalHandle.write(bytes, offset, bytes.length - offset)
+        const { bytesWritten } = await this.lease.write(bytes, offset, bytes.length - offset)
         if (bytesWritten <= 0) throw new Error('[Session] journal write 未取得进展')
         offset += bytesWritten
       }
-      if (durability === 'durable') await this.journalHandle.datasync()
+      if (durability === 'durable') await this.lease.datasync()
     } catch (error) {
       this.fatalError ||= error
       throw error
     }
   }
 
-  private async readJournal(): Promise<ParsedJournal> {
-    let data: Buffer
+  private async scanJournal(
+    reportTrailing: boolean,
+    onRecord?: SessionJournalRecordHandler,
+  ): Promise<SessionJournalScanResult> {
     try {
-      data = await this.io.readFile(this.filePath)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        return { records: [], validLength: 0, hasTrailingFragment: false }
+      const scanned = await scanSessionJournal(this.lease.readChunks(), {
+        maxRecordBytes: this.maxReadRecordBytes,
+        ...(onRecord === undefined ? {} : { onRecord }),
+      })
+      await this.lease.assertSafe()
+      if (reportTrailing && scanned.diagnostics.length > 0) {
+        this.reportTrailingFragment(scanned.diagnostics[0]!, false)
       }
+      return scanned
+    } catch (error) {
+      if (error instanceof SessionJournalScanError) this.reportScanError(error)
+      await this.lease.assertSafe()
       throw error
     }
+  }
 
-    const records: Record<string, unknown>[] = []
-    let start = 0
-    let lineNumber = 0
-    for (let index = 0; index < data.length; index++) {
-      if (data[index] !== 0x0a) continue
-      lineNumber++
-      let raw: string
-      try {
-        raw = UTF8_DECODER.decode(data.subarray(start, index)).replace(/\r$/, '')
-      } catch (error) {
-        throw new Error(`[Session] 第 ${lineNumber} 行不是有效 UTF-8，停止恢复`, { cause: error })
-      }
-      start = index + 1
-      if (!raw.trim()) continue
+  private reportTrailingFragment(diagnostic: SessionJournalDiagnostic, repaired: boolean) {
+    const value: SessionStoreDiagnostic = Object.freeze({
+      code: diagnostic.code,
+      severity: 'warning',
+      sessionId: this.sessionId,
+      path: this.filePath,
+      line: diagnostic.line,
+      byteOffset: diagnostic.byteOffset,
+      byteLength: diagnostic.byteLength,
+      repaired,
+      message: repaired
+        ? '已截断 session journal 的 EOF 未完成记录'
+        : '已忽略 session journal 的 EOF 未完成记录',
+    })
+    this.emitDiagnostic(value)
+    this.emitWarning(`[Session] ${value.message}（第 ${diagnostic.line} 行）`)
+  }
 
-      try {
-        records.push(asRecord(JSON.parse(raw), lineNumber))
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error)
-        throw new Error(`[Session] 第 ${lineNumber} 行损坏，停止恢复: ${reason}`, { cause: error })
-      }
+  private reportScanError(error: SessionJournalScanError) {
+    const location = error.location
+    this.emitDiagnostic(Object.freeze({
+      code: error.code,
+      severity: 'fatal',
+      sessionId: this.sessionId,
+      path: this.filePath,
+      ...(location === undefined ? {} : {
+        line: location.line,
+        byteOffset: location.byteOffset,
+        byteLength: location.byteLength,
+      }),
+      repaired: false,
+      message: error.message,
+    }))
+  }
+
+  private emitDiagnostic(diagnostic: SessionStoreDiagnostic) {
+    try {
+      this.onDiagnostic(diagnostic)
+    } catch {
+      // Observability callbacks must never change storage recovery semantics.
     }
+  }
 
-    const hasTrailingFragment = start < data.length
-    if (hasTrailingFragment) {
-      this.onWarning(`[Session] 忽略 EOF 尾部未完成记录（第 ${lineNumber + 1} 行）`)
+  private emitWarning(message: string) {
+    try {
+      this.onWarning(message)
+    } catch {
+      // Observability callbacks must never change storage recovery semantics.
     }
-
-    return { records, validLength: start, hasTrailingFragment }
   }
 }

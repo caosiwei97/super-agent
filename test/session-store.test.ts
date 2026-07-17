@@ -41,6 +41,8 @@ describe('SessionStore', () => {
       }
     })
     const batch = entries.find((entry) => entry.type === 'messages')
+    const checkpoint = entries.find((entry) => entry.type === 'checkpoint')
+    assert.equal(checkpoint.throughSequence, 0)
     assert.equal(batch.messages.length, 1)
     assert.equal(batch.budgetUsed, 17)
   })
@@ -78,6 +80,8 @@ describe('SessionStore', () => {
   it('continues to read legacy per-message and budget events', async (context) => {
     const directory = await mkdtemp(join(tmpdir(), 'super-agent-session-'))
     const timestamp = new Date().toISOString()
+    const bootstrap = await SessionStore.open('legacy', { directory })
+    await bootstrap.close()
     await appendFile(
       join(directory, 'legacy.jsonl'),
       [
@@ -106,4 +110,27 @@ describe('SessionStore', () => {
       budgetUsed: 12,
     })
   })
+
+  it('reads a pre-existing legacy record above the stricter new-write ceiling',
+    async (context) => {
+      const directory = await mkdtemp(join(tmpdir(), 'super-agent-session-large-legacy-'))
+      const content = 'x'.repeat(1024 * 1024 + 4096)
+      const bootstrap = await SessionStore.open('large-legacy', { directory })
+      await bootstrap.close()
+      await appendFile(join(directory, 'large-legacy.jsonl'), `${JSON.stringify({
+        type: 'message',
+        timestamp: new Date().toISOString(),
+        message: { role: 'user', content },
+      })}\n`, 'utf-8')
+
+      const store = await SessionStore.open('large-legacy', { directory })
+      context.after(async () => {
+        await store.close()
+        await rm(directory, { recursive: true, force: true })
+      })
+
+      const state = await store.loadState()
+      assert.equal(typeof state.messages[0]?.content, 'string')
+      assert.equal(state.messages[0]?.content.length, content.length)
+    })
 })
