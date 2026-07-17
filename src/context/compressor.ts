@@ -185,8 +185,6 @@ export interface ContextCompactionResult extends CompactionResult {
 
 export interface CompactionRuntimePolicy {
   allowSummary?: boolean
-  signal?: AbortSignal
-  deadline?: number
 }
 
 function stripEmbeddedSummary(messages: ModelMessage[], existingSummary: string) {
@@ -235,7 +233,6 @@ export async function summarize(
   messages: ModelMessage[],
   existingSummary = '',
   options: Partial<CompactionOptions> = {},
-  runtime: Pick<CompactionRuntimePolicy, 'signal' | 'deadline'> = {},
 ) {
   const resolvedOptions = resolveOptions(options)
   // A previous summary is injected into messages for the agent. Remove that
@@ -303,10 +300,6 @@ export async function summarize(
       prompt,
       temperature: 0,
       maxOutputTokens: resolvedOptions.maxSummaryChars,
-      abortSignal: runtime.signal,
-      ...(runtime.deadline === undefined
-        ? {}
-        : { timeout: Math.max(1, runtime.deadline - Date.now()) }),
     })
     const summary = result.text.trim()
 
@@ -346,11 +339,6 @@ export async function summarize(
       usageTokens: usageTokenCount(result.usage),
     }
   } catch (error) {
-    if (runtime.signal?.aborted) {
-      throw runtime.signal.reason instanceof Error
-        ? runtime.signal.reason
-        : new DOMException('Compaction aborted', 'AbortError')
-    }
     return {
       messages,
       summary: previousSummary,
@@ -384,7 +372,6 @@ export async function compactContext(
         microcompactResult.messages,
         existingSummary,
         resolvedOptions,
-        { signal: policy.signal, deadline: policy.deadline },
       )
 
   return {

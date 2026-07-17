@@ -6,60 +6,19 @@ import {
   type ConversationState,
 } from '../agent/conversation-runner.js'
 import type { AgentLoopObserver, ToolApprovalHandler } from '../agent/agent-loop.js'
-import type { ToolRegistry } from '../core/tool-registry.js'
+import type { ToolInvocation, ToolRegistry } from '../core/tool-registry.js'
 import type { CompactionOptions, ContextCompactionResult } from '../context/compressor.js'
 import type { SessionWriter } from '../session/store.js'
-import type { RecoveryJournal } from '../execution/recovery-coordinator.js'
-import { redactSensitiveInput } from '../execution/operation-ledger.js'
-import type { PipelineApprovalRequest } from '../execution/tool-execution-pipeline.js'
-import { killActiveProcessGroupsSync } from '../execution/process-executor.js'
-import {
-  DEFAULT_SHUTDOWN_CLOSE_WAIT_TIMEOUT_MS,
-  ShutdownCoordinator,
-} from './shutdown-coordinator.js'
 
 export interface CliRuntimeDeps {
   model: LanguageModel
   registry: ToolRegistry
-  store: SessionWriter & RecoveryJournal
+  store: SessionWriter
   state: ConversationState
   compaction: CompactionOptions
   maxSteps: number
   maxRetries: number
-  modelRequestTimeoutMs: number
-  turnTimeoutMs: number
   autoApprove: boolean
-  shutdown?: CliShutdownOptions
-}
-
-export interface CliShutdownOptions {
-  activeWaitTimeoutMs?: number
-  closeWaitTimeoutMs?: number
-  registryCloseTimeoutMs?: number
-  storeCloseTimeoutMs?: number
-}
-
-const DEFAULT_REGISTRY_CLOSE_TIMEOUT_MS = 1_500
-const DEFAULT_STORE_CLOSE_TIMEOUT_MS = 2_500
-
-type RuntimeResource = 'registry' | 'store'
-
-interface CloseableRuntimeResource {
-  close(): void | Promise<void>
-}
-
-interface RuntimeCloseResources {
-  registry: CloseableRuntimeResource
-  store?: CloseableRuntimeResource
-}
-
-export class RuntimeResourceCloseTimeoutError extends Error {
-  readonly code = 'runtime_resource_close_timeout'
-
-  constructor(readonly resource: RuntimeResource, readonly timeoutMs: number) {
-    super(`等待 ${resource} 关闭超过 ${timeoutMs}ms`)
-    this.name = 'RuntimeResourceCloseTimeoutError'
-  }
 }
 
 export function printStartupStats(registry: ToolRegistry) {
@@ -69,7 +28,9 @@ export function printStartupStats(registry: ToolRegistry) {
 
   console.log(`已注册 ${allTools.length} 个工具：`)
   for (const tool of allTools) {
-    console.log(`  - ${tool.name}（能力、约束、并发与审批按调用动态判定）`)
+    const flags = [tool.isConcurrencySafe ? '可并发' : '串行', tool.isReadOnly ? '只读' : '读写']
+    if (tool.requiresApproval || !tool.isReadOnly) flags.push('需审批')
+    console.log(`  - ${tool.name}（${flags.join(', ')}）`)
   }
 
   console.log('\n=== 工具统计 ===')
@@ -77,7 +38,6 @@ export function printStartupStats(registry: ToolRegistry) {
   console.log(`  活跃工具: ${activeTools.length} 个`)
   console.log(`  延迟工具: ${allTools.length - activeTools.length} 个`)
   console.log(`  Token 估算: ~${estimate.active} (活跃) + ~${estimate.deferred} (延迟)`)
-  console.log('  权限策略: 每次调用由 Capability Resolver + Policy Engine 判定')
 }
 
 function printCompaction(phase: CompactionPhase, result: ContextCompactionResult) {
@@ -101,65 +61,37 @@ function printCompaction(phase: CompactionPhase, result: ContextCompactionResult
   )
 }
 
-export function inputPreview(input: unknown) {
-  try {
-    const serialized = JSON.stringify(redactSensitiveInput(input))
-    if (!serialized) return '[无法安全预览]'
-    return serialized.length > 500 ? `${serialized.slice(0, 500)}…` : serialized
-  } catch {
-    return '[无法安全预览]'
-  }
+function inputPreview(input: unknown) {
+  const serialized = JSON.stringify(input)
+  if (!serialized) return String(input)
+  return serialized.length > 500 ? `${serialized.slice(0, 500)}…` : serialized
 }
 
-export function createInteractiveApprovalHandler(
+function createInteractiveApprovalHandler(
   rl: Interface,
   autoApprove: boolean,
-): ToolApprovalHandler {
-  return async (invocation: PipelineApprovalRequest) => {
-    if (invocation.signal.aborted) {
-      throw invocation.signal.reason instanceof Error
-        ? invocation.signal.reason
-        : new DOMException('Approval aborted', 'AbortError')
-    }
+) {
+  return async (invocation: ToolInvocation) => {
     const description = `${invocation.tool.name}(${inputPreview(invocation.input)})`
     if (autoApprove) {
       console.log(`  [自动批准: ${description}]`)
       return true
     }
-    if (!rl.terminal) {
+    if (!process.stdin.isTTY) {
       console.log(`  [拒绝: 非交互环境无法审批 ${invocation.tool.name}]`)
       return false
     }
 
-    return new Promise<boolean>((resolve, reject) => {
-      let settled = false
-      const cleanup = () => invocation.signal.removeEventListener('abort', onAbort)
-      const onAbort = () => {
-        if (settled) return
-        settled = true
-        cleanup()
-        reject(invocation.signal.reason instanceof Error
-          ? invocation.signal.reason
-          : new DOMException('Approval aborted', 'AbortError'))
-      }
-      invocation.signal.addEventListener('abort', onAbort, { once: true })
-      rl.question(`\n批准执行 ${description}？[y/N] `, { signal: invocation.signal }, (answer) => {
-        if (settled) return
-        settled = true
-        cleanup()
+    return new Promise<boolean>((resolve) => {
+      rl.question(`\n批准执行 ${description}？[y/N] `, (answer) => {
         resolve(['y', 'yes'].includes(answer.trim().toLowerCase()))
       })
     })
   }
 }
 
-function createNonInteractiveApprovalHandler(autoApprove: boolean): ToolApprovalHandler {
-  return async (invocation: PipelineApprovalRequest) => {
-    if (invocation.signal.aborted) {
-      throw invocation.signal.reason instanceof Error
-        ? invocation.signal.reason
-        : new DOMException('Approval aborted', 'AbortError')
-    }
+function createNonInteractiveApprovalHandler(autoApprove: boolean) {
+  return async (invocation: ToolInvocation) => {
     const description = `${invocation.tool.name}(${inputPreview(invocation.input)})`
     if (autoApprove) {
       console.log(`  [自动批准: ${description}]`)
@@ -176,9 +108,9 @@ function createConsoleObserver() {
     onStepStart: ({ step }) => console.log(`\n--- Step ${step} ---`),
     onTextDelta: ({ text }) => process.stdout.write(text),
     onToolCall: ({ toolName, input }) => {
-      console.log(`  [调用: ${toolName}(${inputPreview(input)})]`)
+      console.log(`  [调用: ${toolName}(${JSON.stringify(input)})]`)
     },
-    onToolResult: ({ output }) => console.log(`  [结果: ${inputPreview(output)}]`),
+    onToolResult: ({ output }) => console.log(`  [结果: ${JSON.stringify(output)}]`),
     onLoopDetection: ({ detection }) => console.log(`  ${detection.stuck ? detection.message : ''}`),
     onStreamError: ({ error }) => console.error('[stream error]', error),
     onAttemptError: ({ error }) => console.error(error),
@@ -194,7 +126,6 @@ function createConsoleObserver() {
       const messages: Partial<Record<typeof stopReason, string>> = {
         budget: '\n[Token 预算耗尽，Agent 已停止]',
         loop_detected: '\n[循环检测触发，Agent 已停止]',
-        uncertain: '\n[工具结果不确定，Agent 已停止；请先使用 ops resolve 完成对账]',
         max_steps: '\n[达到最大步数限制，Agent 已停止]',
       }
       if (messages[stopReason]) console.log(messages[stopReason])
@@ -212,264 +143,72 @@ function createRunner(deps: CliRuntimeDeps, approveTool: ToolApprovalHandler) {
     compaction: deps.compaction,
     maxSteps: deps.maxSteps,
     maxRetries: deps.maxRetries,
-    modelRequestTimeoutMs: deps.modelRequestTimeoutMs,
-    turnTimeoutMs: deps.turnTimeoutMs,
     approveTool,
     observer: createConsoleObserver(),
     onCompaction: printCompaction,
   })
 }
 
-function positiveOrZeroTimeout(value: number | undefined, fallback: number, field: string) {
-  const resolved = value ?? fallback
-  if (!Number.isFinite(resolved) || resolved < 0) throw new Error(`${field} 必须是非负有限数`)
-  return resolved
-}
-
-function resolveResourceCloseTimeouts(
-  options: Pick<CliShutdownOptions, 'registryCloseTimeoutMs' | 'storeCloseTimeoutMs'> = {},
-) {
-  return {
-    registryCloseTimeoutMs: positiveOrZeroTimeout(
-      options.registryCloseTimeoutMs,
-      DEFAULT_REGISTRY_CLOSE_TIMEOUT_MS,
-      'registryCloseTimeoutMs',
-    ),
-    storeCloseTimeoutMs: positiveOrZeroTimeout(
-      options.storeCloseTimeoutMs,
-      DEFAULT_STORE_CLOSE_TIMEOUT_MS,
-      'storeCloseTimeoutMs',
-    ),
-  }
-}
-
-function resolveCoordinatorCloseTimeout(options: CliShutdownOptions | undefined) {
-  const resourceTimeouts = resolveResourceCloseTimeouts(options)
-  const closeWaitTimeoutMs = positiveOrZeroTimeout(
-    options?.closeWaitTimeoutMs,
-    DEFAULT_SHUTDOWN_CLOSE_WAIT_TIMEOUT_MS,
-    'closeWaitTimeoutMs',
-  )
-  const minimumCloseWaitTimeoutMs = resourceTimeouts.registryCloseTimeoutMs +
-    resourceTimeouts.storeCloseTimeoutMs
-  if (closeWaitTimeoutMs < minimumCloseWaitTimeoutMs) {
-    throw new Error(
-      `closeWaitTimeoutMs 必须大于或等于 registryCloseTimeoutMs + storeCloseTimeoutMs ` +
-      `(${minimumCloseWaitTimeoutMs}ms)`,
-    )
-  }
-  return closeWaitTimeoutMs
-}
-
-async function closeResourceWithinTimeout(
-  resource: RuntimeResource,
-  close: () => void | Promise<void>,
-  timeoutMs: number,
-) {
-  const closePromise = Promise.resolve().then(close)
-  let timer: ReturnType<typeof setTimeout> | undefined
-  const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => reject(new RuntimeResourceCloseTimeoutError(resource, timeoutMs)), timeoutMs)
-  })
-  try {
-    await Promise.race([closePromise, timeout])
-  } finally {
-    if (timer) clearTimeout(timer)
-  }
-}
-
-export async function closeRuntime(
-  deps: RuntimeCloseResources,
-  options: Pick<CliShutdownOptions, 'registryCloseTimeoutMs' | 'storeCloseTimeoutMs'> = {},
-) {
-  const errors: unknown[] = []
-  const { registryCloseTimeoutMs, storeCloseTimeoutMs } = resolveResourceCloseTimeouts(options)
-  try {
-    await closeResourceWithinTimeout('registry', () => deps.registry.close(), registryCloseTimeoutMs)
-  } catch (error) {
-    errors.push(error)
-  }
-  const store = deps.store
-  if (store) {
-    try {
-      // A timed-out Registry close may still be waiting on a non-cooperative
-      // executionLock reader. Store close is nevertheless attempted so the
-      // session writer lock can be flushed and released before process exit.
-      await closeResourceWithinTimeout('store', () => store.close(), storeCloseTimeoutMs)
-    } catch (error) {
-      errors.push(error)
-    }
-  }
-  if (errors.length > 0) throw new AggregateError(errors, '部分运行时资源关闭失败')
-}
-
 /** Executes one automation-friendly turn and releases all tool resources. */
 export async function runOnce(deps: CliRuntimeDeps, prompt: string) {
-  const closeWaitTimeoutMs = resolveCoordinatorCloseTimeout(deps.shutdown)
   const runner = createRunner(deps, createNonInteractiveApprovalHandler(deps.autoApprove))
-  const controller = new AbortController()
-  let sigintCount = 0
-  let gracefulSignal: 'SIGINT' | 'SIGTERM' | undefined
-  let signalShutdown: Promise<void> | undefined
-  let turnPromise!: ReturnType<typeof runner.runTurn>
-  const shutdownCoordinator = new ShutdownCoordinator({
-    abortActive: (reason) => controller.abort(reason),
-    waitForActive: async () => {
-      try {
-        await turnPromise
-      } catch (error) {
-        if (!(gracefulSignal && error instanceof Error && error.name === 'AbortError')) throw error
-      }
-    },
-    closeResources: () => closeRuntime(deps, deps.shutdown),
-    ...(deps.shutdown?.activeWaitTimeoutMs === undefined
-      ? {}
-      : { activeWaitTimeoutMs: deps.shutdown.activeWaitTimeoutMs }),
-    closeWaitTimeoutMs,
-  })
-
-  const removeSignalListeners = () => {
-    process.removeListener('SIGINT', onSigint)
-    process.removeListener('SIGTERM', onSigterm)
-  }
-  const exitAfterSignalShutdown = (
-    shutdown: Promise<void>,
-    signal: 'SIGINT' | 'SIGTERM',
-  ) => {
-    void shutdown.then(
-      () => {
-        removeSignalListeners()
-        process.exit(signal === 'SIGINT' ? 130 : 143)
-      },
-      (error) => {
-        console.error(`[Shutdown] ${error instanceof Error ? error.message : error}`)
-        removeSignalListeners()
-        process.exit(1)
-      },
-    )
-  }
-  const beginSignalShutdown = (signal: 'SIGINT' | 'SIGTERM') => {
-    if (signalShutdown) return
-    gracefulSignal = signal
-    signalShutdown = shutdownCoordinator.shutdown(
-      new DOMException(`Turn cancelled by ${signal}`, 'AbortError'),
-    )
-    exitAfterSignalShutdown(signalShutdown, signal)
-  }
-  const onSigint = () => {
-    if (signalShutdown || sigintCount >= 1) {
-      killActiveProcessGroupsSync()
-      process.exit(130)
-    }
-    sigintCount = 1
-    beginSignalShutdown('SIGINT')
-  }
-  const onSigterm = () => {
-    if (signalShutdown) return
-    beginSignalShutdown('SIGTERM')
-  }
-  process.on('SIGINT', onSigint)
-  process.on('SIGTERM', onSigterm)
-  turnPromise = runner.runTurn(prompt, { signal: controller.signal })
-
   let turnFailed = false
   let turnError: unknown
   try {
-    return await turnPromise
+    return await runner.runTurn(prompt)
   } catch (error) {
-    if (gracefulSignal && error instanceof Error && error.name === 'AbortError') return undefined
     turnFailed = true
     turnError = error
     throw error
   } finally {
-    if (!signalShutdown) {
-      try {
-        await closeRuntime(deps, deps.shutdown)
-      } catch (closeError) {
-        if (turnFailed) {
-          throw new AggregateError([turnError, closeError], 'Agent 执行与工具资源关闭均失败')
-        }
-        throw closeError
-      } finally {
-        removeSignalListeners()
+    try {
+      await deps.registry.close()
+    } catch (closeError) {
+      if (turnFailed) {
+        throw new AggregateError([turnError, closeError], 'Agent 执行与工具资源关闭均失败')
       }
+      throw closeError
     }
   }
 }
 
 /** Interactive shell only; turn orchestration lives in ConversationRunner. */
 export function startRepl(deps: CliRuntimeDeps) {
-  const closeWaitTimeoutMs = resolveCoordinatorCloseTimeout(deps.shutdown)
   const rl = createInterface({ input: process.stdin, output: process.stdout })
   const runner = createRunner(deps, createInteractiveApprovalHandler(rl, deps.autoApprove))
 
   let shuttingDown = false
   let sigintCount = 0
   let sigintTimer: NodeJS.Timeout | undefined
-  let activeTurn: AbortController | undefined
-  let activeTurnPromise: Promise<unknown> | undefined
-  const shutdownCoordinator = new ShutdownCoordinator({
-    abortActive: (reason) => activeTurn?.abort(reason),
-    waitForActive: async () => {
-      try {
-        await activeTurnPromise
-      } catch {
-        // The turn reports its own cancellation/error before shutdown continues.
-      }
-    },
-    closeResources: () => closeRuntime(deps, deps.shutdown),
-    ...(deps.shutdown?.activeWaitTimeoutMs === undefined
-      ? {}
-      : { activeWaitTimeoutMs: deps.shutdown.activeWaitTimeoutMs }),
-    closeWaitTimeoutMs,
-  })
 
-  async function shutdown(force = false, source: 'SIGINT' | 'SIGTERM' | 'input' = 'input') {
-    if (force) {
-      activeTurn?.abort(new DOMException('Turn force-cancelled by SIGINT', 'AbortError'))
-      killActiveProcessGroupsSync()
-      process.exit(130)
-    }
+  async function shutdown(force = false) {
     if (shuttingDown) return
     shuttingDown = true
-    if (sigintTimer) clearTimeout(sigintTimer)
     console.log('\nBye!')
-    let exitCode = 0
-    try {
-      await shutdownCoordinator.shutdown(
-        new DOMException(`Turn cancelled during ${source} shutdown`, 'AbortError'),
-      )
-    } catch (error) {
-      exitCode = 1
-      console.error(`[Shutdown] ${error instanceof Error ? error.message : error}`)
-    } finally {
-      process.removeListener('SIGINT', onSigint)
-      process.removeListener('SIGTERM', onSigterm)
+
+    if (!force) {
+      try {
+        await deps.registry.close()
+      } catch (error) {
+        console.error(`[Shutdown] ${error instanceof Error ? error.message : error}`)
+      }
     }
-    process.exit(exitCode)
+    process.exit(0)
   }
 
-  const onSigterm = () => { void shutdown(false, 'SIGTERM') }
-  const onSigint = () => {
-    if (shuttingDown) {
-      void shutdown(true, 'SIGINT')
-      return
-    }
-    if (activeTurn && !activeTurn.signal.aborted) {
-      sigintCount = 1
-      activeTurn.abort(new DOMException('Turn cancelled by SIGINT', 'AbortError'))
-      console.log('\n[正在取消当前 Agent turn；再按一次 Ctrl+C 强制退出]')
+  rl.on('SIGINT', () => {
+    sigintCount++
+    if (sigintCount >= 2) {
       if (sigintTimer) clearTimeout(sigintTimer)
-      sigintTimer = setTimeout(() => {
-        sigintCount = 0
-      }, 1_500)
+      void shutdown(true)
       return
     }
-    if (sigintCount >= 1) void shutdown(true, 'SIGINT')
-    else void shutdown(false, 'SIGINT')
-  }
-  process.on('SIGINT', onSigint)
-  process.on('SIGTERM', onSigterm)
+    console.log('\n(再按一次 Ctrl+C 强制退出)')
+    if (sigintTimer) clearTimeout(sigintTimer)
+    sigintTimer = setTimeout(() => {
+      sigintCount = 0
+    }, 1_500)
+  })
 
   rl.on('close', () => void shutdown())
 
@@ -486,27 +225,11 @@ export function startRepl(deps: CliRuntimeDeps) {
       }
 
       try {
-        const controller = new AbortController()
-        activeTurn = controller
-        const turn = runner.runTurn(trimmed, { signal: controller.signal })
-        activeTurnPromise = turn
-        await turn
+        await runner.runTurn(trimmed)
       } catch (error) {
-        if (error instanceof Error && error.name === 'AbortError') {
-          console.log('[Agent turn 已取消]')
-        } else {
-          console.error(`[Agent 出错] ${error instanceof Error ? error.message : error}`)
-        }
-      } finally {
-        activeTurn = undefined
-        activeTurnPromise = undefined
-        sigintCount = 0
-        if (sigintTimer) {
-          clearTimeout(sigintTimer)
-          sigintTimer = undefined
-        }
+        console.error(`[Agent 出错] ${error instanceof Error ? error.message : error}`)
       }
-      if (!shuttingDown) ask()
+      ask()
     })
   }
 

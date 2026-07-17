@@ -1,7 +1,7 @@
 {
   "name": "super-agent",
   "version": "1.0.0",
-  "description": "A compact TypeScript agent kernel with durable and sandboxed execution boundaries",
+  "description": "A compact TypeScript Agent learning project",
   "private": true,
   "type": "module",
   "main": "dist/index.js",
@@ -17,9 +17,6 @@
   },
   "files": [
     "dist",
-    "sandbox/seccomp",
-    "scripts/linux-sandbox-launcher.mjs",
-    "deploy",
     "README.md",
     ".env-example"
   ],
@@ -33,8 +30,6 @@
     "build:watch": "pnpm clean && tsc --watch --skipLibCheck --preserveWatchOutput",
     "prepack": "pnpm build",
     "test": "tsx --test test/*.test.ts",
-    "test:linux-release": "tsx --test test/linux-release-gate.release.ts",
-    "test:seccomp-artifacts": "node sandbox/seccomp/build-profile.mjs --check && tsx --test test/seccomp-artifacts.test.ts",
     "typecheck": "tsc --noEmit --skipLibCheck && tsc -p tsconfig.test.json --skipLibCheck",
     "check": "pnpm typecheck && pnpm test"
   },
@@ -45,21 +40,14 @@
     "node": ">=20"
   },
   "packageManager": "pnpm@10.33.2",
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "fs-ext"
-    ]
-  },
   "dependencies": {
     "@ai-sdk/openai": "^3.0.53",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "ai": "^6.0.168",
-    "ajv": "^8.20.0",
     "dotenv": "^17.4.2",
-    "fs-ext": "2.1.1"
+    "fast-glob": "^3.3.3"
   },
   "devDependencies": {
-    "@types/fs-ext": "2.0.3",
     "@types/node": "^25.6.0",
     "tsx": "^4.21.0",
     "typescript": "^6.0.3"

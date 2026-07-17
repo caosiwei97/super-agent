@@ -2,7 +2,6 @@ import type { ToolDefinition } from '../../core/tool-registry.js'
 
 export const weatherTool: ToolDefinition = {
   name: 'get_weather',
-  executionKind: 'pure',
   description: '查询指定城市的天气信息',
   parameters: {
     type: 'object',
@@ -12,8 +11,8 @@ export const weatherTool: ToolDefinition = {
     required: ['city'],
     additionalProperties: false,
   },
-  getCapabilities: () => [],
-  isConcurrencySafe: () => true,
+  isConcurrencySafe: true,
+  isReadOnly: true,
   execute: async ({ city }: { city: string }) => {
     const data: Record<string, string> = {
       北京: '晴，15-25°C，东南风 2 级',
@@ -29,7 +28,6 @@ export const weatherTool: ToolDefinition = {
 
 export const calculatorTool: ToolDefinition = {
   name: 'calculator',
-  executionKind: 'pure',
   description: '计算数学表达式的结果。当用户提问涉及数学运算时使用',
   parameters: {
     type: 'object',
@@ -39,8 +37,8 @@ export const calculatorTool: ToolDefinition = {
     required: ['expression'],
     additionalProperties: false,
   },
-  getCapabilities: () => [],
-  isConcurrencySafe: () => true,
+  isConcurrencySafe: true,
+  isReadOnly: true,
   execute: async ({ expression }: { expression: string }) => {
     // 白名单校验：只允许数字、基本运算符和括号，杜绝代码注入
     if (!/^[\d+\-*/%().\s]+$/.test(expression)) {
