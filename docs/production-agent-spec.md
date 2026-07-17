@@ -981,16 +981,18 @@ PR11 不把 rotation、manifest、quota、archive 继续堆入当前 `SessionSto
 ```mermaid
 flowchart LR
     Caller["Runner / Recovery / Pipeline"] --> Facade["SessionStore facade<br/>ordered write queue + projection"]
-    Facade --> Lease["Legacy File Lease<br/>pinned directory / lock / journal descriptors"]
+    Facade --> Migration["Legacy Migration<br/>fingerprint + deterministic generation"]
+    Migration --> Lease["Session File Lease<br/>legacy/fence descriptor handoff"]
     Lease --> FixedLock["Fixed lock flock<br/>writer ex / doctor sh"]
-    Lease --> JournalLock["Canonical journal lifetime flock<br/>writer ex / doctor sh"]
-    Lease --> Reader["Journal Scanner<br/>bounded record + typed diagnostics"]
-    Facade --> Segments["Segment Storage<br/>legacy fence + active/sealed segments"]
-    Facade --> Reserve["Quota Admission<br/>regular soft limit + critical reserve"]
-    Doctor["session doctor<br/>fixed sh → journal sh"] --> Reader
+    Lease --> JournalLock["Legacy/fence lifetime flock<br/>writer ex / doctor sh"]
+    Facade --> Reader["Record Stream + Journal Scanner<br/>bounded record + typed diagnostics"]
+    Facade --> Segments["Segment Storage<br/>active/sealed catalog + rotation"]
+    Facade --> Reserve["Quota Admission<br/>pure batch + 2/3/2/1/0 reservations"]
+    Doctor["session doctor<br/>fixed sh → legacy/fence sh<br/>read-only cross-segment"] --> Reader
     Lifecycle["Offline Lifecycle Manager<br/>archive / restore / retention plan"] --> FixedLock
     Lifecycle --> Segments
-    Segments --> Live[("Live session bundle")]
+    Migration --> Fence[("Exact invalid-JSON fence")]
+    Segments --> Live[("Immutable generation bundle")]
     Lifecycle --> Archive[("Private same-filesystem archive")]
     Signal["SIGINT / SIGTERM"] --> Shutdown["Abort turn → close Registry → flush Store"]
     Shutdown --> Facade
@@ -1038,25 +1040,79 @@ value，journal 命中为 0，命令输出未显示 Key。该证据不扩张到 
 
 ##### PR11B：分段、rotation 与 session quota
 
-- 物理布局使用 `layoutVersion: 1`；Event schema 仍为 v2。首次迁移必须在固定 session
-  lock 下先构造并同步新 bundle，再把旧 `<sessionId>.jsonl` 原子替换为旧程序必然拒绝的
-  storage-format fence，避免旧 writer 重新创建单文件形成 split brain。
+- 物理布局使用 `layoutVersion: 1`；Event schema 仍为 v2。bundle 固定包含 immutable
+  `format.json`、可重建 `manifest.json` 与 `segments/`；segment 使用连续 12 位 ordinal，
+  文件状态只允许 `.sealed.jsonl` 或唯一最大 ordinal 的 `.active.jsonl`。`format.json`
+  冻结 record、segment、regular quota 与 critical reserve 限制；reopen 的显式配置冲突
+  fail closed，持久化数值还必须受当前二进制编译上限约束，不能通过篡改放大边界。
+- 首次迁移在 fixed lock 与 legacy journal exclusive flock 下修复唯一 EOF fragment、同步并
+  fingerprint；generation 由 session ID、source kind、精确 byteLength 与 SHA-256
+  确定性派生。先在 staging 构造、同步并完成 JSONL、typed Operation 与 quota gate，只有
+  通过后才发布 canonical bundle；已捕获的 pre-publish 失败精确删除本次 staging，后续持锁
+  恢复只清理严格命名、private 且非 canonical 的 abandoned staging。再创建并预锁 exact fence
+  `SUPER_AGENT_SESSION_STORAGE_FENCE_V1 <64-lowercase-hex>\n`，原子 rename 覆盖旧
+  `<sessionId>.jsonl`，复验 path/fd identity 与精确 bytes 并同步 parent directory 后，才
+  释放 legacy journal lock；fence flock 保持到 Store close。两把 secondary lock 在 commit
+  point 前后重叠，不得出现无锁窗口。fence 前 legacy 是唯一真相，fence 后只能采用它指向的
+  generation；bundle root、generation、segments、format 与所有 segment descriptor 在最后一次
+  bundle 复验到 fence parent fsync 期间保持 pinned 并反复校验 identity，bundle/fence/format
+  不一致必须 fatal，禁止回退其他 orphan bundle。
+- 若 bundle 已发布但 fence 前崩溃，恢复必须重新计算当前 legacy fingerprint；旧 writer
+  的任何追加都会产生新 generation，禁止把旧 bundle merge 或直接采用。fence 是完整的
+  invalid-JSON 行，使 PR11A writer 必然在 append 前拒绝；发布门禁必须用冻结的 PR11A
+  兼容 artifact 做黑盒拒写验证，而不只由新 parser 自证。
 - manifest 只是可重建索引，不是数据真相；sequence、eventId、materializationId 和
-  Operation projection 必须由全部 segment 连续扫描恢复。
+  Operation projection、active segment 与 quota reservation 必须由全部 segment 连续扫描
+  恢复。缺失、损坏或陈旧 manifest 由 writer 在扫描后重建，doctor 只报告；manifest
+  不能保存或扩大权威 quota policy。普通 manifest publish 失败只产生 warning，不得否定已
+  fdatasync 的 event ack；unsafe metadata 仍 fatal。pre-rename 失败必须删除本次 exact temp，
+  diagnostic 的 `repaired` 只能反映重建是否真正成功。
 - rotation 在 Store 单写队列内完成。默认 segment target 为 16 MiB；单条记录不可跨段。
-  先同步并封存 active segment，再建立唯一新 active segment并发布 catalog。sealed segment
-  的任何尾部损坏均 fatal；只有唯一 active segment 的 EOF 半行可修复。
-- 默认 regular session soft quota 为 64 MiB，另有 16 MiB critical reserve。每个
-  `operation.started` 在 durable ack 前，必须从 reserve 原子预留最多两个 1 MiB 记录，
-  覆盖 terminal 与 materialization；额度不足时禁止 dispatch。quota/rotation/admission
-  在同一写队列临界区，拒绝不得消耗 sequence 或留下半条记录。
+  仅当 active 非空且 `activeBytes + recordBytes > target` 时 rotation；单条记录可独占并
+  超过 soft target，但仍受 hard record limit。先 fdatasync active，rename 为 sealed 并同步
+  segments directory，再 O_EXCL 建立下一 active、同步文件与目录，最后发布可重建 catalog。
+  crash 后允许 sealed 暂时没有 active 并创建下一 ordinal；两个 active、ordinal gap/duplicate
+  均 fatal。sealed segment 的任何 EOF fragment 均 fatal；只有唯一 active segment 的 EOF
+  fragment 可在 exclusive writer 下截断。writer 生命周期 pin generation/segments directory
+  与 active descriptor，并在 durable ack 前复验目录和 active path identity；失败只能返回
+  不确定写入错误，不能返回成功 ack。lazy initialization 的 post-open recovery 失败必须先
+  关闭本地 storage descriptor，成功恢复与 quota 校验后才转移所有权。
+- 默认 regular session soft quota 为 64 MiB，另有 16 MiB critical reserve；只计算全部
+  segment 中完整 JSONL event bytes（包含换行），format/manifest/fence 使用独立固定上限。
+  普通事件不能消耗 critical reserve。`operation.proposed` 写入前在同一 Store queue 原子
+  预留两个 1 MiB critical slot，覆盖 pre-start terminal + materialization；
+  `operation.started` 在 durable ack 前再增加一个 1 MiB uncertain control slot，因而额度
+  不足时 dispatch 次数必须为 0。started 正常 terminal 释放 control slot、消耗一个 critical
+  slot并保留一个给 materialization；uncertain 消耗 control slot并保留两个 critical slot，
+  覆盖 reconciliation/supersede + materialization。reservation 不另写事件，也不信任
+  manifest，必须从 Operation projection 与稳定 materialization 全量重建。
+- quota hard-limit、reservation、可选 schema marker、rotation 与 append admission 位于同一
+  写队列临界区，并在任何 rotation/catalog/write 前完成纯预检；拒绝不得消耗 sequence、
+  改变 reservation、创建空 segment 或留下半条记录。legacy 可以 over-soft 迁移，但只有
+  event bytes 与全部恢复 obligations 仍不超过 regular + critical 总量时才能在 fence 前提交；
+  否则保留 legacy 并要求显式提高 session contract 或离线迁移。
 - group commit 定时窗口保持关闭；普通 buffered 事件仍由后续 durable event、rotation
   或 close 同步。PR11 继续只承诺进程崩溃恢复，不把目录 fsync/rename fault test 表述为
   已证明主机掉电耐久。
+- writer 与 doctor 都按跨 segment 全序重建 schema、ID、Operation projection 与 quota
+  obligations；在线 scan error 必须定位到实际 segment path 与 segment-local line/byte offset，
+  不得误指向只含 fence 的 legacy path。doctor 仍只读，不因发现 cache 问题执行修复。
 
 PR11B 退出条件：阈值、Unicode 字节、跨段全序、并发 append、单记录超限、critical
-reserve、sealed corruption、legacy fence 和 rotation crash point 全部通过；现有 11 点
-Operation crash matrix 在极小 segment threshold 下再次通过。
+reserve（proposed=2、started=3、uncertain=2、terminal=1、materialized=0）、sealed
+corruption、真实 PR11A legacy fence 和 migration/rotation crash point 全部通过；现有
+11 点 Operation crash matrix 在极小 segment threshold 下再次通过，测试 I/O wrapper 必须
+保留真实 fd/stat/read 与 flock，不能用 trusted seam 绕过生产 descriptor 边界。
+
+当前本地证据（2026-07-17，非 CI）：PR11B 定向矩阵 185/185；`pnpm check` 为 447 tests、
+437 pass、10 个平台 skip、0 fail；build、diff check 与 deterministic seccomp artifact 2/2
+通过。真实子进程 `SIGKILL` 覆盖 migration 12 点与 rotation 5 点，
+既有 11 点 Operation crash matrix 在极小 segment target 下继续通过；测试 wrapper 保留真实
+fd/stat/read/flock。真实 Provider Key 的 `pnpm start` 完成 create → close → doctor → continue →
+doctor，固定标记均返回，doctor 记录数 6 → 11 且均为 `healthy`；512-byte target 产生 10 个
+segment。值级扫描检查 2 个 `.env` secret value，在命令输出、diagnostic、fence、segments、
+format、manifest 中均为 0 命中，临时 session 已清理。该结论仍不扩张到 target-Linux
+delegated supervisor、x86_64 target kernel、OOM、真实主机掉电或混合版本滚动升级。
 
 ##### PR11C：归档、恢复、保留与目录额度
 

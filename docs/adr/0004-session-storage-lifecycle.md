@@ -36,9 +36,29 @@ flock，doctor 同序获取 non-blocking shared flock，释放时按 journal →
 因此 PR11A 不支持新旧 writer 并行或滚动升级：必须先停止全部旧 writer、运行 doctor，再
 启动新版本；让旧 writer 必然拒绝新布局的 storage-format fence 属于 PR11B。
 
-quota 使用 regular soft limit 与 critical reserve 两层语义。durable
-`operation.started` 只有在 terminal 与 materialization 的最坏记录空间已经原子预留后
-才能 ack 并允许 dispatch。普通事件不得消耗该预留。
+quota 使用 regular soft limit 与 critical reserve 两层语义。`operation.proposed` 在写入前
+原子预留两个 hard-limit critical slot，覆盖 pre-start terminal 与 materialization；durable
+`operation.started` 在 dispatch 前再增加一个 uncertain control slot。正常 terminal 释放
+control 并保留一个 materialization slot；uncertain 消耗 control、保留两个 critical slot，
+覆盖 reconciliation/supersede 与 materialization。reservation 由事件流恢复，不另写记录，
+普通事件不得消耗该预留。
+
+PR11B 将 layout、record stream、migration、segment storage 与 quota admission 拆成独立内部
+模块；Store 只负责单写队列、事件封装和 projection。generation 严格由 legacy source
+fingerprint 派生；fence 是唯一 commit point。迁移持有 fixed + legacy exclusive locks，预锁
+fence temp，并在 rename 后复验 path/fd/bytes、fsync parent，才释放 legacy lock；fence lock
+保持到 Store close。typed Operation/quota gate 在 staging 内、canonical publish 前完成；捕获的
+pre-publish 失败删除本次 exact staging，后续持锁恢复仅回收严格命名的 abandoned staging。
+bundle root、generation、segments、format 与 segment descriptor 从最后复验跨到 fence parent
+fsync，observer hook 后再次复验；fence 前 legacy 是唯一真相，fence 后只采用其指定 generation。
+
+segment catalog 由连续的 12 位 ordinal 文件名重建。rotation 顺序固定为 active fdatasync、
+rename sealed、segments directory fsync、O_EXCL 创建下一 active、file/directory sync，再发布
+可重建 manifest。sealed EOF fragment fatal；仅 active fragment 可由 exclusive writer 截断。
+doctor 只读扫描 segment 事实，manifest 缺失、损坏或陈旧不改变权威状态。普通 manifest cache
+发布失败不会否定已同步 event，unsafe metadata 仍 fatal，失败 temp 必须精确清理。writer 将
+generation/segments directory 与 active descriptor pin 到 close，并在 ack 前复验；lazy recovery
+失败先关闭局部 storage，只有完整恢复与 quota 校验成功才转移所有权。
 
 ## 默认值
 
@@ -46,7 +66,8 @@ quota 使用 regular soft limit 与 critical reserve 两层语义。durable
 - 既有记录兼容读取上限：16 MiB；超过上限 fail closed，交由显式离线迁移处理。
 - segment target：16 MiB。
 - regular session soft quota：64 MiB。
-- critical reserve：16 MiB，并按 started operation 预留最多两个 hard-limit 记录。
+- critical reserve：16 MiB；proposed operation 持有两个 hard-limit critical slot，started
+  operation 另持有一个 hard-limit uncertain control slot。
 - live directory admission：1 GiB；严格跨进程保证需要固定 lifecycle lock。
 - 30 天未活动可归档；自动 purge 默认关闭，显式策略可设为归档后 180 天。
 - timed group commit：关闭；留待 PR13 基于性能数据决定。
@@ -65,11 +86,21 @@ quota 使用 regular soft limit 与 critical reserve 两层语义。durable
   交互 `chat` 在 active turn 上第一次 SIGINT 只取消当前 turn，第二次才强制退出 130。
 - PR11 继续只承诺进程崩溃恢复。目录 sync 和 rename fault test 不等于已经证明真实主机
   掉电耐久。
+- migration/rotation 的 throw-probe 测试称为 fault injection；只有实际子进程收到
+  `SIGKILL` 的矩阵称为 process-crash recovery。两者都不扩张为 power-loss 证明。
+- 跨 segment scanner、doctor 与 Store 在线诊断使用同一全局事实顺序；错误对外定位到实际
+  segment 与 segment-local offset。manifest diagnostic 不得把失败重建误报为 `repaired`。
 
 ## 影响
 
-- PR11A 不改变现有磁盘格式，降低第一批改动的兼容风险。
-- rotation 和 archive 延后到各自具备 fence、fault injection 与 crash matrix 的阶段。
+- PR11A 不改变现有磁盘格式，降低第一批改动的兼容风险；PR11B 首次打开时在线迁移到
+  layout v1，并以 invalid-JSON fence 防止旧 writer 形成 split brain。
+- rotation 已在 PR11B 具备 fault injection 与真实进程崩溃矩阵；archive 仍延后到 PR11C。
+- PR11B 本地非 CI 门禁为 447 tests（437 pass、10 platform skip、0 fail），PR11B 定向
+  185/185，build/diff check 与 deterministic seccomp artifact 2/2 通过；真实
+  migration/rotation `SIGKILL` 为 12+5 点。真实 Key E2E 在 512-byte target 下
+  生成 10 个 segment，doctor 6→11 records 均 healthy，2 个 secret value 在输出与全部 bundle
+  artifact 中 0 命中。target-Linux、OOM 与 power-loss 仍是独立 release gate。
 - Store 热路径不会承担 retention 和远程归档复杂度。
 - 远程/跨文件系统 archive、压缩/加密 archive、NFS/distributed writer、数据库迁移、
   原地删除历史 Operation 事实和全文 session index 不属于 PR11。

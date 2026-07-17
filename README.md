@@ -1,6 +1,10 @@
 # Super-Agent
 
-一个刻意保持小体量、但逐步补齐生产边界的 TypeScript Agent 内核。M3 PR10B 已把首个 production process lane 收敛为固定 `workspace_inspect`、verified staging、per-operation cgroup 与 crash-safe bwrap 握手，并在 arm64 Linux 上完成公开执行矩阵和真实 Key E2E。x86_64 目标内核与真实 systemd crash attestation 仍待发布环境验收；它不是平台化框架，也尚未宣称 production-ready。
+一个刻意保持小体量、但逐步补齐生产边界的 TypeScript Agent 内核。M4 PR11B 已完成
+layout-v1 Session 分段存储、legacy fence 迁移、rotation、regular/critical quota 与跨段 doctor；
+M3 PR10B 的固定 `workspace_inspect`、verified staging、per-operation cgroup 与 crash-safe bwrap
+握手保持不变。x86_64 目标内核、真实 systemd/OOM crash attestation 与主机掉电耐久仍待发布
+环境验收；它不是平台化框架，也尚未宣称 production-ready。
 
 ## 快速开始
 
@@ -11,7 +15,11 @@ pnpm link --global
 super-agent --help
 ```
 
-Session 单写者使用原生内核文件锁。源码安装需要 Python 与 C/C++ 编译工具链；锁语义面向本机文件系统，不支持把 session 目录放在 NFS 等远程文件系统上。
+Session 单写者使用原生内核文件锁。layout v1 把事件保存到 immutable generation 下的
+active/sealed segments，旧 `<id>.jsonl` 只保留一个精确的 migration fence；manifest 是
+可重建缓存，不能作为 sequence、Operation projection 或 quota 的事实来源。源码安装需要
+Python 与 C/C++ 编译工具链；锁语义面向本机文件系统，不支持把 session 目录放在 NFS 等
+远程文件系统上。
 
 首次运行前从 `.env-example` 创建 `.env`：macOS/Linux 使用 `cp .env-example .env`，PowerShell 使用 `Copy-Item .env-example .env`。这适合 development；production 必须把 Provider Key/EnvironmentFile 放在 workspace 外，并令 `SUPER_AGENT_WORKSPACE` 指向不含 `.env`、凭据、symlink、hardlink 或特殊文件的独立目录。
 
@@ -90,7 +98,21 @@ M3 PR10 的历史基线为 226 tests、221 pass、5 个 macOS 上的 Linux-only 
 
 2026-07-16 的 PR11A 非 CI 验收结果：最终 `pnpm check` 为 344 tests、334 pass、10 个平台 skip、0 fail，PR11A 定向矩阵为 92/92，`pnpm build`、diff check 与 deterministic seccomp artifact 2/2 均通过。使用 `.env` 中真实 Provider Key 的 `pnpm start` 依次完成 create → clean close → doctor → continue → doctor；两个固定模型标记均返回，doctor 从 6 条记录到 11 条记录都为 `healthy`。值级扫描检查 2 个 `.env` secret value，journal 命中数为 0，命令输出未显示 Key。该证据只证明 Provider、Ledger、Store、close/reopen 和 doctor 装配，不证明 rotation、quota、主机掉电或混合版本滚动升级。
 
-上述 sandbox 证据只认证当前 arm64 容器内核和 Provider 装配链。仓库中的 x86_64 BPF 仍是 candidate；`SUPER_AGENT_SANDBOX_CRASH_SUPERVISOR` 只是部署声明，尚需在真实 systemd delegated unit 中注入 launcher/Agent `SIGKILL` 与 OOM，证明 `KillMode=control-group` 回收整个 service subtree。M4 的 PR11A 已完成本地门禁，分段、quota、archive 与目标 Linux 生命周期验收仍未完成。
+2026-07-17 的 PR11B 非 CI 验收结果：PR11B 定向矩阵 185/185；最终 `pnpm check` 为
+447 tests、437 pass、10 个平台 skip、0 fail，build、diff check 与 deterministic seccomp
+artifact 2/2 通过。真实子进程 `SIGKILL` 覆盖 migration 12 点、
+rotation 5 点，既有 11 点 Operation crash matrix 在极小 segment target 下通过。使用 `.env`
+中的真实 Provider Key 和 512-byte target 完成 create → close → doctor → continue → doctor，
+两个固定标记均返回，doctor 记录数 6→11 且均 healthy，共产生 10 个 segment。值级扫描检查
+2 个 secret value，在输出、diagnostic、fence、segments、format、manifest 中均 0 命中，临时
+session 已清理。该证据只证明进程崩溃恢复与真实装配，不是 target-Linux、OOM 或 power-loss
+证明。
+
+上述 sandbox 证据只认证当前 arm64 容器内核和 Provider 装配链。仓库中的 x86_64 BPF 仍是
+candidate；`SUPER_AGENT_SANDBOX_CRASH_SUPERVISOR` 只是部署声明，尚需在真实 systemd
+delegated unit 中注入 launcher/Agent `SIGKILL` 与 OOM，证明 `KillMode=control-group` 回收
+整个 service subtree。M4 的 PR11B 已完成本地分段、quota 与 doctor 门禁；archive/retention
+属于 PR11C，目标 Linux 生命周期与真实 power-loss 仍未完成。
 
 ## 运行链路
 
@@ -109,11 +131,18 @@ flowchart TD
     Model --> Provider["LLM Provider"]
     Model --> Audit["Model attempt audit\nstarted / failed / retried / completed"]
     Runner --> Store["SessionStore facade\nOrdered Writes + Projection"]
-    Store --> Lease["SessionFileLease\nPinned Directory / Lock / Journal"]
+    Store --> Admission["Quota Admission\nregular + critical reservations"]
+    Store --> Migration["Legacy Migration\ndeterministic generation + exact fence"]
+    Store --> Segments["Segment Storage\nactive / sealed + rotation"]
+    Migration --> Layout["Immutable format.json\nrebuildable manifest.json"]
+    Migration --> Lease["SessionFileLease\nPinned session dir + lock handoff"]
+    Segments --> Bundle[("layout-v1 generation bundle")]
+    Segments --> SegmentPins["Pinned generation / segments / active fds\nack 前 identity 复验"]
+    Migration --> BundlePins["Pinned bundle / format / segment fds\nfence 前 identity 复验"]
     Lease --> FixedLock["Fixed lock flock\nwriter ex / doctor sh"]
-    Lease --> JournalLock["Journal lifetime flock\nwriter ex / doctor sh"]
-    Lease --> Scanner["Journal Scanner\nStreaming + Typed Diagnostics"]
-    Doctor["session doctor\nfixed sh → journal sh"] --> Scanner
+    Lease --> JournalLock["Legacy / fence lifetime flock\nwriter ex / doctor sh"]
+    Segments --> Scanner["Record Stream + Journal Scanner\nbounded bytes + typed projection"]
+    Doctor["session doctor\nfixed sh → legacy/fence sh\nread-only cross-segment scan"] --> Scanner
     Audit --> Store
     Recovery --> Store
     Loop --> Pipeline["ToolExecutionPipeline\n唯一公开运行时执行入口"]
@@ -217,7 +246,12 @@ flowchart TD
 | `src/security/` | 动态能力、可执行约束、typed policy rules 与 hard-deny 外传门禁 |
 | `src/core/workspace.ts` | 文件工具的工作区路径与 symlink 边界 |
 | `src/session/store.ts` | Session 门面、事件顺序、projection、durable append 和 checkpoint 恢复 |
-| `src/session/session-file-lease.ts` | 旧单文件布局的固定 descriptor、fixed→journal 双锁和 inode/path 安全校验 |
+| `src/session/session-layout.ts` | deterministic generation、exact fence、immutable format 与 segment 命名协议 |
+| `src/session/session-migration.ts` | legacy fingerprint、bundle staging/复验与双 secondary-lock fence handoff |
+| `src/session/session-segment-storage.ts` | segment catalog、active/sealed rotation、EOF 修复与可重建 manifest |
+| `src/session/session-quota.ts` | regular/critical batch admission 与 Operation reservation 全量恢复 |
+| `src/session/session-record-stream.ts` | opaque JSONL 字节拆分、单记录边界与增量 SHA-256 fingerprint |
+| `src/session/session-file-lease.ts` | 固定 descriptor、fixed→legacy/fence 双锁和 inode/path 安全校验 |
 | `src/session/journal-scanner.ts` | 分块 JSONL 扫描、顺序校验和脱敏结构化诊断 |
 | `src/session/doctor.ts` | 只读 shared-lock Session 诊断；不创建、不 chmod、不修复 |
 | `src/tools/` | 内置工具和真实 MCP 工具的延迟发现 `tool_search` |
@@ -238,6 +272,11 @@ flowchart TD
 | `AGENT_MAX_RETRIES` | `10` | 每个模型请求的重试次数，可为 0 |
 | `AGENT_TURN_TIMEOUT_MS` | `120000` | 单轮总墙钟上限，形成贯穿模型、审批和工具的 absolute deadline |
 | `MODEL_REQUEST_TIMEOUT_MS` | `60000` | 单次模型 request 的上限，同时受 turn deadline 约束 |
+| `SUPER_AGENT_SESSION_MAX_RECORD_BYTES` | `1048576` | 新写完整 JSONL record 上限，包含 LF；layout v1 immutable |
+| `SUPER_AGENT_SESSION_MAX_READ_RECORD_BYTES` | `16777216` | 既有 record 兼容读取上限；layout v1 immutable |
+| `SUPER_AGENT_SESSION_SEGMENT_TARGET_BYTES` | `16777216` | active segment soft rotation target；layout v1 immutable |
+| `SUPER_AGENT_SESSION_REGULAR_QUOTA_BYTES` | `67108864` | 普通事件 soft quota；layout v1 immutable |
+| `SUPER_AGENT_SESSION_CRITICAL_RESERVE_BYTES` | `16777216` | Operation 恢复义务与 critical event reserve；layout v1 immutable |
 | `CONTEXT_TOKEN_THRESHOLD` | `12000` | 触发摘要的估算 token 阈值 |
 | `CONTEXT_KEEP_RECENT_MESSAGES` | `8` | 摘要后保留的最近消息数目标 |
 | `CONTEXT_KEEP_RECENT_TOOL_MESSAGES` | `4` | 不做 Microcompact 的最近工具消息数 |
