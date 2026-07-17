@@ -4,9 +4,15 @@ import { Workspace } from '../core/workspace.js'
 import { loadConfig } from '../core/config.js'
 import { createBuiltinTools, createToolSearch } from '../tools/index.js'
 import { connectGitHubMCP } from '../mcp/create-mcp.js'
-import { printStartupStats, runOnce, startRepl } from './repl.js'
-import { cliUsage, parseCliOptions, type OpsCliOptions } from './args.js'
+import { closeRuntime, printStartupStats, runOnce, startRepl } from './repl.js'
+import {
+  cliUsage,
+  parseCliOptions,
+  type OpsCliOptions,
+  type SessionCliOptions,
+} from './args.js'
 import { SessionStore } from '../session/store.js'
+import { diagnoseSession } from '../session/doctor.js'
 import { RecoveryCoordinator } from '../execution/recovery-coordinator.js'
 import type { Executor } from '../execution/executor.js'
 import { LocalExecutor } from '../execution/local-executor.js'
@@ -32,7 +38,7 @@ function printableOperation(operation: Awaited<ReturnType<RecoveryCoordinator['l
 }
 
 async function runOps(cli: OpsCliOptions) {
-  const store = new SessionStore(cli.sessionId)
+  const store = await SessionStore.open(cli.sessionId)
   let operationError: unknown
   try {
     if (!store.exists()) throw new Error(`会话不存在: ${cli.sessionId}`)
@@ -65,6 +71,12 @@ async function runOps(cli: OpsCliOptions) {
   }
 }
 
+async function runSessionCommand(cli: SessionCliOptions) {
+  if (cli.action !== 'doctor') throw new Error('session 需要 doctor 子命令')
+  const report = await diagnoseSession(cli.sessionId)
+  console.log(JSON.stringify(report, null, 2))
+}
+
 /** CLI application entry. Process-level error handling belongs to the executable shim. */
 export async function runCli(args: string[]) {
   const cli = parseCliOptions(args)
@@ -74,6 +86,7 @@ export async function runCli(args: string[]) {
   }
 
   if (cli.command === 'ops') return runOps(cli)
+  if (cli.command === 'session') return runSessionCommand(cli)
 
   const config = loadConfig()
   const executor: Executor = config.execution.profile === 'production'
@@ -111,7 +124,7 @@ export async function runCli(args: string[]) {
     registry.register(createToolSearch(registry))
     await connectGitHubMCP(registry, config.githubMcp)
 
-    store = new SessionStore(cli.sessionId)
+    store = await SessionStore.open(cli.sessionId)
     if (cli.continueSession && !store.exists()) {
       throw new Error(`会话不存在: ${cli.sessionId}`)
     }
@@ -167,8 +180,26 @@ export async function runCli(args: string[]) {
 
     startRepl(runtime)
   } catch (error) {
-    filesystem?.close()
-    await Promise.allSettled([registry?.close() ?? executor.close(), store?.close()])
+    const cleanupErrors: unknown[] = []
+    try {
+      filesystem?.close()
+    } catch (cleanupError) {
+      cleanupErrors.push(cleanupError)
+    }
+    try {
+      await closeRuntime({
+        registry: registry ?? executor,
+        ...(store === undefined ? {} : { store }),
+      })
+    } catch (cleanupError) {
+      cleanupErrors.push(cleanupError)
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...cleanupErrors],
+        'CLI 执行与运行时资源关闭均失败',
+      )
+    }
     throw error
   }
 }

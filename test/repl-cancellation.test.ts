@@ -6,7 +6,10 @@ import { ToolRegistry } from '../src/core/tool-registry.js'
 import {
   closeRuntime,
   createInteractiveApprovalHandler,
+  runOnce,
+  RuntimeResourceCloseTimeoutError,
 } from '../src/cli/repl.js'
+import type { CliRuntimeDeps } from '../src/cli/repl.js'
 import type { PipelineApprovalRequest } from '../src/execution/tool-execution-pipeline.js'
 
 function approvalRequest(signal: AbortSignal): PipelineApprovalRequest {
@@ -70,5 +73,50 @@ describe('REPL cancellation lifecycle', () => {
       /部分运行时资源关闭失败/,
     )
     assert.deepEqual(order, ['registry', 'store'])
+  })
+
+  it('bounds a stuck registry close and still releases the store', async () => {
+    const order: string[] = []
+    const registry = {
+      close: async () => {
+        order.push('registry')
+        await new Promise<never>(() => undefined)
+      },
+    }
+    const store = {
+      close: async () => {
+        order.push('store')
+      },
+    }
+
+    await assert.rejects(
+      closeRuntime(
+        { registry, store } as unknown as Parameters<typeof closeRuntime>[0],
+        { registryCloseTimeoutMs: 5, storeCloseTimeoutMs: 50 },
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof AggregateError)
+        assert.equal(error.errors.length, 1)
+        const timeout = error.errors[0]
+        assert.ok(timeout instanceof RuntimeResourceCloseTimeoutError)
+        assert.equal(timeout.code, 'runtime_resource_close_timeout')
+        assert.equal(timeout.resource, 'registry')
+        return true
+      },
+    )
+    assert.deepEqual(order, ['registry', 'store'])
+  })
+
+  it('rejects an outer close budget smaller than the two resource budgets', async () => {
+    await assert.rejects(
+      runOnce({
+        shutdown: {
+          registryCloseTimeoutMs: 20,
+          storeCloseTimeoutMs: 30,
+          closeWaitTimeoutMs: 49,
+        },
+      } as unknown as CliRuntimeDeps, 'unused'),
+      /closeWaitTimeoutMs.*registryCloseTimeoutMs \+ storeCloseTimeoutMs/,
+    )
   })
 })

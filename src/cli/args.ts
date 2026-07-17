@@ -1,8 +1,9 @@
 import { createSessionId } from '../session/store.js'
 
-export type CliCommand = 'chat' | 'run' | 'ops'
+export type CliCommand = 'chat' | 'run' | 'ops' | 'session'
 export type OpsAction = 'list' | 'resolve'
 export type OpsOutcome = 'succeeded' | 'failed'
+export type SessionAction = 'doctor'
 
 export interface AgentCliOptions {
   command: 'chat' | 'run'
@@ -25,11 +26,22 @@ export interface OpsCliOptions {
   readonly autoApprove?: false
 }
 
-export type CliOptions = AgentCliOptions | OpsCliOptions
+export interface SessionCliOptions {
+  command: 'session'
+  action: SessionAction | undefined
+  sessionId: string
+  help: boolean
+  readonly prompt?: undefined
+  readonly continueSession?: false
+  readonly autoApprove?: false
+}
+
+export type CliOptions = AgentCliOptions | OpsCliOptions | SessionCliOptions
 
 export function parseCliOptions(args: string[]): CliOptions {
   let command: CliCommand | undefined
   let action: OpsAction | undefined
+  let sessionAction: SessionAction | undefined
   let continueSession = false
   let sessionId: string | undefined
   let autoApprove = false
@@ -42,10 +54,13 @@ export function parseCliOptions(args: string[]): CliOptions {
     const arg = args[index]
     // pnpm/npm may forward the conventional separator to the script itself.
     if (arg === '--') continue
-    if ((arg === 'chat' || arg === 'run' || arg === 'ops') && command === undefined && prompt === undefined) {
+    if ((arg === 'chat' || arg === 'run' || arg === 'ops' || arg === 'session') &&
+      command === undefined && prompt === undefined) {
       command = arg
     } else if (command === 'ops' && (arg === 'list' || arg === 'resolve') && action === undefined) {
       action = arg
+    } else if (command === 'session' && arg === 'doctor' && sessionAction === undefined) {
+      sessionAction = arg
     } else if (arg === '--continue') continueSession = true
     else if (arg === '--yes' || arg === '-y') autoApprove = true
     else if (arg === '--help' || arg === '-h') help = true
@@ -72,6 +87,19 @@ export function parseCliOptions(args: string[]): CliOptions {
   }
 
   const resolvedCommand = command || (prompt === undefined ? 'chat' : 'run')
+  if (resolvedCommand === 'session') {
+    if (!help && sessionAction === undefined) throw new Error('session 需要 doctor 子命令')
+    if (continueSession || autoApprove || prompt !== undefined || operationId !== undefined ||
+      outcome !== undefined) {
+      throw new Error('session doctor 只接受 --session 与 --help')
+    }
+    return {
+      command: 'session',
+      action: sessionAction,
+      sessionId: sessionId || 'default',
+      help,
+    }
+  }
   if (resolvedCommand === 'ops') {
     if (!help && action === undefined) throw new Error('ops 需要 list 或 resolve 子命令')
     if (continueSession || autoApprove || prompt !== undefined) {
@@ -120,6 +148,7 @@ export function cliUsage() {
   super-agent run --prompt <text> [选项]
   super-agent ops list --session <id>
   super-agent ops resolve --session <id> --operation <id> --outcome succeeded|failed
+  super-agent session doctor --session <id>
 
 选项:
   --session <id>  指定会话 ID

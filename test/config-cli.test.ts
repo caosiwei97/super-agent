@@ -172,4 +172,18 @@ describe('CLI options', () => {
       /succeeded|failed/,
     )
   })
+
+  it('parses the read-only session doctor command', () => {
+    assert.deepEqual(parseCliOptions(['session', 'doctor', '--session', 'session-1']), {
+      command: 'session',
+      action: 'doctor',
+      sessionId: 'session-1',
+      help: false,
+    })
+    assert.throws(() => parseCliOptions(['session']), /doctor/)
+    assert.throws(
+      () => parseCliOptions(['session', 'doctor', '--session', 'session-1', '--yes']),
+      /只接受 --session 与 --help/,
+    )
+  })
 })

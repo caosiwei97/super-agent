@@ -13,6 +13,10 @@ import type { RecoveryJournal } from '../execution/recovery-coordinator.js'
 import { redactSensitiveInput } from '../execution/operation-ledger.js'
 import type { PipelineApprovalRequest } from '../execution/tool-execution-pipeline.js'
 import { killActiveProcessGroupsSync } from '../execution/process-executor.js'
+import {
+  DEFAULT_SHUTDOWN_CLOSE_WAIT_TIMEOUT_MS,
+  ShutdownCoordinator,
+} from './shutdown-coordinator.js'
 
 export interface CliRuntimeDeps {
   model: LanguageModel
@@ -25,6 +29,37 @@ export interface CliRuntimeDeps {
   modelRequestTimeoutMs: number
   turnTimeoutMs: number
   autoApprove: boolean
+  shutdown?: CliShutdownOptions
+}
+
+export interface CliShutdownOptions {
+  activeWaitTimeoutMs?: number
+  closeWaitTimeoutMs?: number
+  registryCloseTimeoutMs?: number
+  storeCloseTimeoutMs?: number
+}
+
+const DEFAULT_REGISTRY_CLOSE_TIMEOUT_MS = 1_500
+const DEFAULT_STORE_CLOSE_TIMEOUT_MS = 2_500
+
+type RuntimeResource = 'registry' | 'store'
+
+interface CloseableRuntimeResource {
+  close(): void | Promise<void>
+}
+
+interface RuntimeCloseResources {
+  registry: CloseableRuntimeResource
+  store?: CloseableRuntimeResource
+}
+
+export class RuntimeResourceCloseTimeoutError extends Error {
+  readonly code = 'runtime_resource_close_timeout'
+
+  constructor(readonly resource: RuntimeResource, readonly timeoutMs: number) {
+    super(`等待 ${resource} 关闭超过 ${timeoutMs}ms`)
+    this.name = 'RuntimeResourceCloseTimeoutError'
+  }
 }
 
 export function printStartupStats(registry: ToolRegistry) {
@@ -185,59 +220,186 @@ function createRunner(deps: CliRuntimeDeps, approveTool: ToolApprovalHandler) {
   })
 }
 
-export async function closeRuntime(deps: Pick<CliRuntimeDeps, 'registry' | 'store'>) {
-  const errors: unknown[] = []
+function positiveOrZeroTimeout(value: number | undefined, fallback: number, field: string) {
+  const resolved = value ?? fallback
+  if (!Number.isFinite(resolved) || resolved < 0) throw new Error(`${field} 必须是非负有限数`)
+  return resolved
+}
+
+function resolveResourceCloseTimeouts(
+  options: Pick<CliShutdownOptions, 'registryCloseTimeoutMs' | 'storeCloseTimeoutMs'> = {},
+) {
+  return {
+    registryCloseTimeoutMs: positiveOrZeroTimeout(
+      options.registryCloseTimeoutMs,
+      DEFAULT_REGISTRY_CLOSE_TIMEOUT_MS,
+      'registryCloseTimeoutMs',
+    ),
+    storeCloseTimeoutMs: positiveOrZeroTimeout(
+      options.storeCloseTimeoutMs,
+      DEFAULT_STORE_CLOSE_TIMEOUT_MS,
+      'storeCloseTimeoutMs',
+    ),
+  }
+}
+
+function resolveCoordinatorCloseTimeout(options: CliShutdownOptions | undefined) {
+  const resourceTimeouts = resolveResourceCloseTimeouts(options)
+  const closeWaitTimeoutMs = positiveOrZeroTimeout(
+    options?.closeWaitTimeoutMs,
+    DEFAULT_SHUTDOWN_CLOSE_WAIT_TIMEOUT_MS,
+    'closeWaitTimeoutMs',
+  )
+  const minimumCloseWaitTimeoutMs = resourceTimeouts.registryCloseTimeoutMs +
+    resourceTimeouts.storeCloseTimeoutMs
+  if (closeWaitTimeoutMs < minimumCloseWaitTimeoutMs) {
+    throw new Error(
+      `closeWaitTimeoutMs 必须大于或等于 registryCloseTimeoutMs + storeCloseTimeoutMs ` +
+      `(${minimumCloseWaitTimeoutMs}ms)`,
+    )
+  }
+  return closeWaitTimeoutMs
+}
+
+async function closeResourceWithinTimeout(
+  resource: RuntimeResource,
+  close: () => void | Promise<void>,
+  timeoutMs: number,
+) {
+  const closePromise = Promise.resolve().then(close)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new RuntimeResourceCloseTimeoutError(resource, timeoutMs)), timeoutMs)
+  })
   try {
-    await deps.registry.close()
+    await Promise.race([closePromise, timeout])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+export async function closeRuntime(
+  deps: RuntimeCloseResources,
+  options: Pick<CliShutdownOptions, 'registryCloseTimeoutMs' | 'storeCloseTimeoutMs'> = {},
+) {
+  const errors: unknown[] = []
+  const { registryCloseTimeoutMs, storeCloseTimeoutMs } = resolveResourceCloseTimeouts(options)
+  try {
+    await closeResourceWithinTimeout('registry', () => deps.registry.close(), registryCloseTimeoutMs)
   } catch (error) {
     errors.push(error)
   }
-  try {
-    await deps.store.close()
-  } catch (error) {
-    errors.push(error)
+  const store = deps.store
+  if (store) {
+    try {
+      // A timed-out Registry close may still be waiting on a non-cooperative
+      // executionLock reader. Store close is nevertheless attempted so the
+      // session writer lock can be flushed and released before process exit.
+      await closeResourceWithinTimeout('store', () => store.close(), storeCloseTimeoutMs)
+    } catch (error) {
+      errors.push(error)
+    }
   }
   if (errors.length > 0) throw new AggregateError(errors, '部分运行时资源关闭失败')
 }
 
 /** Executes one automation-friendly turn and releases all tool resources. */
 export async function runOnce(deps: CliRuntimeDeps, prompt: string) {
+  const closeWaitTimeoutMs = resolveCoordinatorCloseTimeout(deps.shutdown)
   const runner = createRunner(deps, createNonInteractiveApprovalHandler(deps.autoApprove))
   const controller = new AbortController()
   let sigintCount = 0
+  let gracefulSignal: 'SIGINT' | 'SIGTERM' | undefined
+  let signalShutdown: Promise<void> | undefined
+  let turnPromise!: ReturnType<typeof runner.runTurn>
+  const shutdownCoordinator = new ShutdownCoordinator({
+    abortActive: (reason) => controller.abort(reason),
+    waitForActive: async () => {
+      try {
+        await turnPromise
+      } catch (error) {
+        if (!(gracefulSignal && error instanceof Error && error.name === 'AbortError')) throw error
+      }
+    },
+    closeResources: () => closeRuntime(deps, deps.shutdown),
+    ...(deps.shutdown?.activeWaitTimeoutMs === undefined
+      ? {}
+      : { activeWaitTimeoutMs: deps.shutdown.activeWaitTimeoutMs }),
+    closeWaitTimeoutMs,
+  })
+
+  const removeSignalListeners = () => {
+    process.removeListener('SIGINT', onSigint)
+    process.removeListener('SIGTERM', onSigterm)
+  }
+  const exitAfterSignalShutdown = (
+    shutdown: Promise<void>,
+    signal: 'SIGINT' | 'SIGTERM',
+  ) => {
+    void shutdown.then(
+      () => {
+        removeSignalListeners()
+        process.exit(signal === 'SIGINT' ? 130 : 143)
+      },
+      (error) => {
+        console.error(`[Shutdown] ${error instanceof Error ? error.message : error}`)
+        removeSignalListeners()
+        process.exit(1)
+      },
+    )
+  }
+  const beginSignalShutdown = (signal: 'SIGINT' | 'SIGTERM') => {
+    if (signalShutdown) return
+    gracefulSignal = signal
+    signalShutdown = shutdownCoordinator.shutdown(
+      new DOMException(`Turn cancelled by ${signal}`, 'AbortError'),
+    )
+    exitAfterSignalShutdown(signalShutdown, signal)
+  }
   const onSigint = () => {
-    sigintCount++
-    if (sigintCount === 1) {
-      controller.abort(new DOMException('Turn cancelled by SIGINT', 'AbortError'))
-      return
+    if (signalShutdown || sigintCount >= 1) {
+      killActiveProcessGroupsSync()
+      process.exit(130)
     }
-    killActiveProcessGroupsSync()
-    process.exit(130)
+    sigintCount = 1
+    beginSignalShutdown('SIGINT')
+  }
+  const onSigterm = () => {
+    if (signalShutdown) return
+    beginSignalShutdown('SIGTERM')
   }
   process.on('SIGINT', onSigint)
+  process.on('SIGTERM', onSigterm)
+  turnPromise = runner.runTurn(prompt, { signal: controller.signal })
+
   let turnFailed = false
   let turnError: unknown
   try {
-    return await runner.runTurn(prompt, { signal: controller.signal })
+    return await turnPromise
   } catch (error) {
+    if (gracefulSignal && error instanceof Error && error.name === 'AbortError') return undefined
     turnFailed = true
     turnError = error
     throw error
   } finally {
-    process.removeListener('SIGINT', onSigint)
-    try {
-      await closeRuntime(deps)
-    } catch (closeError) {
-      if (turnFailed) {
-        throw new AggregateError([turnError, closeError], 'Agent 执行与工具资源关闭均失败')
+    if (!signalShutdown) {
+      try {
+        await closeRuntime(deps, deps.shutdown)
+      } catch (closeError) {
+        if (turnFailed) {
+          throw new AggregateError([turnError, closeError], 'Agent 执行与工具资源关闭均失败')
+        }
+        throw closeError
+      } finally {
+        removeSignalListeners()
       }
-      throw closeError
     }
   }
 }
 
 /** Interactive shell only; turn orchestration lives in ConversationRunner. */
 export function startRepl(deps: CliRuntimeDeps) {
+  const closeWaitTimeoutMs = resolveCoordinatorCloseTimeout(deps.shutdown)
   const rl = createInterface({ input: process.stdin, output: process.stdout })
   const runner = createRunner(deps, createInteractiveApprovalHandler(rl, deps.autoApprove))
 
@@ -246,8 +408,23 @@ export function startRepl(deps: CliRuntimeDeps) {
   let sigintTimer: NodeJS.Timeout | undefined
   let activeTurn: AbortController | undefined
   let activeTurnPromise: Promise<unknown> | undefined
+  const shutdownCoordinator = new ShutdownCoordinator({
+    abortActive: (reason) => activeTurn?.abort(reason),
+    waitForActive: async () => {
+      try {
+        await activeTurnPromise
+      } catch {
+        // The turn reports its own cancellation/error before shutdown continues.
+      }
+    },
+    closeResources: () => closeRuntime(deps, deps.shutdown),
+    ...(deps.shutdown?.activeWaitTimeoutMs === undefined
+      ? {}
+      : { activeWaitTimeoutMs: deps.shutdown.activeWaitTimeoutMs }),
+    closeWaitTimeoutMs,
+  })
 
-  async function shutdown(force = false) {
+  async function shutdown(force = false, source: 'SIGINT' | 'SIGTERM' | 'input' = 'input') {
     if (force) {
       activeTurn?.abort(new DOMException('Turn force-cancelled by SIGINT', 'AbortError'))
       killActiveProcessGroupsSync()
@@ -256,23 +433,28 @@ export function startRepl(deps: CliRuntimeDeps) {
     if (shuttingDown) return
     shuttingDown = true
     if (sigintTimer) clearTimeout(sigintTimer)
-    activeTurn?.abort(new DOMException('Turn cancelled during shutdown', 'AbortError'))
-    try {
-      await activeTurnPromise
-    } catch {
-      // The turn reports its own cancellation/error before shutdown continues.
-    }
     console.log('\nBye!')
-
+    let exitCode = 0
     try {
-      await closeRuntime(deps)
+      await shutdownCoordinator.shutdown(
+        new DOMException(`Turn cancelled during ${source} shutdown`, 'AbortError'),
+      )
     } catch (error) {
+      exitCode = 1
       console.error(`[Shutdown] ${error instanceof Error ? error.message : error}`)
+    } finally {
+      process.removeListener('SIGINT', onSigint)
+      process.removeListener('SIGTERM', onSigterm)
     }
-    process.exit(0)
+    process.exit(exitCode)
   }
 
-  rl.on('SIGINT', () => {
+  const onSigterm = () => { void shutdown(false, 'SIGTERM') }
+  const onSigint = () => {
+    if (shuttingDown) {
+      void shutdown(true, 'SIGINT')
+      return
+    }
     if (activeTurn && !activeTurn.signal.aborted) {
       sigintCount = 1
       activeTurn.abort(new DOMException('Turn cancelled by SIGINT', 'AbortError'))
@@ -283,9 +465,11 @@ export function startRepl(deps: CliRuntimeDeps) {
       }, 1_500)
       return
     }
-    if (sigintCount >= 1) void shutdown(true)
-    else void shutdown(false)
-  })
+    if (sigintCount >= 1) void shutdown(true, 'SIGINT')
+    else void shutdown(false, 'SIGINT')
+  }
+  process.on('SIGINT', onSigint)
+  process.on('SIGTERM', onSigterm)
 
   rl.on('close', () => void shutdown())
 
