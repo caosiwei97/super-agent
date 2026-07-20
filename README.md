@@ -75,7 +75,7 @@ sequenceDiagram
     R->>S: 1.3 保存用户消息
     R->>R: 1.4 发送前压缩
 
-    loop 最多 AGENT_MAX_STEPS 次
+    loop 代码内设置的 step 上限
         R->>M: 2.1 发送上下文、system prompt 和工具定义
         M-->>R: 2.2 返回文本或工具调用
         alt 直接回答
@@ -251,13 +251,8 @@ flowchart LR
 | `SUPER_AGENT_WORKSPACE` | 当前目录 | 文件、Shell 和预览工具的根目录 |
 | `GITHUB_PERSONAL_ACCESS_TOKEN` | 无 | 配置后接入 GitHub MCP |
 | `TOKEN_BUDGET` | `1000000` | 当前 session 的累计 token 上限 |
-| `AGENT_MAX_STEPS` | `15` | 每轮最多执行多少个模型 step |
-| `AGENT_MAX_RETRIES` | `10` | 单次模型请求最多重试次数，允许为 0 |
-| `CONTEXT_TOKEN_THRESHOLD` | `12000` | 超过该估算值后尝试生成摘要 |
-| `CONTEXT_KEEP_RECENT_MESSAGES` | `8` | 摘要时优先保留的近期消息数 |
-| `CONTEXT_KEEP_RECENT_TOOL_MESSAGES` | `4` | 不清理结果的近期工具消息数 |
-| `CONTEXT_ASCII_CHARS_PER_TOKEN` | `4` | ASCII token 估算比例 |
-| `CONTEXT_MAX_SUMMARY_CHARS` | `1200` | 摘要最大字符数 |
+
+模型 step、重试和上下文压缩都属于代码内部策略，不通过环境变量配置。对应默认值分别位于 `src/agent/agent-loop.ts` 和 `src/context/compressor.ts`。
 
 设置 `PROMPT_DEBUG=1` 可以打印 system prompt 每个组成部分的开关状态和字符数。
 
