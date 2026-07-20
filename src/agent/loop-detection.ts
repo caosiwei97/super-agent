@@ -54,7 +54,7 @@ export function hashResult(result: unknown) {
   return hash(stableStringify(result))
 }
 
-/** Per-agent-loop detector. No module-global history is shared across sessions. */
+/** 每个智能体循环独立使用一个检测器，不在不同会话间共享模块级历史记录。 */
 export class LoopDetector {
   private readonly history: ToolCallRecord[] = []
   private readonly options: LoopDetectorOptions

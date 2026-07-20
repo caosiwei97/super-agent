@@ -14,10 +14,10 @@ function isWithin(root: string, candidate: string) {
 }
 
 /**
- * Resolves tool paths against one explicit workspace root.
+ * 以一个明确的工作区根目录为基准解析工具路径。
  *
- * Existing paths are checked through realpath to prevent symlink escapes.
- * New write targets validate their existing parent for the same reason.
+ * 已存在的路径通过 realpath 检查，防止符号链接逃逸。
+ * 新的写入目标也会检查其已存在的父目录。
  */
 export class Workspace {
   readonly root: string
@@ -40,8 +40,8 @@ export class Workspace {
   resolveForWrite(path: string) {
     const candidate = this.resolveLexically(path)
     try {
-      // lstat sees dangling symlinks that existsSync intentionally treats as
-      // missing. Such a link must never be followed by writeFile.
+      // lstat 能发现 existsSync 会有意视为不存在的悬空符号链接。
+      // writeFile 绝不能沿着这类链接写入。
       lstatSync(candidate)
       return this.resolveExisting(path)
     } catch (error) {

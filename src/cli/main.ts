@@ -9,7 +9,7 @@ import { SessionStore } from '../session/store.js'
 
 const SESSION_ID = 'default'
 
-/** CLI application entry. Process-level error handling belongs to the executable shim. */
+/** 命令行应用入口。进程级错误处理由可执行程序的外层入口负责。 */
 export async function runCli(args: string[] = []) {
   const unexpectedArgs = args.filter((arg) => arg !== '--')
   if (unexpectedArgs.length > 0) {
@@ -56,7 +56,7 @@ export async function runCli(args: string[] = []) {
     try {
       await registry.close()
     } catch {
-      // Preserve the application error as the primary failure.
+      // 保留应用错误作为主要失败原因。
     }
     throw error
   }

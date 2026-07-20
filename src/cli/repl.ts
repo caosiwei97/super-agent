@@ -103,7 +103,7 @@ function createRunner(deps: CliRuntimeDeps, approveTool: ToolApprovalHandler) {
   })
 }
 
-/** Interactive shell only; turn orchestration lives in ConversationRunner. */
+/** 这里只负责交互式终端；单轮对话编排由 ConversationRunner 负责。 */
 export function startRepl(deps: CliRuntimeDeps) {
   const rl = createInterface({ input: process.stdin, output: process.stdout })
   const runner = createRunner(deps, createInteractiveApprovalHandler(rl))

@@ -73,7 +73,7 @@ function notify(callback: (() => void) | undefined) {
   try {
     callback?.()
   } catch {
-    // Observability must not change agent execution semantics.
+    // 可观测性回调不得改变智能体的执行语义。
   }
 }
 
@@ -91,11 +91,10 @@ function deniedToolResult(call: GuardedCall, reason: string) {
 }
 
 /**
- * Runs one agent turn with retry, budget, approval and loop protection.
+ * 运行一轮智能体，对重试、预算、审批和循环进行保护。
  *
- * Successful step messages are committed through `onMessages` immediately;
- * callers can compact the working context between steps without losing the raw
- * audit trail.
+ * 每个成功步骤的消息都会立即通过 `onMessages` 持久化；
+ * 调用方可以在步骤之间压缩工作上下文，同时保留原始审计记录。
  */
 export async function agentLoop(options: AgentLoopOptions) {
   const {

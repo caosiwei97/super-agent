@@ -14,7 +14,7 @@ function once(release: () => void) {
   }
 }
 
-/** Fair FIFO read/write lock: queued writers cannot be starved by new readers. */
+/** 公平的先进先出读写锁：排队的写操作不会因新读操作不断进入而饿死。 */
 export class AsyncReadWriteLock {
   private activeReaders = 0
   private activeWriter = false

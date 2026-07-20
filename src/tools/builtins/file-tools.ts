@@ -207,7 +207,7 @@ export function createFileTools(workspace: Workspace) {
 
         const lines = content.split('\n')
         for (let index = 0; index < lines.length; index++) {
-          // Bound regex work per line; matching output is truncated separately.
+          // 限制每行参与正则匹配的长度；匹配结果会另行截断。
           if (!regex.test(lines[index].slice(0, 10_000))) continue
           const line = lines[index].trimEnd()
           const preview = line.length > MAX_MATCH_LINE_CHARS

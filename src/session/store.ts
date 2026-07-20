@@ -11,14 +11,14 @@ interface EntryBase {
   timestamp: string
 }
 
-/** Current atomic event: step messages and their cumulative budget share one JSONL record. */
+/** 当前的原子事件：步骤消息及其累计预算共用一条 JSONL 记录。 */
 export interface MessagesEntry extends EntryBase {
   type: 'messages'
   messages: ModelMessage[]
   budgetUsed?: number
 }
 
-/** Legacy entries remain readable so existing sessions can be resumed. */
+/** 保留对旧格式记录的读取支持，以便恢复已有会话。 */
 export interface MessageEntry extends EntryBase {
   type: 'message'
   message: ModelMessage
@@ -81,11 +81,10 @@ function assertMessages(messages: ModelMessage[]) {
 }
 
 /**
- * Append-only session log with recoverable checkpoints.
+ * 只追加写入的会话日志，并通过检查点实现恢复。
  *
- * Message events preserve the raw audit trail. Checkpoints only replace the
- * in-memory recovery state, so startup memory stays bounded by compacted context
- * rather than by the full transcript.
+ * 消息事件保留原始审计记录。检查点只替换内存中的恢复状态，
+ * 因此启动时的内存占用由压缩后的上下文决定，而不是由完整对话记录决定。
  */
 export class SessionStore implements SessionWriter {
   private readonly filePath: string

@@ -66,7 +66,7 @@ function estimateTextTokens(text: string, asciiCharsPerToken: number) {
   return wideChars + Math.ceil(otherChars / asciiCharsPerToken)
 }
 
-/** Conservative heuristic for mixed CJK/ASCII content; configurable per provider. */
+/** 针对中日韩文字与 ASCII 混合内容的保守估算；可按模型供应商调整。 */
 export function estimateTokens(
   messages: ModelMessage[],
   options: Partial<CompactionOptions> = {},
@@ -82,7 +82,7 @@ export function estimateTokens(
   return tokens
 }
 
-// ── Layer 1: Microcompact ────────────────────────────
+// ── 第一层：微压缩 ──────────────────────────────────
 
 const CLEARABLE_TOOLS = new Set([
   'read_file',
@@ -128,8 +128,8 @@ export function microcompact(
         cleared++
         return {
           ...part,
-          // AI SDK v6 requires a structured ToolResultOutput. A raw string here
-          // passes through `any`, but fails when the next model request is encoded.
+          // AI SDK v6 要求使用结构化的 ToolResultOutput。这里若使用原始字符串，
+          // 即使能通过 `any` 类型检查，编码下一次模型请求时仍会失败。
           output: { type: 'text' as const, value: CLEARED_TOOL_RESULT },
         }
       }),
@@ -139,7 +139,7 @@ export function microcompact(
   return { messages: compactedMessages, cleared }
 }
 
-// ── Layer 2: LLM Summarization ───────────────────────
+// ── 第二层：模型摘要 ─────────────────────────────────
 
 const COMPRESS_PROMPT = `你是一个对话压缩系统。你的任务是把 Agent 和用户之间的对话历史压缩成一份结构化摘要，确保后续对话能够无缝继续。
 
@@ -235,9 +235,8 @@ export async function summarize(
   options: Partial<CompactionOptions> = {},
 ) {
   const resolvedOptions = resolveOptions(options)
-  // A previous summary is injected into messages for the agent. Remove that
-  // synthetic message before rolling the next summary, otherwise every
-  // compaction sends the same summary to the summarizer twice.
+  // 上一次摘要会作为合成消息注入智能体上下文。生成新摘要前先移除该消息，
+  // 否则每次压缩都会把同一份摘要重复发送两次。
   const previousSummary = existingSummary
   const conversationMessages = stripEmbeddedSummary(messages, previousSummary)
 
@@ -255,8 +254,7 @@ export async function summarize(
 
   const splitIndex = Math.max(0, conversationMessages.length - resolvedOptions.keepRecentMessages)
 
-  // Keep complete user turns so assistant tool calls never get separated from
-  // the user request that initiated them.
+  // 保留完整的用户轮次，避免助手的工具调用与触发它的用户请求分离。
   let alignedIndex = splitIndex
   while (alignedIndex > 0 && conversationMessages[alignedIndex].role !== 'user') {
     alignedIndex--
@@ -318,8 +316,8 @@ export async function summarize(
     }
     const compactedMessages: ModelMessage[] = [summaryMessage, ...toKeep]
 
-    // A model can ignore the requested summary length. Never replace the
-    // working context with a representation that is not actually smaller.
+    // 模型可能忽略摘要长度要求。若摘要后的表示并未真正变小，
+    // 就不能用它替换工作上下文。
     if (
       estimateTokens(compactedMessages, resolvedOptions) >=
       estimateTokens(messages, resolvedOptions)
@@ -349,7 +347,7 @@ export async function summarize(
   }
 }
 
-/** Run both compaction layers and return enough metadata for lifecycle logging. */
+/** 依次运行两层压缩，并返回记录生命周期日志所需的完整元数据。 */
 export async function compactContext(
   model: LanguageModel,
   messages: ModelMessage[],

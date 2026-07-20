@@ -57,8 +57,8 @@ export function createPreviewTools(workspace: Workspace) {
             return
           }
 
-          // The lexical check above blocks ../. realpath also blocks a symlink
-          // inside app/ from serving files elsewhere in the workspace.
+          // 上面的词法检查会阻止 ../；realpath 还会阻止 app/ 内的符号链接
+          // 提供工作区其他位置的文件。
           const realFilePath = await realpath(filePath)
           const realRelativePath = relative(root, realFilePath)
           if (

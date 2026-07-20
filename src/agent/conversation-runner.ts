@@ -36,7 +36,7 @@ export interface ConversationRunnerOptions {
   runAgentLoop?: (options: AgentLoopOptions) => Promise<AgentLoopResult>
 }
 
-/** Coordinates one durable conversation turn; the CLI only handles interaction. */
+/** 编排一个可持久化的对话轮次；命令行界面只负责交互。 */
 export class ConversationRunner {
   private readonly runAgentLoop: (options: AgentLoopOptions) => Promise<AgentLoopResult>
   private turnInProgress = false
@@ -86,9 +86,8 @@ export class ConversationRunner {
         beforeStep: async (step) => {
           if (step > 1) await this.compact('between-steps')
         },
-        // `agentLoop` updates the shared budget before this callback. Persist
-        // the snapshot in the same JSONL event as the raw step messages so a
-        // crash cannot restore messages while losing their token cost.
+        // `agentLoop` 会在此回调前更新共享预算。将预算快照与原始步骤消息
+        // 持久化到同一条 JSONL 事件中，避免崩溃恢复消息时丢失对应的令牌消耗。
         onMessages: (messages) =>
           this.options.store.appendMessages(messages, this.state.budget.used),
       })
@@ -127,9 +126,8 @@ export class ConversationRunner {
     this.state.summary = result.summary
     this.state.budget.used += result.usageTokens
 
-    // Between-step and pre-turn compaction happen before the final turn
-    // checkpoint. Persist material context/budget changes immediately so they
-    // remain recoverable if the following model request fails or the process exits.
+    // 步骤间压缩和轮次前压缩发生在最终轮次检查点之前。
+    // 重要的上下文或预算变化需要立即持久化，确保后续模型请求失败或进程退出时仍可恢复。
     const changed = result.cleared > 0 || result.compressedCount > 0 || result.usageTokens > 0
     if (changed && phase !== 'after-turn') {
       await this.options.store.appendCheckpoint({
@@ -142,7 +140,7 @@ export class ConversationRunner {
     try {
       this.options.onCompaction?.(phase, result)
     } catch {
-      // An observability callback must not invalidate a durable turn.
+      // 可观测性回调不得破坏已持久化的对话轮次。
     }
   }
 }

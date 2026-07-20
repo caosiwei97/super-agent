@@ -7,7 +7,7 @@ export interface GitHubMCPOptions {
   token?: string
 }
 
-/** Connects to GitHub's hosted Streamable HTTP MCP server. */
+/** 连接 GitHub 托管的可流式传输 HTTP MCP 服务器。 */
 export async function connectGitHubMCP(
   registry: ToolRegistry,
   options: GitHubMCPOptions,

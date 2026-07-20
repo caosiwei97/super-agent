@@ -47,7 +47,7 @@ function ipv6Number(address: string) {
   return groups.reduce((result, group) => (result << 16n) + BigInt(`0x${group}`), 0n)
 }
 
-/** True only for globally routable addresses; private, loopback and documentation ranges are blocked. */
+/** 仅全局可路由地址返回 `true`；私有、回环和文档专用地址段均会被阻止。 */
 export function isPublicAddress(address: string): boolean {
   const family = isIP(address)
   if (family === 4) {
@@ -85,13 +85,13 @@ export function isPublicAddress(address: string): boolean {
     }
     if (value >> 121n === 0x7en) return false // fc00::/7
     if (value >> 118n === 0x3fan) return false // fe80::/10
-    if (value >> 118n === 0x3fbn) return false // deprecated site-local fec0::/10
-    if (value >> 120n === 0xffn) return false // multicast
+    if (value >> 118n === 0x3fbn) return false // 已弃用的站点本地地址 fec0::/10
+    if (value >> 120n === 0xffn) return false // 多播地址
     if (value >> 96n === 0x20010000n) return false // Teredo 2001::/32
-    if (value >> 96n === 0x20010db8n) return false // documentation
+    if (value >> 96n === 0x20010db8n) return false // 文档专用地址
     if (value >> 112n === 0x2002n) return false // 6to4
-    if ((value >> 32n) === (ipv6Number('64:ff9b::')! >> 32n)) return false // NAT64 well-known prefix
-    if ((value >> 64n) === (ipv6Number('100::')! >> 64n)) return false // discard-only prefix
+    if ((value >> 32n) === (ipv6Number('64:ff9b::')! >> 32n)) return false // NAT64 公认前缀
+    if ((value >> 64n) === (ipv6Number('100::')! >> 64n)) return false // 仅丢弃前缀
     if (value >> 32n === 0xffffn) {
       const mapped = Number(value & 0xffffffffn)
       return isPublicAddress([

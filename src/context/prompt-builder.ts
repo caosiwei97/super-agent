@@ -10,7 +10,7 @@ export function buildSystem(
   registry: ToolRegistry,
   session: { id: string; contextMessageCount: number },
 ) {
-  // Prompt Pipe 组装 system prompt
+  // 通过提示管道组装系统提示词
   const builder = new PromptBuilder()
     .pipe('coreRules', coreRules())
     .pipe('toolGuide', toolGuide())
@@ -45,9 +45,9 @@ export class PromptBuilder {
   }
 
   /**
-   * 构建最终的 system prompt。
+   * 构建最终的系统提示词。
    *
-   * 如果 PROMPT_DEBUG=1，同时打印各 pipe 的状态（开关 + 字符数），
+   * 如果 PROMPT_DEBUG=1，同时打印各管道的状态（开关 + 字符数），
    * 避免正常使用时的噪音输出。
    */
   build(ctx: PromptContext) {
@@ -74,7 +74,7 @@ export class PromptBuilder {
   }
 }
 
-// ── 预定义的 Pipe ────────────────────────────────
+// ── 预定义管道 ───────────────────────────────────
 
 export function coreRules() {
   return (() => `你是 Super Agent，一个有工具调用能力的 AI 助手。

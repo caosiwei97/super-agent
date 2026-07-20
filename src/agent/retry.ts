@@ -2,9 +2,9 @@
  * 从 Error 对象提取 HTTP 状态码。
  *
  * 优先读取 error.status / error.statusCode 属性（AI SDK / fetch 错误的标准字段），
- * 再 fallback 到 message 文本中匹配 "status: 429" / "HTTP 500" 这类模式。
+ * 再回退到错误消息文本中匹配 "status: 429" / "HTTP 500" 这类模式。
  *
- * 不再用裸 /(\d{3})/ —— 那会误匹配 message 中的任意三位数（如 "retry in 5000ms" → 500）。
+ * 不再用裸 /(\d{3})/ —— 那会误匹配错误消息中的任意三位数（如 "retry in 5000ms" → 500）。
  */
 function extractStatusCode(error: Error) {
   // 1. 属性读取（最可靠）
@@ -17,7 +17,7 @@ function extractStatusCode(error: Error) {
     candidate.status ?? candidate.statusCode ?? candidate.response?.status
   if (typeof statusAttr === 'number') return statusAttr
 
-  // 2. 文本 fallback：匹配 "status: 429" / "HTTP 500" / "status 503" 等模式
+  // 2. 文本回退：匹配 "status: 429" / "HTTP 500" / "status 503" 等模式
   const message = error.message || ''
   const match = message.match(/(?:status|HTTP)[:\s]*(\d{3})\b/i)
   return match ? parseInt(match[1], 10) : null

@@ -7,7 +7,7 @@ export interface MCPToolDescriptor {
   inputSchema: Record<string, unknown>
 }
 
-/** Narrow port keeps the registry independent from the MCP transport implementation. */
+/** 精简接口使工具注册表不依赖 MCP 传输层的具体实现。 */
 export interface MCPToolClient {
   connect(): Promise<void>
   listTools(): Promise<MCPToolDescriptor[]>
@@ -23,7 +23,7 @@ export interface ToolDefinition {
   isReadOnly?: boolean
   requiresApproval?: boolean
   maxResultChars?: number
-  // Tool input is validated by the AI SDK against `parameters` before execution.
+  // 工具执行前，AI SDK 会依据 `parameters` 校验输入。
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   execute: (input: any) => Promise<unknown>
   dispose?: () => Promise<void> | void
@@ -92,8 +92,7 @@ export class ToolRegistry {
           name: prefixedName,
           description: `[MCP:${serverName}] ${tool.description}`,
           parameters: tool.inputSchema,
-          // MCP schemas do not expose trustworthy read/write metadata. Default to
-          // serialized execution with explicit approval.
+          // MCP 参数结构没有提供可信的读写元数据，因此默认串行执行并要求明确审批。
           isConcurrencySafe: false,
           isReadOnly: false,
           requiresApproval: true,
@@ -221,8 +220,8 @@ export class ToolRegistry {
         execution = { ok: false, output: error instanceof Error ? error.message : String(error) }
       }
 
-      // Result observers run exactly once. Hook failures intentionally propagate:
-      // silently swallowing them would desynchronize loop detection from execution.
+      // 结果观察器只运行一次。钩子失败会有意向上抛出，
+      // 静默忽略会导致循环检测与实际执行状态不同步。
       await hooks.onToolResult?.(invocation, execution)
       return execution
     } finally {
