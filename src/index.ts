@@ -1,6 +1,4 @@
 export { runCli } from './cli/main.js'
-export { parseCliOptions, cliUsage } from './cli/args.js'
-export type { CliCommand } from './cli/args.js'
 export { agentLoop } from './agent/agent-loop.js'
 export type {
   AgentLoopOptions,
@@ -38,7 +36,7 @@ export type {
 } from './core/tool-registry.js'
 export { Workspace, WorkspaceBoundaryError } from './core/workspace.js'
 export { loadConfig } from './core/config.js'
-export { SessionStore, createSessionId } from './session/store.js'
+export { SessionStore } from './session/store.js'
 export type {
   SessionEntry,
   SessionState,

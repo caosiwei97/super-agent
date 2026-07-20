@@ -4,16 +4,16 @@ import { Workspace } from '../core/workspace.js'
 import { loadConfig } from '../core/config.js'
 import { createBuiltinTools, createToolSearch } from '../tools/index.js'
 import { connectGitHubMCP } from '../mcp/create-mcp.js'
-import { printStartupStats, runOnce, startRepl } from './repl.js'
-import { cliUsage, parseCliOptions } from './args.js'
+import { startRepl } from './repl.js'
 import { SessionStore } from '../session/store.js'
 
+const SESSION_ID = 'default'
+
 /** CLI application entry. Process-level error handling belongs to the executable shim. */
-export async function runCli(args: string[]) {
-  const cli = parseCliOptions(args)
-  if (cli.help) {
-    console.log(cliUsage())
-    return
+export async function runCli(args: string[] = []) {
+  const unexpectedArgs = args.filter((arg) => arg !== '--')
+  if (unexpectedArgs.length > 0) {
+    throw new Error('无需子命令或参数，直接运行 super-agent 即可')
   }
 
   const config = loadConfig()
@@ -25,28 +25,15 @@ export async function runCli(args: string[]) {
     registry.register(createToolSearch(registry))
     await connectGitHubMCP(registry, config.githubMcp)
 
-    const store = new SessionStore(cli.sessionId)
-    if (cli.continueSession && !store.exists()) {
-      throw new Error(`会话不存在: ${cli.sessionId}`)
-    }
-    if (!cli.continueSession && store.exists()) {
-      throw new Error(`会话 ${cli.sessionId} 已存在；请改用 --continue --session ${cli.sessionId}`)
-    }
-
-    const loaded = cli.continueSession
-      ? await store.loadState()
-      : { messages: [], summary: '', budgetUsed: 0 }
-    if (!cli.continueSession) await store.appendCheckpoint(loaded)
+    const store = new SessionStore(SESSION_ID)
+    const resumed = store.exists()
+    const loaded = await store.loadState()
+    if (!resumed) await store.appendCheckpoint(loaded)
     console.log(
-      cli.continueSession
-        ? `[Session] 恢复 ${cli.sessionId}，工作上下文 ${loaded.messages.length} 条消息`
-        : `[Session] 新会话 ${cli.sessionId}`,
+      resumed
+        ? `[Session] 已恢复，工作上下文 ${loaded.messages.length} 条消息`
+        : '[Session] 已创建',
     )
-    if (!cli.continueSession) {
-      console.log(`  恢复命令: super-agent chat --continue --session ${cli.sessionId}`)
-    }
-
-    printStartupStats(registry)
     if (!config.model.apiKey) console.warn('[Config] 未配置 OPENAI_API_KEY，模型调用将失败')
 
     const client = createOpenAI({
@@ -65,13 +52,6 @@ export async function runCli(args: string[]) {
       compaction: config.compaction,
       maxSteps: config.agent.maxSteps,
       maxRetries: config.agent.maxRetries,
-      autoApprove: cli.autoApprove || config.autoApprove,
-    }
-
-    if (cli.command === 'run') {
-      if (!cli.prompt) throw new Error('run 命令缺少提示词')
-      await runOnce(runtime, cli.prompt)
-      return
     }
 
     startRepl(runtime)

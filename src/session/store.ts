@@ -1,7 +1,6 @@
 import { createReadStream, existsSync, mkdirSync } from 'node:fs'
 import { appendFile } from 'node:fs/promises'
 import { createInterface } from 'node:readline'
-import { randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 import { modelMessageSchema, type ModelMessage } from 'ai'
 
@@ -54,11 +53,6 @@ export interface SessionWriter {
 export interface SessionStoreOptions {
   directory?: string
   onWarning?: (message: string) => void
-}
-
-export function createSessionId(now = new Date()) {
-  const timestamp = now.toISOString().replace(/[:.]/g, '-').replace('T', '_').replace('Z', '')
-  return `${timestamp}_${randomUUID().slice(0, 8)}`
 }
 
 function validateSessionId(sessionId: string) {

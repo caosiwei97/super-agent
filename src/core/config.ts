@@ -33,14 +33,6 @@ function positiveNumber(env: NodeJS.ProcessEnv, name: string, fallback: number) 
   return value
 }
 
-function booleanValue(env: NodeJS.ProcessEnv, name: string, fallback: boolean) {
-  const raw = env[name]
-  if (raw === undefined || raw === '') return fallback
-  if (['1', 'true', 'yes'].includes(raw.toLowerCase())) return true
-  if (['0', 'false', 'no'].includes(raw.toLowerCase())) return false
-  throw new Error(`${name} 必须是 true/false 或 1/0，当前值: ${raw}`)
-}
-
 export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   return {
     model: {
@@ -61,7 +53,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       maxSummaryChars: positiveInteger(env, 'CONTEXT_MAX_SUMMARY_CHARS', 1_200),
     },
     workspaceRoot: resolve(env.SUPER_AGENT_WORKSPACE || process.cwd()),
-    autoApprove: booleanValue(env, 'SUPER_AGENT_AUTO_APPROVE', false),
     githubMcp: {
       token: env.GITHUB_PERSONAL_ACCESS_TOKEN,
     },

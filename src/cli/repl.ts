@@ -18,26 +18,6 @@ export interface CliRuntimeDeps {
   compaction: CompactionOptions
   maxSteps: number
   maxRetries: number
-  autoApprove: boolean
-}
-
-export function printStartupStats(registry: ToolRegistry) {
-  const allTools = registry.getAll()
-  const activeTools = registry.getActiveTools()
-  const estimate = registry.countTokenEstimate()
-
-  console.log(`已注册 ${allTools.length} 个工具：`)
-  for (const tool of allTools) {
-    const flags = [tool.isConcurrencySafe ? '可并发' : '串行', tool.isReadOnly ? '只读' : '读写']
-    if (tool.requiresApproval || !tool.isReadOnly) flags.push('需审批')
-    console.log(`  - ${tool.name}（${flags.join(', ')}）`)
-  }
-
-  console.log('\n=== 工具统计 ===')
-  console.log(`  全部工具: ${allTools.length} 个`)
-  console.log(`  活跃工具: ${activeTools.length} 个`)
-  console.log(`  延迟工具: ${allTools.length - activeTools.length} 个`)
-  console.log(`  Token 估算: ~${estimate.active} (活跃) + ~${estimate.deferred} (延迟)`)
 }
 
 function printCompaction(phase: CompactionPhase, result: ContextCompactionResult) {
@@ -67,16 +47,9 @@ function inputPreview(input: unknown) {
   return serialized.length > 500 ? `${serialized.slice(0, 500)}…` : serialized
 }
 
-function createInteractiveApprovalHandler(
-  rl: Interface,
-  autoApprove: boolean,
-) {
+function createInteractiveApprovalHandler(rl: Interface) {
   return async (invocation: ToolInvocation) => {
     const description = `${invocation.tool.name}(${inputPreview(invocation.input)})`
-    if (autoApprove) {
-      console.log(`  [自动批准: ${description}]`)
-      return true
-    }
     if (!process.stdin.isTTY) {
       console.log(`  [拒绝: 非交互环境无法审批 ${invocation.tool.name}]`)
       return false
@@ -87,19 +60,6 @@ function createInteractiveApprovalHandler(
         resolve(['y', 'yes'].includes(answer.trim().toLowerCase()))
       })
     })
-  }
-}
-
-function createNonInteractiveApprovalHandler(autoApprove: boolean) {
-  return async (invocation: ToolInvocation) => {
-    const description = `${invocation.tool.name}(${inputPreview(invocation.input)})`
-    if (autoApprove) {
-      console.log(`  [自动批准: ${description}]`)
-      return true
-    }
-
-    console.log(`  [拒绝: one-shot 模式需使用 --yes 才能批准 ${invocation.tool.name}]`)
-    return false
   }
 }
 
@@ -149,33 +109,10 @@ function createRunner(deps: CliRuntimeDeps, approveTool: ToolApprovalHandler) {
   })
 }
 
-/** Executes one automation-friendly turn and releases all tool resources. */
-export async function runOnce(deps: CliRuntimeDeps, prompt: string) {
-  const runner = createRunner(deps, createNonInteractiveApprovalHandler(deps.autoApprove))
-  let turnFailed = false
-  let turnError: unknown
-  try {
-    return await runner.runTurn(prompt)
-  } catch (error) {
-    turnFailed = true
-    turnError = error
-    throw error
-  } finally {
-    try {
-      await deps.registry.close()
-    } catch (closeError) {
-      if (turnFailed) {
-        throw new AggregateError([turnError, closeError], 'Agent 执行与工具资源关闭均失败')
-      }
-      throw closeError
-    }
-  }
-}
-
 /** Interactive shell only; turn orchestration lives in ConversationRunner. */
 export function startRepl(deps: CliRuntimeDeps) {
   const rl = createInterface({ input: process.stdin, output: process.stdout })
-  const runner = createRunner(deps, createInteractiveApprovalHandler(rl, deps.autoApprove))
+  const runner = createRunner(deps, createInteractiveApprovalHandler(rl))
 
   let shuttingDown = false
   let sigintCount = 0
