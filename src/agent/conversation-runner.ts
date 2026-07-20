@@ -29,11 +29,9 @@ export interface ConversationRunnerOptions {
   registry: ToolRegistry
   store: SessionWriter
   state: ConversationState
-  compaction: CompactionOptions
+  compaction?: Partial<CompactionOptions>
   approveTool?: ToolApprovalHandler
   observer?: AgentLoopObserver
-  maxSteps?: number
-  maxRetries?: number
   onCompaction?: (phase: CompactionPhase, result: ContextCompactionResult) => void
   runAgentLoop?: (options: AgentLoopOptions) => Promise<AgentLoopResult>
 }
@@ -93,8 +91,6 @@ export class ConversationRunner {
         // crash cannot restore messages while losing their token cost.
         onMessages: (messages) =>
           this.options.store.appendMessages(messages, this.state.budget.used),
-        maxSteps: this.options.maxSteps,
-        maxRetries: this.options.maxRetries,
       })
     } catch (error) {
       loopError = error
@@ -123,7 +119,7 @@ export class ConversationRunner {
       this.options.model,
       this.state.messages,
       this.state.summary,
-      this.options.compaction,
+      this.options.compaction ?? {},
       { allowSummary: this.state.budget.used < this.state.budget.limit },
     )
 

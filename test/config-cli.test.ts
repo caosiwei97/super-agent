@@ -4,14 +4,11 @@ import { runCli } from '../src/cli/main.js'
 import { loadConfig } from '../src/core/config.js'
 
 describe('configuration', () => {
-  it('accepts zero retries and zero retained old tool results', () => {
-    const config = loadConfig({
-      AGENT_MAX_RETRIES: '0',
-      CONTEXT_KEEP_RECENT_TOOL_MESSAGES: '0',
-    })
+  it('keeps runtime policies out of environment configuration', () => {
+    const config = loadConfig({})
 
-    assert.equal(config.agent.maxRetries, 0)
-    assert.equal(config.compaction.keepRecentToolMessages, 0)
+    assert.deepEqual(config.agent, { budgetLimit: 1_000_000 })
+    assert.equal('compaction' in config, false)
   })
 
   it('configures GitHub MCP with only a personal access token', () => {

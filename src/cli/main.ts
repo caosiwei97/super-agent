@@ -49,9 +49,6 @@ export async function runCli(args: string[] = []) {
         summary: loaded.summary,
         budget: { used: loaded.budgetUsed, limit: config.agent.budgetLimit },
       },
-      compaction: config.compaction,
-      maxSteps: config.agent.maxSteps,
-      maxRetries: config.agent.maxRetries,
     }
 
     startRepl(runtime)
