@@ -26,7 +26,7 @@ function usage(totalInput = 3, totalOutput = 2) {
   }
 }
 
-/** Minimal AI SDK v3 model for deterministic agent-loop tests. */
+/** 用于确定性智能体循环测试的最小 AI SDK v3 模型。 */
 export function streamSequenceModel(steps: StreamStep[]) {
   let callCount = 0
 
@@ -69,8 +69,8 @@ export function streamSequenceModel(steps: StreamStep[]) {
       })
 
       return {
-        // The helper mirrors provider events at runtime; keeping the cast here
-        // avoids coupling tests to the transitive @ai-sdk/provider package.
+        // 此辅助函数模拟模型供应商的运行时事件；在这里保留类型断言，
+        // 可避免测试与间接依赖的 @ai-sdk/provider 包耦合。
         stream: new ReadableStream({
           start(controller) {
             for (const part of parts) controller.enqueue(part)
