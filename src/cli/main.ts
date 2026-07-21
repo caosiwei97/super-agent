@@ -13,7 +13,7 @@ const SESSION_ID = 'default'
 export async function runCli(args: string[] = []) {
   const unexpectedArgs = args.filter((arg) => arg !== '--')
   if (unexpectedArgs.length > 0) {
-    throw new Error('无需子命令或参数，直接运行 super-agent 即可')
+    throw new Error('无需子命令或参数，直接运行 ti 即可')
   }
 
   const config = loadConfig()

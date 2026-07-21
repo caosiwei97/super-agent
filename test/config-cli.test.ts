@@ -20,7 +20,7 @@ describe('configuration', () => {
 
 describe('CLI', () => {
   it('only accepts the argument-free interactive entry', async () => {
-    await assert.rejects(runCli(['chat']), /直接运行 super-agent/)
-    await assert.rejects(runCli(['--yes']), /直接运行 super-agent/)
+    await assert.rejects(runCli(['chat']), /直接运行 ti/)
+    await assert.rejects(runCli(['--yes']), /直接运行 ti/)
   })
 })

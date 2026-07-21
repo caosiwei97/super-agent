@@ -1,5 +1,5 @@
 {
-  "name": "super-agent",
+  "name": "ti-agent",
   "version": "1.0.0",
   "description": "A compact TypeScript Agent learning project",
   "private": true,
@@ -7,7 +7,7 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
-    "super-agent": "dist/bin/super-agent.js"
+    "ti": "dist/bin/ti.js"
   },
   "exports": {
     ".": {
@@ -21,7 +21,7 @@
     ".env-example"
   ],
   "scripts": {
-    "dev": "tsx src/bin/super-agent.ts",
+    "dev": "tsx src/bin/ti.ts",
     "clean": "node scripts/clean.mjs",
     "build": "pnpm clean && tsc --skipLibCheck",
     "build:watch": "pnpm clean && tsc --watch --skipLibCheck --preserveWatchOutput",
