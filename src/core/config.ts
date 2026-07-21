@@ -21,7 +21,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     agent: {
       budgetLimit: positiveInteger(env, 'TOKEN_BUDGET', 1_000_000),
     },
-    workspaceRoot: resolve(env.SUPER_AGENT_WORKSPACE || process.cwd()),
+    workspaceRoot: resolve(env.TI_AGENT_WORKSPACE || process.cwd()),
     githubMcp: {
       token: env.GITHUB_PERSONAL_ACCESS_TOKEN,
     },
