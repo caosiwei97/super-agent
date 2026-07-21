@@ -22,9 +22,6 @@
   ],
   "scripts": {
     "dev": "tsx src/bin/super-agent.ts",
-    "cli": "tsx src/bin/super-agent.ts",
-    "debug": "node --inspect-brk --import tsx src/bin/super-agent.ts",
-    "start": "tsx src/bin/super-agent.ts",
     "clean": "node scripts/clean.mjs",
     "build": "pnpm clean && tsc --skipLibCheck",
     "build:watch": "pnpm clean && tsc --watch --skipLibCheck --preserveWatchOutput",

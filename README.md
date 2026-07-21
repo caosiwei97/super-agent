@@ -263,7 +263,7 @@ pnpm check
 pnpm build
 ```
 
-`pnpm check` 会先做类型检查，再运行测试。源码调试使用 `pnpm debug`，然后从 IDE 或 `chrome://inspect` 连接 Node Inspector。
+`pnpm check` 会先做类型检查，再运行测试。
 
 ## 安全边界
 
