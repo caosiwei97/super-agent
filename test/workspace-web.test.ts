@@ -12,7 +12,7 @@ import {
 
 describe('Workspace', () => {
   it('blocks lexical traversal and symlink escapes for reads and writes', async (context) => {
-    const parent = await mkdtemp(join(tmpdir(), 'super-agent-workspace-'))
+    const parent = await mkdtemp(join(tmpdir(), 'ti-agent-workspace-'))
     context.after(() => rm(parent, { recursive: true, force: true }))
     const root = join(parent, 'root')
     const outside = join(parent, 'outside')

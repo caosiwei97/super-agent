@@ -8,7 +8,7 @@ import { SessionStore } from '../src/session/store.js'
 
 describe('SessionStore', () => {
   it('restores the latest checkpoint plus raw tail and budget snapshot', async (context) => {
-    const directory = await mkdtemp(join(tmpdir(), 'super-agent-session-'))
+    const directory = await mkdtemp(join(tmpdir(), 'ti-agent-session-'))
     context.after(() => rm(directory, { recursive: true, force: true }))
     const warnings: string[] = []
     const store = new SessionStore('recoverable', {
@@ -45,7 +45,7 @@ describe('SessionStore', () => {
   })
 
   it('uses the newest checkpoint as the recovery base', async (context) => {
-    const directory = await mkdtemp(join(tmpdir(), 'super-agent-session-'))
+    const directory = await mkdtemp(join(tmpdir(), 'ti-agent-session-'))
     context.after(() => rm(directory, { recursive: true, force: true }))
     const store = new SessionStore('checkpoints', { directory })
 
@@ -72,7 +72,7 @@ describe('SessionStore', () => {
   })
 
   it('continues to read legacy per-message and budget events', async (context) => {
-    const directory = await mkdtemp(join(tmpdir(), 'super-agent-session-'))
+    const directory = await mkdtemp(join(tmpdir(), 'ti-agent-session-'))
     context.after(() => rm(directory, { recursive: true, force: true }))
     const store = new SessionStore('legacy', { directory })
     const timestamp = new Date().toISOString()

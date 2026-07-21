@@ -33,7 +33,7 @@ function olderTurns() {
 }
 
 async function createStore(context: TestContext) {
-  const directory = await mkdtemp(join(tmpdir(), 'super-agent-runner-'))
+  const directory = await mkdtemp(join(tmpdir(), 'ti-agent-runner-'))
   context.after(() => rm(directory, { recursive: true, force: true }))
   return { directory, store: new SessionStore('runner', { directory }) }
 }
