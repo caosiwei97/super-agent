@@ -25,7 +25,7 @@ export class MCPClient {
     // 先用临时变量持有客户端，连接成功后再赋给 `this.client`。
     // 这样连接抛错时 `this.client` 保持 null，不会出现“已赋值但未连上”的中间状态。
     const client = new Client(
-      { name: 'super-agent', version: '1.0.0' },
+      { name: 'ti-agent', version: '1.0.0' },
       { capabilities: {} },
     )
 

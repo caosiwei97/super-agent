@@ -181,7 +181,7 @@ export function createWebTools(dependencies: WebToolDependencies = {}) {
           let current = await validatePublicUrl(url, lookup)
           for (let redirects = 0; ; redirects++) {
             const response = await fetchImpl(current, {
-              headers: { 'User-Agent': 'Mozilla/5.0 SuperAgent' },
+              headers: { 'User-Agent': 'Mozilla/5.0 ti-agent' },
               redirect: 'manual',
               signal: AbortSignal.timeout(10_000),
             })

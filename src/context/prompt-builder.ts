@@ -77,7 +77,7 @@ export class PromptBuilder {
 // ── 预定义管道 ───────────────────────────────────
 
 export function coreRules() {
-  return (() => `你是 Super Agent，一个有工具调用能力的 AI 助手。
+  return (() => `你是 ti-agent，一个有工具调用能力的 AI 助手。
 你的行为准则：
 - 先读文件再修改，不要凭记忆编辑
 - 不要加没被要求的功能
