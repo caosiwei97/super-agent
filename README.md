@@ -1,6 +1,6 @@
-# Super-Agent
+# ti-agent
 
-运行 `super-agent`，终端就会出现聊天提示符。它是一个 TypeScript Agent Demo，代码重点只有四件事：模型如何连续调用工具、危险操作如何审批、上下文如何缩短、会话如何恢复。
+运行 `ti`，终端就会出现聊天提示符。`ti-agent` 是一个 TypeScript Agent Demo，代码重点只有四件事：模型如何连续调用工具、危险操作如何审批、上下文如何缩短、会话如何恢复。
 
 ## 跑起来
 
@@ -21,7 +21,7 @@ PowerShell 复制配置文件时，把第二行换成 `Copy-Item .env-example .e
 ```bash
 pnpm build
 pnpm link --global
-super-agent
+ti
 ```
 
 CLI 不需要任何参数。进入聊天后：
@@ -35,7 +35,7 @@ CLI 不需要任何参数。进入聊天后：
 
 ```mermaid
 flowchart TD
-    Start["执行 super-agent"] --> Args{"传入了业务参数？"}
+    Start["执行 ti"] --> Args{"传入了业务参数？"}
     Args -->|是| Reject["提示直接运行并退出"]
     Args -->|否| Config["读取 .env 与默认配置"]
     Config --> Builtin["注册内置工具"]
@@ -209,7 +209,7 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    Bin["bin/super-agent.ts\n进程入口"] --> Main["cli/main.ts\n装配依赖"]
+    Bin["bin/ti.ts\n进程入口"] --> Main["cli/main.ts\n装配依赖"]
     Main --> Repl["cli/repl.ts\n输入与审批"]
     Main --> Registry["core/tool-registry.ts\n工具目录与执行锁"]
     Main --> Store["session/store.ts\nJSONL 会话"]
@@ -248,7 +248,7 @@ flowchart LR
 | `OPENAI_API_KEY` | 无 | 模型服务密钥 |
 | `MODEL_BASE_URL` | `https://api.deepseek.com` | OpenAI-compatible 接口地址 |
 | `MODEL_ID` | `deepseek-v4-flash` | 模型名称 |
-| `SUPER_AGENT_WORKSPACE` | 当前目录 | 文件、Shell 和预览工具的根目录 |
+| `TI_AGENT_WORKSPACE` | 当前目录 | 文件、Shell 和预览工具的根目录 |
 | `GITHUB_PERSONAL_ACCESS_TOKEN` | 无 | 配置后接入 GitHub MCP |
 | `TOKEN_BUDGET` | `1000000` | 当前 session 的累计 token 上限 |
 
@@ -267,7 +267,7 @@ pnpm build
 
 ## 安全边界
 
-- 文件工具只能访问 `SUPER_AGENT_WORKSPACE`，并检查路径和符号链接是否越界。
+- 文件工具只能访问 `TI_AGENT_WORKSPACE`，并检查路径和符号链接是否越界。
 - `fetch_url` 只接受公网 HTTP(S) 地址，会拦截本地、私网、异常端口、超大响应和过多重定向。
 - `bash` 虽然需要审批，但获批后拥有当前 Node 进程的系统权限；审批不是沙箱。
 - 工具输出、文件大小、搜索范围和 Shell 运行时间都有上限，目的是避免 Demo 失控。
