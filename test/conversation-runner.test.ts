@@ -40,7 +40,7 @@ async function createStore(context: TestContext) {
 
 async function commitAssistant(options: AgentLoopOptions, content: string, tokenCost: number) {
   const message: ModelMessage = { role: 'assistant', content }
-  options.budget.used += tokenCost
+  options.tokenCost.used += tokenCost
   await options.onMessages?.([message])
   options.messages.push(message)
 }
@@ -51,7 +51,7 @@ describe('ConversationRunner', () => {
     const state: ConversationState = {
       messages: [],
       summary: '',
-      budget: { used: 0, limit: 1_000 },
+      tokenCost: { used: 0, limit: 1_000 },
     }
     await store.appendCheckpoint({ messages: [], summary: '', budgetUsed: 0 })
     let signalStarted!: () => void
@@ -83,7 +83,7 @@ describe('ConversationRunner', () => {
     const state: ConversationState = {
       messages: olderTurns(),
       summary: '',
-      budget: { used: 0, limit: 1_000 },
+      tokenCost: { used: 0, limit: 1_000 },
     }
     await store.appendCheckpoint({ messages: state.messages, summary: '', budgetUsed: 0 })
     const phases: Array<[CompactionPhase, ContextCompactionResult]> = []
@@ -108,14 +108,15 @@ describe('ConversationRunner', () => {
     assert.equal(phases.find(([phase]) => phase === 'before-turn')?.[1].compressedCount, 0)
     assert.ok((phases.find(([phase]) => phase === 'after-turn')?.[1].compressedCount ?? 0) > 0)
     assert.equal(state.summary, 'older turns completed')
-    assert.equal(state.budget.used, 20)
+    assert.equal(state.tokenCost.used, 20)
     assert.equal(state.messages[0].role, 'assistant')
 
     const restored = await store.loadState()
     assert.deepEqual(restored, {
       messages: state.messages,
+      messageTimestamps: state.messageTimestamps,
       summary: state.summary,
-      budgetUsed: state.budget.used,
+      budgetUsed: state.tokenCost.used,
     })
     const rawLog = await readFile(join(directory, 'runner.jsonl'), 'utf-8')
     assert.ok(rawLog.includes(largeAnswer), 'raw assistant output should remain in the audit log')
@@ -126,7 +127,7 @@ describe('ConversationRunner', () => {
     const state: ConversationState = {
       messages: olderTurns(),
       summary: '',
-      budget: { used: 0, limit: 1_000 },
+      tokenCost: { used: 0, limit: 1_000 },
     }
     await store.appendCheckpoint({ messages: state.messages, summary: '', budgetUsed: 0 })
     const phases: Array<[CompactionPhase, ContextCompactionResult]> = []
@@ -155,12 +156,12 @@ describe('ConversationRunner', () => {
     assert.equal((await store.loadState()).summary, 'between-step summary')
   })
 
-  it('still microcompacts but skips paid summarization once budget is exhausted', async (context) => {
+  it('still microcompacts but skips paid summarization once cost budget is exhausted', async (context) => {
     const { store } = await createStore(context)
     const state: ConversationState = {
       messages: olderTurns(),
       summary: '',
-      budget: { used: 0, limit: 5 },
+      tokenCost: { used: 0, limit: 5 },
     }
     await store.appendCheckpoint({ messages: state.messages, summary: '', budgetUsed: 0 })
     let summaryCalls = 0
@@ -172,7 +173,7 @@ describe('ConversationRunner', () => {
       compaction: COMPACTION,
       runAgentLoop: async (options) => {
         await commitAssistant(options, `large-${'q'.repeat(1_000)}`, 5)
-        return { steps: 1, stopReason: 'budget' }
+        return { steps: 1, stopReason: 'cost_exhausted' }
       },
     })
 

@@ -13,12 +13,12 @@ import {
   type ToolRuntimeHooks,
 } from '../core/tool-registry.js'
 
-export interface BudgetState {
+export interface TokenCostState {
   used: number
   limit: number
 }
 
-export type AgentStopReason = 'completed' | 'budget' | 'loop_detected' | 'max_steps'
+export type AgentStopReason = 'completed' | 'cost_exhausted' | 'loop_detected' | 'max_steps'
 
 export interface AgentLoopResult {
   steps: number
@@ -34,7 +34,7 @@ export interface AgentLoopObserver {
   onStreamError?: (event: { error: unknown }) => void
   onAttemptError?: (event: { attempt: number; error: unknown }) => void
   onRetry?: (event: { attempt: number; maxRetries: number; delayMs: number }) => void
-  onBudget?: (event: { used: number; limit: number }) => void
+  onTokenCost?: (event: { used: number; limit: number }) => void
   onContinue?: (event: { nextStep: number }) => void
   onStop?: (result: AgentLoopResult) => void
 }
@@ -46,10 +46,12 @@ export interface AgentLoopOptions {
   registry: ToolRegistry
   messages: ModelMessage[]
   buildSystem: () => string
-  budget: BudgetState
+  tokenCost: TokenCostState
   approveTool?: ToolApprovalHandler
   observer?: AgentLoopObserver
   beforeStep?: (step: number) => Promise<void>
+  /** 每次成功模型请求返回的精确 prompt token，用于校准上下文估算。 */
+  onInputTokens?: (inputTokens: number) => void
   onMessages?: (messages: ModelMessage[]) => Promise<void>
   maxSteps?: number
   maxRetries?: number
@@ -91,7 +93,7 @@ function deniedToolResult(call: GuardedCall, reason: string) {
 }
 
 /**
- * 运行一轮智能体，对重试、预算、审批和循环进行保护。
+ * 运行一轮智能体，对重试、成本预算、审批和循环进行保护。
  *
  * 每个成功步骤的消息都会立即通过 `onMessages` 持久化；
  * 调用方可以在步骤之间压缩工作上下文，同时保留原始审计记录。
@@ -102,10 +104,11 @@ export async function agentLoop(options: AgentLoopOptions) {
     registry,
     messages,
     buildSystem,
-    budget,
+    tokenCost,
     approveTool = async () => false,
     observer = {},
     beforeStep,
+    onInputTokens,
     onMessages,
     maxSteps = DEFAULT_MAX_STEPS,
     maxRetries = DEFAULT_MAX_RETRIES,
@@ -118,12 +121,12 @@ export async function agentLoop(options: AgentLoopOptions) {
     throw new Error(`maxRetries 必须是非负整数，当前值: ${maxRetries}`)
   }
   if (
-    !Number.isFinite(budget.used) ||
-    !Number.isFinite(budget.limit) ||
-    budget.used < 0 ||
-    budget.limit <= 0
+    !Number.isFinite(tokenCost.used) ||
+    !Number.isFinite(tokenCost.limit) ||
+    tokenCost.used < 0 ||
+    tokenCost.limit <= 0
   ) {
-    throw new Error(`非法 Token 预算: ${budget.used}/${budget.limit}`)
+    throw new Error(`非法 token 成本: ${tokenCost.used}/${tokenCost.limit}`)
   }
 
   const stop = (result: AgentLoopResult) => {
@@ -131,8 +134,8 @@ export async function agentLoop(options: AgentLoopOptions) {
     return result
   }
 
-  if (budget.used >= budget.limit) {
-    return stop({ steps: 0, stopReason: 'budget' })
+  if (tokenCost.used >= tokenCost.limit) {
+    return stop({ steps: 0, stopReason: 'cost_exhausted' })
   }
 
   const detector = new LoopDetector()
@@ -160,8 +163,8 @@ export async function agentLoop(options: AgentLoopOptions) {
 
   for (let step = 1; step <= maxSteps; step++) {
     await beforeStep?.(step)
-    if (budget.used >= budget.limit) {
-      return stop({ steps: step - 1, stopReason: 'budget' })
+    if (tokenCost.used >= tokenCost.limit) {
+      return stop({ steps: step - 1, stopReason: 'cost_exhausted' })
     }
 
     notify(() => observer.onStepStart?.({ step }))
@@ -230,7 +233,10 @@ export async function agentLoop(options: AgentLoopOptions) {
       }
     }
 
-    budget.used += usageTokens(stepUsage)
+    tokenCost.used += usageTokens(stepUsage)
+    if (typeof stepUsage?.inputTokens === 'number') {
+      onInputTokens?.(stepUsage.inputTokens)
+    }
     const committedMessages = [...responseMessages]
     let criticalLoopDetected = false
 
@@ -297,13 +303,13 @@ export async function agentLoop(options: AgentLoopOptions) {
     await onMessages?.(committedMessages)
     messages.push(...committedMessages)
 
-    notify(() => observer.onBudget?.({ used: budget.used, limit: budget.limit }))
+    notify(() => observer.onTokenCost?.({ used: tokenCost.used, limit: tokenCost.limit }))
 
     if (criticalLoopDetected) {
       return stop({ steps: step, stopReason: 'loop_detected' })
     }
-    if (budget.used >= budget.limit) {
-      return stop({ steps: step, stopReason: 'budget' })
+    if (tokenCost.used >= tokenCost.limit) {
+      return stop({ steps: step, stopReason: 'cost_exhausted' })
     }
     if (!hasToolCall) {
       return stop({ steps: step, stopReason: 'completed' })

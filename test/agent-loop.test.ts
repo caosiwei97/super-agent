@@ -50,17 +50,20 @@ describe('agentLoop', () => {
       { type: 'text', text: 'done' },
     ])
     const messages: ModelMessage[] = [{ role: 'user', content: 'run both' }]
+    const inputTokenCounts: number[] = []
 
     const result = await agentLoop({
       model,
       registry,
       messages,
       buildSystem: () => 'test',
-      budget: { used: 0, limit: 1_000 },
+      tokenCost: { used: 0, limit: 1_000 },
+      onInputTokens: (tokens) => inputTokenCounts.push(tokens),
       maxRetries: 0,
     })
 
     assert.deepEqual(result, { steps: 2, stopReason: 'completed' })
+    assert.deepEqual(inputTokenCounts, [3, 3])
     const byId = new Map(toolResults(messages).map((part) => [part.toolCallId, part.output]))
     assert.deepEqual(byId.get('call-a'), { type: 'text', value: 'A:one' })
     assert.deepEqual(byId.get('call-b'), { type: 'text', value: 'B:two' })
@@ -89,7 +92,7 @@ describe('agentLoop', () => {
       registry,
       messages,
       buildSystem: () => 'test',
-      budget: { used: 0, limit: 1_000 },
+      tokenCost: { used: 0, limit: 1_000 },
       approveTool: async (invocation) => {
         approvals.push(invocation.toolCallId)
         return true

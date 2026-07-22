@@ -25,6 +25,7 @@ describe('SessionStore', () => {
     const restored = await store.loadState()
 
     assert.deepEqual(restored.messages, [...compacted, ...tail])
+    assert.equal(restored.messageTimestamps.length, restored.messages.length)
     assert.equal(restored.summary, 'summary-v1')
     assert.equal(restored.budgetUsed, 17)
     assert.equal(warnings.length, 1)
@@ -52,16 +53,20 @@ describe('SessionStore', () => {
     await store.appendMessages([{ role: 'user', content: 'superseded raw message' }], 3)
     await store.appendCheckpoint({
       messages: [{ role: 'assistant', content: 'new compact context' }],
+      messageTimestamps: [123],
       summary: 'latest',
       budgetUsed: 5,
     })
     await store.appendMessages([{ role: 'user', content: 'tail' }], 8)
 
-    assert.deepEqual(await store.loadState(), {
-      messages: [
-        { role: 'assistant', content: 'new compact context' },
-        { role: 'user', content: 'tail' },
-      ],
+    const restored = await store.loadState()
+    assert.deepEqual(restored.messages, [
+      { role: 'assistant', content: 'new compact context' },
+      { role: 'user', content: 'tail' },
+    ])
+    assert.equal(restored.messageTimestamps.length, 2)
+    assert.equal(restored.messageTimestamps[0], 123)
+    assert.deepEqual({ summary: restored.summary, budgetUsed: restored.budgetUsed }, {
       summary: 'latest',
       budgetUsed: 8,
     })
@@ -91,6 +96,7 @@ describe('SessionStore', () => {
 
     assert.deepEqual(await store.loadState(), {
       messages: [{ role: 'user', content: 'legacy message' }],
+      messageTimestamps: [Date.parse(timestamp)],
       summary: '',
       budgetUsed: 9,
     })

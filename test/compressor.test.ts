@@ -97,6 +97,28 @@ describe('microcompact', () => {
     const secondPass = microcompact(result.messages, TEST_OPTIONS)
     assert.equal(secondPass.cleared, 0)
   })
+
+  it('preserves failed tool results as reusable error experience', () => {
+    const failed: ModelMessage = {
+      role: 'tool',
+      content: [{
+        type: 'tool-result',
+        toolCallId: 'call-failed',
+        toolName: 'read_file',
+        output: { type: 'error-text', value: 'file does not exist' },
+      }],
+    }
+    const result = microcompact([
+      failed,
+      toolMessage(1),
+      toolMessage(2),
+    ], { ...TEST_OPTIONS, keepRecentToolMessages: 1 })
+
+    assert.equal(result.cleared, 1)
+    const failedPart = result.messages[0].role === 'tool' && result.messages[0].content[0]
+    assert.ok(failedPart && failedPart.type === 'tool-result')
+    assert.deepEqual(failedPart.output, { type: 'error-text', value: 'file does not exist' })
+  })
 })
 
 describe('summarize', () => {
@@ -150,6 +172,26 @@ describe('summarize', () => {
 })
 
 describe('compactContext', () => {
+  it('runs zero-cost TTL defense without calling the summary model', async () => {
+    const prompts: string[] = []
+    const model = summaryModel(['unused'], prompts)
+    const messages = [toolMessage(0)]
+
+    const result = await compactContext(
+      model,
+      messages,
+      '',
+      { ...TEST_OPTIONS, tokenThreshold: 10_000 },
+      { now: 11 * 60_000 },
+      [0],
+    )
+
+    assert.equal(result.hardPruned, 1)
+    assert.equal(result.compressedCount, 0)
+    assert.equal(prompts.length, 0)
+    assert.equal(textToolOutput(result.messages[0]), '[tool result expired: read_file]')
+  })
+
   it('reports both layer results for lifecycle logging', async () => {
     const prompts: string[] = []
     const model = summaryModel(['combined-summary'], prompts)

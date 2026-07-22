@@ -5,7 +5,7 @@ export type {
   AgentLoopResult,
   AgentLoopObserver,
   AgentStopReason,
-  BudgetState,
+  TokenCostState,
   ToolApprovalHandler,
 } from './agent/agent-loop.js'
 export { ConversationRunner } from './agent/conversation-runner.js'
@@ -25,6 +25,18 @@ export type {
   CompactionResult,
   ContextCompactionResult,
 } from './context/compressor.js'
+export {
+  applyContextDefense,
+  DEFAULT_CONTEXT_DEFENSE_OPTIONS,
+  estimateTextTokens,
+  TokenTracker,
+  truncateToolResults,
+  ttlPrune,
+} from './context/defense.js'
+export type {
+  ContextDefenseOptions,
+  ContextDefenseResult,
+} from './context/defense.js'
 export { ToolRegistry } from './core/tool-registry.js'
 export type {
   MCPToolClient,
@@ -39,6 +51,7 @@ export { loadConfig } from './core/config.js'
 export { SessionStore } from './session/store.js'
 export type {
   SessionEntry,
+  SessionCheckpointState,
   SessionState,
   SessionStoreOptions,
   SessionWriter,

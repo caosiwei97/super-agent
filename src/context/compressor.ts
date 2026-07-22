@@ -4,10 +4,20 @@ import {
   type ModelMessage,
   type ToolResultPart,
 } from 'ai'
+import {
+  applyContextDefense,
+  DEFAULT_CONTEXT_DEFENSE_OPTIONS,
+  estimateTokens,
+  isFailureToolResult,
+  resolveDefenseOptions,
+  type ContextDefenseOptions,
+} from './defense.js'
+
+export { estimateTokens } from './defense.js'
 
 const CLEARED_TOOL_RESULT = '[tool result cleared]'
 
-export interface CompactionOptions {
+export interface CompactionOptions extends Partial<Omit<ContextDefenseOptions, 'asciiCharsPerToken'>> {
   tokenThreshold: number
   keepRecentMessages: number
   keepRecentToolMessages: number
@@ -15,16 +25,20 @@ export interface CompactionOptions {
   maxSummaryChars: number
 }
 
-export const DEFAULT_COMPACTION_OPTIONS: CompactionOptions = {
+export const DEFAULT_COMPACTION_OPTIONS: CompactionOptions & ContextDefenseOptions = {
+  ...DEFAULT_CONTEXT_DEFENSE_OPTIONS,
   tokenThreshold: 12_000,
   keepRecentMessages: 8,
   keepRecentToolMessages: 4,
-  asciiCharsPerToken: 4,
   maxSummaryChars: 1_200,
 }
 
 function resolveOptions(options: Partial<CompactionOptions>) {
-  const resolved = { ...DEFAULT_COMPACTION_OPTIONS, ...options }
+  const resolved = {
+    ...DEFAULT_COMPACTION_OPTIONS,
+    ...resolveDefenseOptions(options),
+    ...options,
+  }
   const positiveIntegers: Array<keyof CompactionOptions> = [
     'tokenThreshold',
     'keepRecentMessages',
@@ -38,9 +52,6 @@ function resolveOptions(options: Partial<CompactionOptions>) {
   if (!Number.isSafeInteger(resolved.keepRecentToolMessages) || resolved.keepRecentToolMessages < 0) {
     throw new Error('CompactionOptions.keepRecentToolMessages 必须是非负整数')
   }
-  if (!Number.isFinite(resolved.asciiCharsPerToken) || resolved.asciiCharsPerToken <= 0) {
-    throw new Error('CompactionOptions.asciiCharsPerToken 必须是正数')
-  }
   return resolved
 }
 
@@ -52,37 +63,7 @@ function stringify(value: unknown) {
   }
 }
 
-const WIDE_CHAR = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u
-
-function estimateTextTokens(text: string, asciiCharsPerToken: number) {
-  let wideChars = 0
-  let otherChars = 0
-
-  for (const character of text) {
-    if (WIDE_CHAR.test(character)) wideChars++
-    else otherChars++
-  }
-
-  return wideChars + Math.ceil(otherChars / asciiCharsPerToken)
-}
-
-/** 针对中日韩文字与 ASCII 混合内容的保守估算；可按模型供应商调整。 */
-export function estimateTokens(
-  messages: ModelMessage[],
-  options: Partial<CompactionOptions> = {},
-) {
-  const { asciiCharsPerToken } = resolveOptions(options)
-  let tokens = 0
-
-  for (const message of messages) {
-    const content = typeof message.content === 'string' ? message.content : stringify(message.content)
-    tokens += estimateTextTokens(content, asciiCharsPerToken)
-  }
-
-  return tokens
-}
-
-// ── 第一层：微压缩 ──────────────────────────────────
+// ── 即时防线后的兜底微压缩 ───────────────────────────
 
 const CLEARABLE_TOOLS = new Set([
   'read_file',
@@ -120,7 +101,8 @@ export function microcompact(
         if (
           part.type !== 'tool-result' ||
           !CLEARABLE_TOOLS.has(part.toolName) ||
-          isClearedToolResult(part)
+          isClearedToolResult(part) ||
+          isFailureToolResult(part)
         ) {
           return part
         }
@@ -178,6 +160,11 @@ export interface CompactionResult {
 }
 
 export interface ContextCompactionResult extends CompactionResult {
+  messageTimestamps: number[]
+  truncated: number
+  compacted: number
+  softPruned: number
+  hardPruned: number
   cleared: number
   beforeTokens: number
   afterTokens: number
@@ -185,6 +172,8 @@ export interface ContextCompactionResult extends CompactionResult {
 
 export interface CompactionRuntimePolicy {
   allowSummary?: boolean
+  estimatedTokens?: number
+  now?: number
 }
 
 function stripEmbeddedSummary(messages: ModelMessage[], existingSummary: string) {
@@ -347,18 +336,45 @@ export async function summarize(
   }
 }
 
-/** 依次运行两层压缩，并返回记录生命周期日志所需的完整元数据。 */
+function remapTimestamps(
+  sourceMessages: ModelMessage[],
+  sourceTimestamps: readonly number[],
+  targetMessages: ModelMessage[],
+  now: number,
+) {
+  const timestampsByMessage = new Map<ModelMessage, number>()
+  sourceMessages.forEach((message, index) => {
+    timestampsByMessage.set(message, sourceTimestamps[index] ?? now)
+  })
+  return targetMessages.map((message) => timestampsByMessage.get(message) ?? now)
+}
+
+/** 依次运行即时防线、微压缩和摘要，并返回完整的生命周期元数据。 */
 export async function compactContext(
   model: LanguageModel,
   messages: ModelMessage[],
   existingSummary = '',
   options: Partial<CompactionOptions> = {},
   policy: CompactionRuntimePolicy = {},
+  messageTimestamps: readonly number[] = [],
 ) {
   const resolvedOptions = resolveOptions(options)
-  const beforeTokens = estimateTokens(messages, resolvedOptions)
-  const microcompactResult = microcompact(messages, resolvedOptions)
-  const summaryResult = policy.allowSummary === false
+  const now = policy.now ?? Date.now()
+  const defenseResult = applyContextDefense(
+    messages,
+    messageTimestamps,
+    resolvedOptions,
+    { now, estimatedTokens: policy.estimatedTokens },
+  )
+  const shouldCompact = defenseResult.afterTokens >= resolvedOptions.tokenThreshold
+  const microcompactResult = shouldCompact
+    ? microcompact(defenseResult.messages, resolvedOptions)
+    : { messages: defenseResult.messages, cleared: 0 }
+  const microcompactSavings = estimateTokens(defenseResult.messages, resolvedOptions) -
+    estimateTokens(microcompactResult.messages, resolvedOptions)
+  const afterMicrocompactTokens = Math.max(0, defenseResult.afterTokens - microcompactSavings)
+  const summaryResult = policy.allowSummary === false ||
+    afterMicrocompactTokens < resolvedOptions.tokenThreshold
     ? {
         messages: microcompactResult.messages,
         summary: existingSummary,
@@ -372,10 +388,24 @@ export async function compactContext(
         resolvedOptions,
       )
 
+  const summarySavings = estimateTokens(microcompactResult.messages, resolvedOptions) -
+    estimateTokens(summaryResult.messages, resolvedOptions)
+  const timestampsAfterSummary = remapTimestamps(
+    microcompactResult.messages,
+    defenseResult.messageTimestamps,
+    summaryResult.messages,
+    now,
+  )
+
   return {
     ...summaryResult,
+    messageTimestamps: timestampsAfterSummary,
+    truncated: defenseResult.truncated,
+    compacted: defenseResult.compacted,
+    softPruned: defenseResult.softPruned,
+    hardPruned: defenseResult.hardPruned,
     cleared: microcompactResult.cleared,
-    beforeTokens,
-    afterTokens: estimateTokens(summaryResult.messages, resolvedOptions),
+    beforeTokens: defenseResult.beforeTokens,
+    afterTokens: Math.max(0, afterMicrocompactTokens - summarySavings),
   }
 }

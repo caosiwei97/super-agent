@@ -19,7 +19,14 @@ export interface CliRuntimeDeps {
 
 function printCompaction(phase: CompactionPhase, result: ContextCompactionResult) {
   if (result.error) console.warn(`[Compaction] LLM 摘要失败: ${result.error}`)
-  if (result.cleared === 0 && result.compressedCount === 0) return
+  if (
+    result.truncated === 0 &&
+    result.compacted === 0 &&
+    result.softPruned === 0 &&
+    result.hardPruned === 0 &&
+    result.cleared === 0 &&
+    result.compressedCount === 0
+  ) return
 
   const phaseLabel: Record<CompactionPhase, string> = {
     'before-turn': '发送前',
@@ -27,6 +34,10 @@ function printCompaction(phase: CompactionPhase, result: ContextCompactionResult
     'after-turn': 'Agent Loop 后',
   }
   const actions: string[] = []
+  if (result.truncated > 0) actions.push(`截断 ${result.truncated} 个超长工具结果`)
+  if (result.compacted > 0) actions.push(`预算清理 ${result.compacted} 个工具结果`)
+  if (result.softPruned > 0) actions.push(`软修剪 ${result.softPruned} 个过期结果`)
+  if (result.hardPruned > 0) actions.push(`硬清除 ${result.hardPruned} 个过期结果`)
   if (result.cleared > 0) actions.push(`清理 ${result.cleared} 个旧工具结果`)
   if (result.compressedCount > 0) actions.push(`摘要 ${result.compressedCount} 条消息`)
   const saved = Math.max(0, result.beforeTokens - result.afterTokens)
@@ -74,14 +85,14 @@ function createConsoleObserver() {
     onRetry: ({ attempt, maxRetries, delayMs }) => {
       console.log(`  [重试] 第 ${attempt}/${maxRetries} 次失败，${delayMs}ms 后重试...`)
     },
-    onBudget: ({ used, limit }) => {
+    onTokenCost: ({ used, limit }) => {
       const percentage = Math.round((used / limit) * 100)
       console.log(`  [Token] ${used}/${limit} (${percentage}%)`)
     },
     onContinue: () => console.log('  → 继续下一步...'),
     onStop: ({ stopReason }) => {
       const messages: Partial<Record<typeof stopReason, string>> = {
-        budget: '\n[Token 预算耗尽，Agent 已停止]',
+        cost_exhausted: '\n[Token 成本预算耗尽，Agent 已停止]',
         loop_detected: '\n[循环检测触发，Agent 已停止]',
         max_steps: '\n[达到最大步数限制，Agent 已停止]',
       }

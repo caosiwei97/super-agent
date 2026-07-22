@@ -11,7 +11,10 @@ interface EntryBase {
   timestamp: string
 }
 
-/** 当前的原子事件：步骤消息及其累计预算共用一条 JSONL 记录。 */
+// 注意：磁盘 JSONL 字段 budgetUsed 与判别符 type:'budget' 是历史字段名，
+// 保留原名以兼容已有 .sessions/*.jsonl；仅内部 TS 标识已从 budget 重命名为 cost。
+
+/** 当前的原子事件：步骤消息及其累计成本预算共用一条 JSONL 记录。 */
 export interface MessagesEntry extends EntryBase {
   type: 'messages'
   messages: ModelMessage[]
@@ -24,7 +27,8 @@ export interface MessageEntry extends EntryBase {
   message: ModelMessage
 }
 
-export interface BudgetEntry extends EntryBase {
+/** 历史独立成本事件；磁盘判别符仍为 'budget' 以兼容旧文件。 */
+export interface CostEntry extends EntryBase {
   type: 'budget'
   budgetUsed: number
 }
@@ -32,22 +36,29 @@ export interface BudgetEntry extends EntryBase {
 export interface CheckpointEntry extends EntryBase {
   type: 'checkpoint'
   messages: ModelMessage[]
+  /** 与 messages 按索引对齐；旧 checkpoint 可能没有该字段。 */
+  messageTimestamps?: number[]
   summary: string
   budgetUsed: number
 }
 
-export type SessionEntry = MessagesEntry | MessageEntry | BudgetEntry | CheckpointEntry
+export type SessionEntry = MessagesEntry | MessageEntry | CostEntry | CheckpointEntry
 
 export interface SessionState {
   messages: ModelMessage[]
+  messageTimestamps: number[]
   summary: string
   budgetUsed: number
+}
+
+export type SessionCheckpointState = Omit<SessionState, 'messageTimestamps'> & {
+  messageTimestamps?: number[]
 }
 
 export interface SessionWriter {
   getSessionId(): string
   appendMessages(messages: ModelMessage[], budgetUsed?: number): Promise<void>
-  appendCheckpoint(state: SessionState): Promise<void>
+  appendCheckpoint(state: SessionCheckpointState): Promise<void>
 }
 
 export interface SessionStoreOptions {
@@ -63,10 +74,11 @@ function validateSessionId(sessionId: string) {
 
 function emptyState() {
   const messages: ModelMessage[] = []
-  return { messages, summary: '', budgetUsed: 0 }
+  const messageTimestamps: number[] = []
+  return { messages, messageTimestamps, summary: '', budgetUsed: 0 }
 }
 
-function assertBudget(budgetUsed: number) {
+function assertCostUsed(budgetUsed: number) {
   if (!Number.isFinite(budgetUsed) || budgetUsed < 0) {
     throw new Error(`非法 budgetUsed: ${budgetUsed}`)
   }
@@ -78,6 +90,22 @@ function assertMessages(messages: ModelMessage[]) {
       throw new Error('拒绝写入结构无效的 ModelMessage')
     }
   }
+}
+
+function assertMessageTimestamps(messages: ModelMessage[], timestamps: number[]) {
+  if (
+    timestamps.length !== messages.length ||
+    timestamps.some((timestamp) => !Number.isFinite(timestamp) || timestamp < 0)
+  ) {
+    throw new Error('messageTimestamps 必须与 messages 等长且包含有效时间戳')
+  }
+}
+
+function parseEntryTimestamp(timestamp: unknown) {
+  if (typeof timestamp !== 'string') throw new Error('timestamp 无效')
+  const parsed = Date.parse(timestamp)
+  if (!Number.isFinite(parsed)) throw new Error('timestamp 无效')
+  return parsed
 }
 
 /**
@@ -112,7 +140,7 @@ export class SessionStore implements SessionWriter {
   async appendMessages(messages: ModelMessage[], budgetUsed?: number) {
     if (messages.length === 0) return
     assertMessages(messages)
-    if (budgetUsed !== undefined) assertBudget(budgetUsed)
+    if (budgetUsed !== undefined) assertCostUsed(budgetUsed)
 
     await this.appendEntries([
       {
@@ -124,14 +152,19 @@ export class SessionStore implements SessionWriter {
     ])
   }
 
-  async appendCheckpoint(state: SessionState) {
+  async appendCheckpoint(state: SessionCheckpointState) {
     assertMessages(state.messages)
-    assertBudget(state.budgetUsed)
+    assertCostUsed(state.budgetUsed)
+    const timestamp = new Date().toISOString()
+    const messageTimestamps = state.messageTimestamps ??
+      state.messages.map(() => Date.parse(timestamp))
+    assertMessageTimestamps(state.messages, messageTimestamps)
     await this.appendEntries([
       {
         type: 'checkpoint',
-        timestamp: new Date().toISOString(),
+        timestamp,
         messages: state.messages,
+        messageTimestamps,
         summary: state.summary,
         budgetUsed: state.budgetUsed,
       },
@@ -156,6 +189,7 @@ export class SessionStore implements SessionWriter {
         const entry = JSON.parse(line) as Partial<SessionEntry>
         if (entry.type === 'messages') {
           if (!Array.isArray(entry.messages)) throw new Error('messages.messages 不是数组')
+          const timestamp = parseEntryTimestamp(entry.timestamp)
           const parsedMessages = entry.messages.map((message) => modelMessageSchema.safeParse(message))
           if (parsedMessages.some((parsed) => !parsed.success)) {
             throw new Error('messages 包含无效消息')
@@ -164,23 +198,26 @@ export class SessionStore implements SessionWriter {
             if (typeof entry.budgetUsed !== 'number') {
               throw new Error('messages.budgetUsed 无效')
             }
-            assertBudget(entry.budgetUsed)
-            state.budgetUsed = entry.budgetUsed
+            assertCostUsed(entry.budgetUsed)
           }
           state.messages.push(...parsedMessages.map((parsed) => parsed.data!))
+          state.messageTimestamps.push(...entry.messages.map(() => timestamp))
+          if (entry.budgetUsed !== undefined) state.budgetUsed = entry.budgetUsed
           continue
         }
 
         if (entry.type === 'message') {
           const parsed = modelMessageSchema.safeParse(entry.message)
           if (!parsed.success) throw new Error('message 结构无效')
+          const timestamp = parseEntryTimestamp(entry.timestamp)
           state.messages.push(parsed.data)
+          state.messageTimestamps.push(timestamp)
           continue
         }
 
         if (entry.type === 'budget') {
           if (typeof entry.budgetUsed !== 'number') throw new Error('budget.budgetUsed 无效')
-          assertBudget(entry.budgetUsed)
+          assertCostUsed(entry.budgetUsed)
           state.budgetUsed = entry.budgetUsed
           continue
         }
@@ -195,10 +232,23 @@ export class SessionStore implements SessionWriter {
           if (typeof entry.budgetUsed !== 'number') {
             throw new Error('checkpoint.budgetUsed 无效')
           }
-          assertBudget(entry.budgetUsed)
+          assertCostUsed(entry.budgetUsed)
+
+          const checkpointTimestamp = parseEntryTimestamp(entry.timestamp)
+          const messageTimestamps = entry.messageTimestamps === undefined
+            ? entry.messages.map(() => checkpointTimestamp)
+            : entry.messageTimestamps
+          if (!Array.isArray(messageTimestamps)) {
+            throw new Error('checkpoint.messageTimestamps 无效')
+          }
+          assertMessageTimestamps(
+            parsedMessages.map((parsed) => parsed.data!),
+            messageTimestamps,
+          )
 
           state = {
             messages: parsedMessages.map((parsed) => parsed.data!),
+            messageTimestamps,
             summary: entry.summary,
             budgetUsed: entry.budgetUsed,
           }

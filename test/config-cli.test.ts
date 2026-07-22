@@ -7,7 +7,7 @@ describe('configuration', () => {
   it('keeps runtime policies out of environment configuration', () => {
     const config = loadConfig({})
 
-    assert.deepEqual(config.agent, { budgetLimit: 1_000_000 })
+    assert.deepEqual(config.agent, { tokenCostLimit: 1_000_000 })
     assert.equal('compaction' in config, false)
   })
 

@@ -46,8 +46,9 @@ export async function runCli(args: string[] = []) {
       store,
       state: {
         messages: loaded.messages,
+        messageTimestamps: loaded.messageTimestamps,
         summary: loaded.summary,
-        budget: { used: loaded.budgetUsed, limit: config.agent.budgetLimit },
+        tokenCost: { used: loaded.budgetUsed, limit: config.agent.tokenCostLimit },
       },
     }
 
