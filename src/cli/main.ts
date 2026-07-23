@@ -7,6 +7,8 @@ import { connectGitHubMCP } from '../mcp/create-mcp.js'
 import { startRepl } from './repl.js'
 import { SessionStore } from '../session/store.js'
 import type { CompactionOptions } from '../context/compressor.js'
+import { PRICE_TABLE, UsageTracker } from '../usage/tracker.js'
+import { createDeepSeekFetch } from '../usage/cache-aware-fetch.js'
 
 const SESSION_ID = 'default'
 
@@ -40,7 +42,14 @@ export async function runCli(args: string[] = []) {
     const client = createOpenAI({
       baseURL: config.model.baseURL,
       apiKey: config.model.apiKey,
+      fetch: createDeepSeekFetch(),
     })
+    const usageTracker = new UsageTracker(
+      loaded.usageRecords,
+      config.model.pricing
+        ? { ...PRICE_TABLE, [config.model.modelId]: config.model.pricing }
+        : PRICE_TABLE,
+    )
     const runtime = {
       model: client.chat(config.model.modelId),
       registry,
@@ -51,6 +60,7 @@ export async function runCli(args: string[] = []) {
         summary: loaded.summary,
         tokenCost: { used: loaded.budgetUsed, limit: config.agent.tokenCostLimit },
       },
+      usageTracker,
       compaction: { contextWindowTokens: config.model.contextWindowTokens } satisfies Partial<CompactionOptions>,
     }
 

@@ -8,14 +8,71 @@ import {
 import type { AgentLoopObserver, ToolApprovalHandler } from '../agent/agent-loop.js'
 import type { ToolInvocation, ToolRegistry } from '../core/tool-registry.js'
 import type { CompactionOptions, ContextCompactionResult } from '../context/compressor.js'
+import { renderContextMatrix } from '../context/view.js'
 import type { SessionWriter } from '../session/store.js'
+import {
+  UsageTracker,
+  type StepRecord,
+  type UsageTotals,
+} from '../usage/tracker.js'
 
 export interface CliRuntimeDeps {
   model: LanguageModel
   registry: ToolRegistry
   store: SessionWriter
   state: ConversationState
+  usageTracker: UsageTracker
   compaction?: Partial<CompactionOptions>
+}
+
+function formatTokens(tokens: number) {
+  return new Intl.NumberFormat('en-US').format(tokens)
+}
+
+function formatDollars(cost: number) {
+  if (cost === 0) return '$0.000000'
+  if (cost < 0.0001) return `$${cost.toFixed(8)}`
+  return `$${cost.toFixed(6)}`
+}
+
+function progressBar(ratio: number, width = 30) {
+  const filled = Math.round(Math.max(0, Math.min(1, ratio)) * width)
+  return `${'█'.repeat(filled)}${'░'.repeat(width - filled)}`
+}
+
+export function renderUsageSummary(tracker: UsageTracker) {
+  const totals: UsageTotals = tracker.totals()
+  const hitPercentage = totals.cacheHitRate * 100
+  const savedPercentage = totals.baselineCost === 0
+    ? 0
+    : (totals.savedCost / totals.baselineCost) * 100
+  const unpricedModels = Array.from(new Set(
+    tracker.records()
+      .filter((record) => record.cost === undefined)
+      .map((record) => record.model),
+  ))
+  const partial = totals.unpricedSteps > 0
+    ? `（仅含 ${totals.pricedSteps}/${totals.steps} 个已定价 step）`
+    : ''
+
+  return [
+    'Usage Summary',
+    `${totals.steps} steps`,
+    '',
+    `◎ Input        ${formatTokens(totals.inputTokens)} tokens`,
+    `◈ Cache write  ${formatTokens(totals.cacheWriteTokens)} tokens`,
+    `◉ Cache read   ${formatTokens(totals.cacheReadTokens)} tokens (${hitPercentage.toFixed(1)}% hit)`,
+    `◇ Output       ${formatTokens(totals.outputTokens)} tokens`,
+    '',
+    `Cache hit rate ${progressBar(totals.cacheHitRate)} ${hitPercentage.toFixed(1)}%`,
+    '',
+    `Estimated cost ${formatDollars(totals.cost)} ${partial}`.trimEnd(),
+    `Without cache  ${formatDollars(totals.baselineCost)} ${partial}`.trimEnd(),
+    `Estimated saved ${formatDollars(totals.savedCost)} (${savedPercentage.toFixed(1)}% off)`,
+    ...(unpricedModels.length > 0
+      ? ['', `价格未知: ${unpricedModels.join(', ')}；这些 step 只统计 token，不计入金额。`]
+      : []),
+  ].join('\n')
 }
 
 function printCompaction(phase: CompactionPhase, result: ContextCompactionResult) {
@@ -90,6 +147,11 @@ function createConsoleObserver() {
       const percentage = Math.round((used / limit) * 100)
       console.log(`  [Token] ${used}/${limit} (${percentage}%)`)
     },
+    onUsage: ({ record }: { record: StepRecord }) => {
+      if (record.cacheReadTokens === 0) return
+      const cost = record.cost === undefined ? '' : ` · ${formatDollars(record.cost)}`
+      console.log(`  [Cache hit] read ${formatTokens(record.cacheReadTokens)} tokens${cost}`)
+    },
     onContinue: () => console.log('  → 继续下一步...'),
     onStop: ({ stopReason }) => {
       const messages: Partial<Record<typeof stopReason, string>> = {
@@ -109,6 +171,7 @@ function createRunner(deps: CliRuntimeDeps, approveTool: ToolApprovalHandler) {
     registry: deps.registry,
     store: deps.store,
     state: deps.state,
+    usageTracker: deps.usageTracker,
     compaction: deps.compaction,
     approveTool,
     observer: createConsoleObserver(),
@@ -165,6 +228,26 @@ export function startRepl(deps: CliRuntimeDeps) {
       }
       if (trimmed === 'exit') {
         void shutdown()
+        return
+      }
+      if (trimmed === '/usage') {
+        console.log(`\n${renderUsageSummary(runner.usage)}`)
+        ask()
+        return
+      }
+      if (trimmed === '/context') {
+        console.log(`\n${renderContextMatrix(runner.getContextSnapshot())}`)
+        ask()
+        return
+      }
+      if (trimmed === '/help') {
+        console.log('\n命令: /context 查看上下文，/usage 查看成本，/help 查看帮助，exit 退出')
+        ask()
+        return
+      }
+      if (trimmed.startsWith('/')) {
+        console.log(`[未知命令] ${trimmed}；输入 /help 查看可用命令`)
+        ask()
         return
       }
 

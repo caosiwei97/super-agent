@@ -3,6 +3,7 @@ import { describe, it } from 'node:test'
 import { modelMessageSchema, type ModelMessage } from 'ai'
 import { agentLoop } from '../src/agent/agent-loop.js'
 import { ToolRegistry, type ToolDefinition } from '../src/core/tool-registry.js'
+import { UsageTracker } from '../src/usage/tracker.js'
 import { streamSequenceModel } from './helpers.js'
 
 function tool(name: string, execute: ToolDefinition['execute'], mutation = false) {
@@ -51,6 +52,7 @@ describe('agentLoop', () => {
     ])
     const messages: ModelMessage[] = [{ role: 'user', content: 'run both' }]
     const inputTokenCounts: number[] = []
+    const usageTracker = new UsageTracker()
 
     const result = await agentLoop({
       model,
@@ -58,12 +60,24 @@ describe('agentLoop', () => {
       messages,
       buildSystem: () => 'test',
       tokenCost: { used: 0, limit: 1_000 },
+      usageTracker,
       onInputTokens: (tokens) => inputTokenCounts.push(tokens),
       maxRetries: 0,
     })
 
     assert.deepEqual(result, { steps: 2, stopReason: 'completed' })
     assert.deepEqual(inputTokenCounts, [3, 3])
+    assert.deepEqual(
+      usageTracker.records().map((record) => ({
+        model: record.model,
+        inputTokens: record.inputTokens,
+        outputTokens: record.outputTokens,
+      })),
+      [
+        { model: 'stream-sequence', inputTokens: 3, outputTokens: 2 },
+        { model: 'stream-sequence', inputTokens: 3, outputTokens: 2 },
+      ],
+    )
     const byId = new Map(toolResults(messages).map((part) => [part.toolCallId, part.output]))
     assert.deepEqual(byId.get('call-a'), { type: 'text', value: 'A:one' })
     assert.deepEqual(byId.get('call-b'), { type: 'text', value: 'B:two' })

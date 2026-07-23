@@ -3,6 +3,7 @@ import { appendFile } from 'node:fs/promises'
 import { createInterface } from 'node:readline'
 import { resolve } from 'node:path'
 import { modelMessageSchema, type ModelMessage } from 'ai'
+import { isStepRecord, type StepRecord } from '../usage/tracker.js'
 
 const DEFAULT_SESSION_DIR = '.sessions'
 const SESSION_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/
@@ -19,6 +20,7 @@ export interface MessagesEntry extends EntryBase {
   type: 'messages'
   messages: ModelMessage[]
   budgetUsed?: number
+  usage?: StepRecord
 }
 
 /** 保留对旧格式记录的读取支持，以便恢复已有会话。 */
@@ -40,6 +42,7 @@ export interface CheckpointEntry extends EntryBase {
   messageTimestamps?: number[]
   summary: string
   budgetUsed: number
+  usageRecords?: StepRecord[]
 }
 
 export type SessionEntry = MessagesEntry | MessageEntry | CostEntry | CheckpointEntry
@@ -49,15 +52,21 @@ export interface SessionState {
   messageTimestamps: number[]
   summary: string
   budgetUsed: number
+  usageRecords: StepRecord[]
 }
 
-export type SessionCheckpointState = Omit<SessionState, 'messageTimestamps'> & {
+export type SessionCheckpointState = Omit<SessionState, 'messageTimestamps' | 'usageRecords'> & {
   messageTimestamps?: number[]
+  usageRecords?: StepRecord[]
 }
 
 export interface SessionWriter {
   getSessionId(): string
-  appendMessages(messages: ModelMessage[], budgetUsed?: number): Promise<void>
+  appendMessages(
+    messages: ModelMessage[],
+    budgetUsed?: number,
+    usage?: StepRecord,
+  ): Promise<void>
   appendCheckpoint(state: SessionCheckpointState): Promise<void>
 }
 
@@ -75,7 +84,8 @@ function validateSessionId(sessionId: string) {
 function emptyState() {
   const messages: ModelMessage[] = []
   const messageTimestamps: number[] = []
-  return { messages, messageTimestamps, summary: '', budgetUsed: 0 }
+  const usageRecords: StepRecord[] = []
+  return { messages, messageTimestamps, summary: '', budgetUsed: 0, usageRecords }
 }
 
 function assertCostUsed(budgetUsed: number) {
@@ -90,6 +100,10 @@ function assertMessages(messages: ModelMessage[]) {
       throw new Error('拒绝写入结构无效的 ModelMessage')
     }
   }
+}
+
+function assertUsageRecords(records: readonly StepRecord[]) {
+  if (!records.every(isStepRecord)) throw new Error('usageRecords 包含无效记录')
 }
 
 function assertMessageTimestamps(messages: ModelMessage[], timestamps: number[]) {
@@ -137,10 +151,11 @@ export class SessionStore implements SessionWriter {
     return existsSync(this.filePath)
   }
 
-  async appendMessages(messages: ModelMessage[], budgetUsed?: number) {
+  async appendMessages(messages: ModelMessage[], budgetUsed?: number, usage?: StepRecord) {
     if (messages.length === 0) return
     assertMessages(messages)
     if (budgetUsed !== undefined) assertCostUsed(budgetUsed)
+    if (usage !== undefined) assertUsageRecords([usage])
 
     await this.appendEntries([
       {
@@ -148,6 +163,7 @@ export class SessionStore implements SessionWriter {
         timestamp: new Date().toISOString(),
         messages,
         ...(budgetUsed === undefined ? {} : { budgetUsed }),
+        ...(usage === undefined ? {} : { usage }),
       },
     ])
   }
@@ -158,7 +174,9 @@ export class SessionStore implements SessionWriter {
     const timestamp = new Date().toISOString()
     const messageTimestamps = state.messageTimestamps ??
       state.messages.map(() => Date.parse(timestamp))
+    const usageRecords = state.usageRecords ?? []
     assertMessageTimestamps(state.messages, messageTimestamps)
+    assertUsageRecords(usageRecords)
     await this.appendEntries([
       {
         type: 'checkpoint',
@@ -167,6 +185,7 @@ export class SessionStore implements SessionWriter {
         messageTimestamps,
         summary: state.summary,
         budgetUsed: state.budgetUsed,
+        usageRecords,
       },
     ])
   }
@@ -200,9 +219,13 @@ export class SessionStore implements SessionWriter {
             }
             assertCostUsed(entry.budgetUsed)
           }
+          if (entry.usage !== undefined && !isStepRecord(entry.usage)) {
+            throw new Error('messages.usage 无效')
+          }
           state.messages.push(...parsedMessages.map((parsed) => parsed.data!))
           state.messageTimestamps.push(...entry.messages.map(() => timestamp))
           if (entry.budgetUsed !== undefined) state.budgetUsed = entry.budgetUsed
+          if (entry.usage !== undefined) state.usageRecords.push(entry.usage)
           continue
         }
 
@@ -233,6 +256,11 @@ export class SessionStore implements SessionWriter {
             throw new Error('checkpoint.budgetUsed 无效')
           }
           assertCostUsed(entry.budgetUsed)
+          const usageRecords = entry.usageRecords ?? []
+          if (!Array.isArray(usageRecords)) {
+            throw new Error('checkpoint.usageRecords 无效')
+          }
+          assertUsageRecords(usageRecords)
 
           const checkpointTimestamp = parseEntryTimestamp(entry.timestamp)
           const messageTimestamps = entry.messageTimestamps === undefined
@@ -251,6 +279,7 @@ export class SessionStore implements SessionWriter {
             messageTimestamps,
             summary: entry.summary,
             budgetUsed: entry.budgetUsed,
+            usageRecords,
           }
           continue
         }

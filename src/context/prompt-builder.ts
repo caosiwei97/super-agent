@@ -8,7 +8,7 @@ import type { ToolRegistry } from '../core/tool-registry.js'
  */
 export function buildSystem(
   registry: ToolRegistry,
-  session: { id: string; contextMessageCount: number },
+  session: { id: string },
 ) {
   // 通过提示管道组装系统提示词
   const builder = new PromptBuilder()
@@ -20,7 +20,6 @@ export function buildSystem(
   const promptCtx: PromptContext = {
     toolCount: registry.getActiveTools().length,
     deferredToolSummary: registry.getDeferredToolSummary(),
-    contextMessageCount: session.contextMessageCount,
     sessionId: session.id,
   }
 
@@ -30,7 +29,6 @@ export function buildSystem(
 export interface PromptContext {
   toolCount: number
   deferredToolSummary: string
-  contextMessageCount: number
   sessionId: string
 }
 
@@ -101,8 +99,7 @@ export function deferredTools() {
 }
 
 export function sessionContext() {
-  return ((ctx) => {
-    if (ctx.contextMessageCount === 0) return null
-    return `[会话信息] 当前会话 ${ctx.sessionId}，工作上下文包含 ${ctx.contextMessageCount} 条消息。`
-  }) satisfies PipeFn
+  // 会话 ID 在整个进程中稳定。不要在 system prompt 中加入消息数或时间戳，
+  // 否则每个 step 都会改变请求前缀并破坏 Prompt Cache。
+  return ((ctx) => `[会话信息] 当前会话 ${ctx.sessionId}。`) satisfies PipeFn
 }

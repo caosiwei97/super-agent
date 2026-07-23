@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import type { ModelMessage } from 'ai'
 import { SessionStore } from '../src/session/store.js'
+import { UsageTracker } from '../src/usage/tracker.js'
 
 describe('SessionStore', () => {
   it('restores the latest checkpoint plus raw tail and budget snapshot', async (context) => {
@@ -17,9 +18,15 @@ describe('SessionStore', () => {
     })
     const compacted: ModelMessage[] = [{ role: 'assistant', content: 'compact state' }]
     const tail: ModelMessage[] = [{ role: 'user', content: 'after checkpoint' }]
+    const usage = new UsageTracker().record('deepseek-v4-flash', {
+      inputTokens: 10,
+      outputTokens: 2,
+      cacheWriteTokens: 0,
+      cacheReadTokens: 8,
+    }, 123)
 
     await store.appendCheckpoint({ messages: compacted, summary: 'summary-v1', budgetUsed: 11 })
-    await store.appendMessages(tail, 17)
+    await store.appendMessages(tail, 17, usage)
     await appendFile(join(directory, 'recoverable.jsonl'), '{broken json}\n', 'utf-8')
 
     const restored = await store.loadState()
@@ -28,6 +35,7 @@ describe('SessionStore', () => {
     assert.equal(restored.messageTimestamps.length, restored.messages.length)
     assert.equal(restored.summary, 'summary-v1')
     assert.equal(restored.budgetUsed, 17)
+    assert.deepEqual(restored.usageRecords, [usage])
     assert.equal(warnings.length, 1)
 
     const log = await readFile(join(directory, 'recoverable.jsonl'), 'utf-8')
@@ -99,6 +107,7 @@ describe('SessionStore', () => {
       messageTimestamps: [Date.parse(timestamp)],
       summary: '',
       budgetUsed: 9,
+      usageRecords: [],
     })
   })
 })

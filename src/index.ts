@@ -18,6 +18,7 @@ export {
   compactContext,
   estimateTokens,
   microcompact,
+  resolveCompactionOptions,
   summarize,
 } from './context/compressor.js'
 export type {
@@ -25,6 +26,8 @@ export type {
   CompactionResult,
   ContextCompactionResult,
 } from './context/compressor.js'
+export { renderContextMatrix } from './context/view.js'
+export type { ContextSnapshot } from './context/view.js'
 export {
   applyContextDefense,
   DEFAULT_CONTEXT_DEFENSE_OPTIONS,
@@ -48,6 +51,25 @@ export type {
 } from './core/tool-registry.js'
 export { Workspace, WorkspaceBoundaryError } from './core/workspace.js'
 export { loadConfig } from './core/config.js'
+export {
+  computeBaselineCost,
+  computeCost,
+  normalizeUsage,
+  PRICE_TABLE,
+  resolvePricing,
+  UsageTracker,
+} from './usage/tracker.js'
+export {
+  createDeepSeekFetch,
+  disableDeepSeekThinking,
+  normalizeCacheUsagePayload,
+} from './usage/cache-aware-fetch.js'
+export type {
+  ModelPricing,
+  StepRecord,
+  StepUsage,
+  UsageTotals,
+} from './usage/tracker.js'
 export { SessionStore } from './session/store.js'
 export type {
   SessionEntry,

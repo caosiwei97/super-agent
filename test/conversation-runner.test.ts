@@ -112,12 +112,26 @@ describe('ConversationRunner', () => {
     assert.equal(state.messages[0].role, 'assistant')
 
     const restored = await store.loadState()
-    assert.deepEqual(restored, {
+    assert.deepEqual({
+      messages: restored.messages,
+      messageTimestamps: restored.messageTimestamps,
+      summary: restored.summary,
+      budgetUsed: restored.budgetUsed,
+    }, {
       messages: state.messages,
       messageTimestamps: state.messageTimestamps,
       summary: state.summary,
       budgetUsed: state.tokenCost.used,
     })
+    assert.equal(restored.usageRecords.length, 1)
+    assert.deepEqual(
+      {
+        model: restored.usageRecords[0].model,
+        inputTokens: restored.usageRecords[0].inputTokens,
+        outputTokens: restored.usageRecords[0].outputTokens,
+      },
+      { model: 'summary', inputTokens: 10, outputTokens: 5 },
+    )
     const rawLog = await readFile(join(directory, 'runner.jsonl'), 'utf-8')
     assert.ok(rawLog.includes(largeAnswer), 'raw assistant output should remain in the audit log')
   })

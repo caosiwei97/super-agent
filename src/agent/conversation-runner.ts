@@ -11,13 +11,24 @@ import type { ToolRegistry } from '../core/tool-registry.js'
 import type { SessionWriter } from '../session/store.js'
 import {
   compactContext,
+  resolveCompactionOptions,
   type CompactionOptions,
   type ContextCompactionResult,
 } from '../context/compressor.js'
-import { TokenTracker } from '../context/defense.js'
+import {
+  estimateTextTokens,
+  estimateTokens,
+  TokenTracker,
+} from '../context/defense.js'
+import type { ContextSnapshot } from '../context/view.js'
 import { buildSystem } from '../context/prompt-builder.js'
+import { normalizeUsage, UsageTracker } from '../usage/tracker.js'
 
 export type CompactionPhase = 'before-turn' | 'between-steps' | 'after-turn'
+
+function modelIdentifier(model: LanguageModel) {
+  return typeof model === 'string' ? model : model.modelId
+}
 
 export interface ConversationState {
   messages: ModelMessage[]
@@ -34,6 +45,7 @@ export interface ConversationRunnerOptions {
   compaction?: Partial<CompactionOptions>
   approveTool?: ToolApprovalHandler
   observer?: AgentLoopObserver
+  usageTracker?: UsageTracker
   onCompaction?: (phase: CompactionPhase, result: ContextCompactionResult) => void
   runAgentLoop?: (options: AgentLoopOptions) => Promise<AgentLoopResult>
 }
@@ -42,10 +54,12 @@ export interface ConversationRunnerOptions {
 export class ConversationRunner {
   private readonly runAgentLoop: (options: AgentLoopOptions) => Promise<AgentLoopResult>
   private readonly tokenTracker: TokenTracker
+  private readonly usageTracker: UsageTracker
   private turnInProgress = false
 
   constructor(private readonly options: ConversationRunnerOptions) {
     this.runAgentLoop = options.runAgentLoop || agentLoop
+    this.usageTracker = options.usageTracker ?? new UsageTracker()
     const now = Date.now()
     const timestamps = options.state.messageTimestamps ?? []
     options.state.messageTimestamps = options.state.messages.map((_, index) => {
@@ -57,6 +71,25 @@ export class ConversationRunner {
 
   get state() {
     return this.options.state
+  }
+
+  get usage() {
+    return this.usageTracker
+  }
+
+  getContextSnapshot(): ContextSnapshot {
+    const compaction = resolveCompactionOptions(this.options.compaction)
+    const system = buildSystem(this.options.registry, {
+      id: this.options.store.getSessionId(),
+    })
+    return {
+      model: modelIdentifier(this.options.model),
+      contextWindowTokens: compaction.contextWindowTokens,
+      compactionThresholdTokens: compaction.tokenThreshold,
+      systemTokens: estimateTextTokens(system, compaction),
+      toolTokens: this.options.registry.countTokenEstimate().active,
+      messageTokens: estimateTokens(this.state.messages, compaction),
+    }
   }
 
   async runTurn(input: string) {
@@ -90,9 +123,9 @@ export class ConversationRunner {
         buildSystem: () =>
           buildSystem(this.options.registry, {
             id: this.options.store.getSessionId(),
-            contextMessageCount: this.state.messages.length,
           }),
         tokenCost: this.state.tokenCost,
+        usageTracker: this.usageTracker,
         approveTool: this.options.approveTool,
         observer: this.options.observer,
         beforeStep: async (step) => {
@@ -101,8 +134,8 @@ export class ConversationRunner {
         onInputTokens: (inputTokens) => this.tokenTracker.updateFromAPI(inputTokens),
         // `agentLoop` 会在此回调前更新共享成本预算。将成本预算快照与原始步骤消息
         // 持久化到同一条 JSONL 事件中，避免崩溃恢复消息时丢失对应的令牌消耗。
-        onMessages: async (messages) => {
-          await this.options.store.appendMessages(messages, this.state.tokenCost.used)
+        onMessages: async (messages, usage) => {
+          await this.options.store.appendMessages(messages, this.state.tokenCost.used, usage)
           const timestamp = Date.now()
           this.state.messageTimestamps!.push(...messages.map(() => timestamp))
           this.tokenTracker.addMessages(messages)
@@ -119,6 +152,7 @@ export class ConversationRunner {
         messageTimestamps: this.state.messageTimestamps,
         summary: this.state.summary,
         budgetUsed: this.state.tokenCost.used,
+        usageRecords: this.usageTracker.records(),
       })
     } catch (finalizeError) {
       if (loopError) {
@@ -153,6 +187,9 @@ export class ConversationRunner {
     this.state.summary = result.summary
     this.state.tokenCost.used += result.usageTokens
     this.tokenTracker.rebase(result.afterTokens)
+    const usageRecord = result.usage
+      ? this.usageTracker.record(modelIdentifier(this.options.model), normalizeUsage(result.usage))
+      : undefined
 
     // 步骤间压缩和轮次前压缩发生在最终轮次检查点之前。
     // 重要的上下文或成本预算变化需要立即持久化，确保后续模型请求失败或进程退出时仍可恢复。
@@ -165,10 +202,12 @@ export class ConversationRunner {
         messageTimestamps: this.state.messageTimestamps,
         summary: this.state.summary,
         budgetUsed: this.state.tokenCost.used,
+        usageRecords: this.usageTracker.records(),
       })
     }
 
     try {
+      if (usageRecord) this.options.observer?.onUsage?.({ record: usageRecord })
       this.options.onCompaction?.(phase, result)
     } catch {
       // 可观测性回调不得破坏已持久化的对话轮次。

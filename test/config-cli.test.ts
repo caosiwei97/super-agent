@@ -24,6 +24,29 @@ describe('configuration', () => {
       token: 'token',
     })
   })
+
+  it('accepts only a complete non-negative pricing override', () => {
+    const pricingEnv = {
+      MODEL_INPUT_PRICE_PER_MILLION: '1',
+      MODEL_OUTPUT_PRICE_PER_MILLION: '2',
+      MODEL_CACHE_WRITE_PRICE_PER_MILLION: '1.25',
+      MODEL_CACHE_READ_PRICE_PER_MILLION: '0.1',
+    }
+    assert.deepEqual(loadConfig(pricingEnv).model.pricing, {
+      input: 1,
+      output: 2,
+      cacheWrite: 1.25,
+      cacheRead: 0.1,
+    })
+    assert.throws(
+      () => loadConfig({ MODEL_INPUT_PRICE_PER_MILLION: '1' }),
+      /必须同时配置/,
+    )
+    assert.throws(
+      () => loadConfig({ ...pricingEnv, MODEL_OUTPUT_PRICE_PER_MILLION: '-1' }),
+      /必须是非负数/,
+    )
+  })
 })
 
 describe('CLI', () => {

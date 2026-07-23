@@ -12,6 +12,11 @@ import {
   type ToolInvocation,
   type ToolRuntimeHooks,
 } from '../core/tool-registry.js'
+import {
+  normalizeUsage,
+  type StepRecord,
+  type UsageTracker,
+} from '../usage/tracker.js'
 
 export interface TokenCostState {
   used: number
@@ -35,6 +40,7 @@ export interface AgentLoopObserver {
   onAttemptError?: (event: { attempt: number; error: unknown }) => void
   onRetry?: (event: { attempt: number; maxRetries: number; delayMs: number }) => void
   onTokenCost?: (event: { used: number; limit: number }) => void
+  onUsage?: (event: { record: StepRecord }) => void
   onContinue?: (event: { nextStep: number }) => void
   onStop?: (result: AgentLoopResult) => void
 }
@@ -52,7 +58,8 @@ export interface AgentLoopOptions {
   beforeStep?: (step: number) => Promise<void>
   /** 每次成功模型请求返回的精确 prompt token，用于校准上下文估算。 */
   onInputTokens?: (inputTokens: number) => void
-  onMessages?: (messages: ModelMessage[]) => Promise<void>
+  usageTracker?: UsageTracker
+  onMessages?: (messages: ModelMessage[], usage?: StepRecord) => Promise<void>
   maxSteps?: number
   maxRetries?: number
 }
@@ -80,7 +87,11 @@ function notify(callback: (() => void) | undefined) {
 }
 
 function usageTokens(usage: LanguageModelUsage | undefined) {
-  return (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0)
+  return usage?.totalTokens ?? (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0)
+}
+
+function modelIdentifier(model: LanguageModel) {
+  return typeof model === 'string' ? model : model.modelId
 }
 
 function deniedToolResult(call: GuardedCall, reason: string) {
@@ -109,6 +120,7 @@ export async function agentLoop(options: AgentLoopOptions) {
     observer = {},
     beforeStep,
     onInputTokens,
+    usageTracker,
     onMessages,
     maxSteps = DEFAULT_MAX_STEPS,
     maxRetries = DEFAULT_MAX_RETRIES,
@@ -237,6 +249,7 @@ export async function agentLoop(options: AgentLoopOptions) {
     if (typeof stepUsage?.inputTokens === 'number') {
       onInputTokens?.(stepUsage.inputTokens)
     }
+    const usageRecord = usageTracker?.record(modelIdentifier(model), normalizeUsage(stepUsage))
     const committedMessages = [...responseMessages]
     let criticalLoopDetected = false
 
@@ -300,9 +313,10 @@ export async function agentLoop(options: AgentLoopOptions) {
       committedMessages.push({ role: 'tool', content: approvalContent })
     }
 
-    await onMessages?.(committedMessages)
+    await onMessages?.(committedMessages, usageRecord)
     messages.push(...committedMessages)
 
+    if (usageRecord) notify(() => observer.onUsage?.({ record: usageRecord }))
     notify(() => observer.onTokenCost?.({ used: tokenCost.used, limit: tokenCost.limit }))
 
     if (criticalLoopDetected) {

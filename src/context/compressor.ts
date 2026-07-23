@@ -1,6 +1,7 @@
 import {
   generateText,
   type LanguageModel,
+  type LanguageModelUsage,
   type ModelMessage,
   type ToolResultPart,
 } from 'ai'
@@ -33,7 +34,7 @@ export const DEFAULT_COMPACTION_OPTIONS: CompactionOptions & ContextDefenseOptio
   maxSummaryChars: 1_200,
 }
 
-function resolveOptions(options: Partial<CompactionOptions>) {
+export function resolveCompactionOptions(options: Partial<CompactionOptions> = {}) {
   const resolved = {
     ...DEFAULT_COMPACTION_OPTIONS,
     ...resolveDefenseOptions(options),
@@ -88,7 +89,7 @@ export function microcompact(
   messages: ModelMessage[],
   options: Partial<CompactionOptions> = {},
 ) {
-  const { keepRecentToolMessages } = resolveOptions(options)
+  const { keepRecentToolMessages } = resolveCompactionOptions(options)
   const toolMessageIndices: number[] = []
 
   for (let index = 0; index < messages.length; index++) {
@@ -164,6 +165,7 @@ export interface CompactionResult {
   summary: string
   compressedCount: number
   usageTokens: number
+  usage?: LanguageModelUsage
   error?: string
 }
 
@@ -231,7 +233,7 @@ export async function summarize(
   existingSummary = '',
   options: Partial<CompactionOptions> = {},
 ) {
-  const resolvedOptions = resolveOptions(options)
+  const resolvedOptions = resolveCompactionOptions(options)
   // 上一次摘要会作为合成消息注入智能体上下文。生成新摘要前先移除该消息，
   // 否则每次压缩都会把同一份摘要重复发送两次。
   const previousSummary = existingSummary
@@ -304,6 +306,7 @@ export async function summarize(
         summary: previousSummary,
         compressedCount: 0,
         usageTokens: usageTokenCount(result.usage),
+        usage: result.usage,
       }
     }
 
@@ -324,6 +327,7 @@ export async function summarize(
         summary: previousSummary,
         compressedCount: 0,
         usageTokens: usageTokenCount(result.usage),
+        usage: result.usage,
       }
     }
 
@@ -332,6 +336,7 @@ export async function summarize(
       summary,
       compressedCount: toCompress.length,
       usageTokens: usageTokenCount(result.usage),
+      usage: result.usage,
     }
   } catch (error) {
     return {
@@ -366,7 +371,7 @@ export async function compactContext(
   policy: CompactionRuntimePolicy = {},
   messageTimestamps: readonly number[] = [],
 ) {
-  const resolvedOptions = resolveOptions(options)
+  const resolvedOptions = resolveCompactionOptions(options)
   const now = policy.now ?? Date.now()
   const defenseResult = applyContextDefense(
     messages,
