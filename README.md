@@ -255,11 +255,12 @@ flowchart LR
 | `OPENAI_API_KEY` | 无 | 模型服务密钥 |
 | `MODEL_BASE_URL` | `https://api.deepseek.com` | OpenAI-compatible 接口地址 |
 | `MODEL_ID` | `deepseek-v4-flash` | 模型名称 |
+| `MODEL_CONTEXT_WINDOW` | `16000` | 模型实际上下文窗口（token）。设为真实窗口（如 200000）才能用满上下文，压缩阈值会按 75% 水位自动派生 |
 | `TI_AGENT_WORKSPACE` | 当前目录 | 文件、Shell 和预览工具的根目录 |
 | `GITHUB_PERSONAL_ACCESS_TOKEN` | 无 | 配置后接入 GitHub MCP |
 | `TOKEN_BUDGET` | `1000000` | 当前 session 的累计 token 上限 |
 
-模型 step、重试和上下文防御/压缩都属于代码内部策略，不通过环境变量配置。对应默认值分别位于 `src/agent/agent-loop.ts`、`src/context/defense.ts` 和 `src/context/compressor.ts`。
+模型 step、重试属于代码内部策略，不通过环境变量配置。上下文防御/压缩的窗口水位通过 `MODEL_CONTEXT_WINDOW` 配置，其余默认值分别位于 `src/agent/agent-loop.ts`、`src/context/defense.ts` 和 `src/context/compressor.ts`。
 
 设置 `PROMPT_DEBUG=1` 可以打印 system prompt 每个组成部分的开关状态和字符数。
 

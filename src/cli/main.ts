@@ -6,6 +6,7 @@ import { createBuiltinTools, createToolSearch } from '../tools/index.js'
 import { connectGitHubMCP } from '../mcp/create-mcp.js'
 import { startRepl } from './repl.js'
 import { SessionStore } from '../session/store.js'
+import type { CompactionOptions } from '../context/compressor.js'
 
 const SESSION_ID = 'default'
 
@@ -50,6 +51,7 @@ export async function runCli(args: string[] = []) {
         summary: loaded.summary,
         tokenCost: { used: loaded.budgetUsed, limit: config.agent.tokenCostLimit },
       },
+      compaction: { contextWindowTokens: config.model.contextWindowTokens } satisfies Partial<CompactionOptions>,
     }
 
     startRepl(runtime)

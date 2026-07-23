@@ -39,6 +39,14 @@ function resolveOptions(options: Partial<CompactionOptions>) {
     ...resolveDefenseOptions(options),
     ...options,
   }
+  // tokenThreshold 未显式指定时，按窗口水位推导，与 defense 的
+  // contextBudgetTokens（contextWindowTokens × contextBudgetRatio）保持一致，
+  // 让三层压缩按模型实际上下文窗口判断，而非写死 12k。
+  if (options.tokenThreshold === undefined) {
+    resolved.tokenThreshold = Math.floor(
+      resolved.contextWindowTokens * resolved.contextBudgetRatio,
+    )
+  }
   const positiveIntegers: Array<keyof CompactionOptions> = [
     'tokenThreshold',
     'keepRecentMessages',

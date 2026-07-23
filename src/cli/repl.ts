@@ -7,7 +7,7 @@ import {
 } from '../agent/conversation-runner.js'
 import type { AgentLoopObserver, ToolApprovalHandler } from '../agent/agent-loop.js'
 import type { ToolInvocation, ToolRegistry } from '../core/tool-registry.js'
-import type { ContextCompactionResult } from '../context/compressor.js'
+import type { CompactionOptions, ContextCompactionResult } from '../context/compressor.js'
 import type { SessionWriter } from '../session/store.js'
 
 export interface CliRuntimeDeps {
@@ -15,6 +15,7 @@ export interface CliRuntimeDeps {
   registry: ToolRegistry
   store: SessionWriter
   state: ConversationState
+  compaction?: Partial<CompactionOptions>
 }
 
 function printCompaction(phase: CompactionPhase, result: ContextCompactionResult) {
@@ -108,6 +109,7 @@ function createRunner(deps: CliRuntimeDeps, approveTool: ToolApprovalHandler) {
     registry: deps.registry,
     store: deps.store,
     state: deps.state,
+    compaction: deps.compaction,
     approveTool,
     observer: createConsoleObserver(),
     onCompaction: printCompaction,

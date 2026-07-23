@@ -20,7 +20,8 @@ export interface ContextDefenseOptions {
 }
 
 export const DEFAULT_CONTEXT_DEFENSE_OPTIONS: ContextDefenseOptions = {
-  // 保持原项目 12k 摘要阈值对应 75% 水位；可按实际模型窗口覆盖。
+  // 仅作兜底默认值；应通过 MODEL_CONTEXT_WINDOW 设为模型真实窗口，
+  // compressor 的 tokenThreshold 会按此窗口水位自动派生。
   contextWindowTokens: 16_000,
   contextBudgetRatio: 0.75,
   maxSingleToolResultRatio: 0.5,

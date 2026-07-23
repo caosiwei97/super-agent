@@ -212,3 +212,39 @@ describe('compactContext', () => {
     assert.equal(prompts.length, 1)
   })
 })
+
+describe('context-window-driven threshold', () => {
+  it('derives tokenThreshold from contextWindowTokens when not set explicitly', async () => {
+    const prompts: string[] = []
+    const model = summaryModel([], prompts)
+    // 同样的对话在 tokenThreshold=300 时必然触发摘要（见上文用例），
+    // 这里只给 contextWindowTokens 不给 tokenThreshold，派生出的阈值应足够高，
+    // 使得 compactContext 不再调用模型做摘要。
+    const messages = longConversation(8, 'history')
+
+    const result = await compactContext(model, messages, '', {
+      ...TEST_OPTIONS,
+      tokenThreshold: undefined,
+      contextWindowTokens: 200_000,
+    } as Partial<CompactionOptions>)
+
+    assert.equal(prompts.length, 0, 'large window should not trigger paid summarization')
+    assert.equal(result.compressedCount, 0)
+  })
+
+  it('keeps an explicit tokenThreshold over the derived one', async () => {
+    const prompts: string[] = []
+    const model = summaryModel(['derived-overridden'], prompts)
+    const messages = longConversation(8, 'history')
+
+    const result = await compactContext(
+      model,
+      messages,
+      '',
+      { ...TEST_OPTIONS, tokenThreshold: 300, contextWindowTokens: 200_000 },
+    )
+
+    assert.equal(prompts.length, 1, 'explicit tokenThreshold=300 still triggers summarization')
+    assert.ok(result.compressedCount > 0)
+  })
+})

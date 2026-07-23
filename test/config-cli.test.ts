@@ -11,6 +11,14 @@ describe('configuration', () => {
     assert.equal('compaction' in config, false)
   })
 
+  it('defaults the model context window to a safe fallback and overrides via env', () => {
+    assert.equal(loadConfig({}).model.contextWindowTokens, 16_000)
+    assert.equal(
+      loadConfig({ MODEL_CONTEXT_WINDOW: '200000' }).model.contextWindowTokens,
+      200_000,
+    )
+  })
+
   it('configures GitHub MCP with only a personal access token', () => {
     assert.deepEqual(loadConfig({ GITHUB_PERSONAL_ACCESS_TOKEN: 'token' }).githubMcp, {
       token: 'token',
