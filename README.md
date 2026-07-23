@@ -1,6 +1,6 @@
 # ti-agent
 
-运行 `ti`，终端就会出现聊天提示符。`ti-agent` 是一个 TypeScript Agent Demo，代码重点只有四件事：模型如何连续调用工具、危险操作如何审批、上下文如何缩短、会话如何恢复。
+运行 `ti`，终端就会出现聊天提示符。`ti-agent` 是一个 TypeScript Agent Demo，代码重点包括：模型如何连续调用工具、危险操作如何审批、上下文如何缩短、会话如何恢复，以及每个 step 的缓存命中与真实成本如何追踪。
 
 ## 跑起来
 
@@ -27,6 +27,9 @@ ti
 CLI 不需要任何参数。进入聊天后：
 
 - 输入普通文本开始对话。
+- 输入 `/context`，查看 system、工具、消息、空闲区和自动压缩缓冲区的 16×16 上下文矩阵。
+- 输入 `/usage`，查看四类 token、缓存命中率、估算成本、无缓存基线和节省金额。
+- 输入 `/help`，查看终端命令。
 - 输入 `exit`，关闭工具资源并退出。
 - 审批提示中只有 `y` 或 `yes` 表示同意，其他输入都按拒绝处理。
 - 第一次 `Ctrl+C` 会提示确认；1.5 秒内再按一次会强制退出。
@@ -47,7 +50,7 @@ flowchart TD
     MCPResult -->|否| Fallback["保留本地工具继续启动"]
     Fallback --> Session
     Skip --> Session
-    Session -->|是| Restore["恢复消息、摘要和预算"]
+    Session -->|是| Restore["恢复消息、摘要、预算和用量"]
     Session -->|否| Create["写入初始 checkpoint"]
     Restore --> Runtime["创建模型与 ConversationRunner"]
     Create --> Runtime
@@ -88,7 +91,7 @@ sequenceDiagram
                 G-->>R: 2.6 截断后的结果
             end
         end
-        R->>S: 2.7 保存本 step 消息与累计预算
+        R->>S: 2.7 保存本 step 消息、预算与 usage
     end
 
     R->>R: 3.1 对话结束后压缩
@@ -140,7 +143,7 @@ flowchart TD
 
 ## Session 如何保存和恢复
 
-Session 保存在 JSONL 文件里，每行是一条记录，只往文件末尾追加。Checkpoint 是恢复快照，启动时以最新快照为基线，再接上它后面的消息。
+Session 保存在 JSONL 文件里，每行是一条记录，只往文件末尾追加。Checkpoint 是恢复快照，启动时以最新快照为基线，再接上它后面的消息。成本记录与对应 step 的消息写在同一条事件里，并进入 checkpoint，所以重启后 `/usage` 会继续累计。
 
 ```mermaid
 flowchart LR
@@ -208,6 +211,25 @@ flowchart TD
 
 Token 估算以模型 API 返回的 `inputTokens` 为精确基准，只对后续新增消息做无 tokenizer 的轻量增量估算；中日韩字符采用更保守的权重。只有即时防线仍无法把上下文降到阈值以下时，才继续做微压缩和 LLM 摘要。摘要会消耗 token，且只有结果确实短于原上下文时才会替换消息。
 
+`/context` 使用当前实际配置的上下文窗口和 75% 自动压缩水位，把估算占用拆成 System prompt、System tools、Messages、Free space 与 Autocompact buffer。长会话里模型表现异常时，可以先用它判断消息历史或工具定义是否挤占了推理空间。
+
+## Prompt Cache 与成本
+
+DeepSeek 的隐式 Prompt Cache 不需要额外开关；命中依赖请求前缀稳定。System prompt 不包含时间戳或每步变化的消息数，固定规则放在动态工具清单之前。运行中发现新工具仍会改变工具前缀，这是动态加载带来的预期失效点。
+
+当前实现只面向 DeepSeek V4。由于 `@ai-sdk/openai` 尚不能在工具循环中完整回放 DeepSeek 的 `reasoning_content`，请求适配层会明确发送 `thinking: { type: "disabled" }`，避免默认 thinking mode 在第二个工具 step 返回 400。
+
+每次主模型调用和 LLM 摘要都会将 API usage 归一化为四类：
+
+- 普通输入 `inputTokens`
+- 缓存写入 `cacheWriteTokens`
+- 缓存读取 `cacheReadTokens`
+- 模型输出 `outputTokens`
+
+`/usage` 同时计算两份金额：按缓存读写价格得到的估算成本，以及把所有缓存 token 按普通输入全价重算的无缓存基线。两者差值就是缓存节省金额。AI SDK 6 的标准 cache 明细优先；DeepSeek 原始 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` 等字段作为兼容回退。该金额只基于 API 成功返回的 usage；失败或中断请求是否计费应以 DeepSeek 账单为准。
+
+内置价格表位于 `src/usage/tracker.ts`，只包含 DeepSeek V4 Flash/Pro 官方直连 API 价格，单位为 USD / 1M tokens。价格会变化，接入代理服务时应使用下面四个环境变量覆盖；其他模型仍统计 token，但金额明确标记为未知，不会按 `$0` 冒充真实成本。
+
 ## 代码从哪里读
 
 下面这张图对应实际调用方向。
@@ -256,6 +278,10 @@ flowchart LR
 | `MODEL_BASE_URL` | `https://api.deepseek.com` | OpenAI-compatible 接口地址 |
 | `MODEL_ID` | `deepseek-v4-flash` | 模型名称 |
 | `MODEL_CONTEXT_WINDOW` | `16000` | 模型实际上下文窗口（token）。设为真实窗口（如 200000）才能用满上下文，压缩阈值会按 75% 水位自动派生 |
+| `MODEL_INPUT_PRICE_PER_MILLION` | 内置价格表 | 普通输入价格（USD / 1M tokens），四个价格变量必须同时配置 |
+| `MODEL_OUTPUT_PRICE_PER_MILLION` | 内置价格表 | 输出价格（USD / 1M tokens） |
+| `MODEL_CACHE_WRITE_PRICE_PER_MILLION` | 内置价格表 | 缓存写入价格（USD / 1M tokens） |
+| `MODEL_CACHE_READ_PRICE_PER_MILLION` | 内置价格表 | 缓存读取价格（USD / 1M tokens） |
 | `TI_AGENT_WORKSPACE` | 当前目录 | 文件、Shell 和预览工具的根目录 |
 | `GITHUB_PERSONAL_ACCESS_TOKEN` | 无 | 配置后接入 GitHub MCP |
 | `TOKEN_BUDGET` | `1000000` | 当前 session 的累计 token 上限 |
